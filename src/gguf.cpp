@@ -1050,6 +1050,18 @@ const char * gguf_get_tensor_name(const struct gguf_context * ctx, int64_t tenso
     return ctx->info[tensor_id].t.name;
 }
 
+uint32_t gguf_get_tensor_n_dims(const struct gguf_context * ctx, int64_t tensor_id) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    return (uint32_t) ggml_n_dims(&ctx->info[tensor_id].t);
+}
+
+int64_t gguf_get_tensor_dim(const struct gguf_context * ctx, int64_t tensor_id, int32_t dim) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+    GGML_ASSERT(dim < ggml_n_dims(&ctx->info[tensor_id].t));
+    return ctx->info[tensor_id].t.ne[dim];
+}
+
 enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
     return ctx->info[tensor_id].t.type;
