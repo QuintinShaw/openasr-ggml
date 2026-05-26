@@ -311,8 +311,15 @@ void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
 }
 
 void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
     (void) user_data;
+#ifndef OPENASR_GGML_DEBUG
+    if (level == GGML_LOG_LEVEL_DEBUG) {
+        const char * ggml_debug = getenv("GGML_DEBUG");
+        if (ggml_debug == NULL || ggml_debug[0] == '\0' || ggml_debug[0] == '0') {
+            return;
+        }
+    }
+#endif
     fputs(text, stderr);
     fflush(stderr);
 }
