@@ -94,6 +94,9 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
+static id<MTLBinaryArchive> openasr_metal_device_archive(ggml_metal_device_t dev);
+static void openasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev);
+
 struct ggml_metal_library {
     id<MTLLibrary> obj;
 
@@ -411,8 +414,29 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
-        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        id<MTLComputePipelineState> obj = nil;
+        MTLComputePipelineDescriptor * pdesc = [MTLComputePipelineDescriptor new];
+        pdesc.computeFunction = mtl_function;
+        id<MTLBinaryArchive> archive = openasr_metal_device_archive(lib->dev);
+        if (archive) {
+            pdesc.binaryArchives = @[archive];
+        }
+        obj = [device newComputePipelineStateWithDescriptor:pdesc
+                                                    options:MTLPipelineOptionNone
+                                                 reflection:nil
+                                                      error:&error];
 
+        if (obj && archive) {
+            NSError * add_err = nil;
+            if ([archive addComputePipelineFunctionsWithDescriptor:pdesc error:&add_err]) {
+                openasr_metal_device_mark_archive_dirty(lib->dev);
+            } else if (add_err) {
+                GGML_LOG_DEBUG("%s: add-to-archive skipped for '%s': %s\n",
+                        __func__, name, [[add_err description] UTF8String]);
+            }
+        }
+
+        [pdesc release];
         [mtl_function release];
 
         if (!obj) {
@@ -531,9 +555,132 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
+    id<MTLBinaryArchive> binary_archive;
+    NSURL * binary_archive_url;
+    bool binary_archive_dirty;
+
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 };
+
+static NSURL * openasr_metal_pipeline_cache_url(NSString * device_name) {
+    NSFileManager * fm = [NSFileManager defaultManager];
+
+    NSURL * cache_dir = nil;
+    const char * env_dir = getenv("GGML_METAL_PIPELINE_CACHE");
+    if (env_dir && env_dir[0] != '\0') {
+        cache_dir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:env_dir]];
+    } else {
+        NSURL * libcache = [fm URLForDirectory:NSCachesDirectory
+                                     inDomain:NSUserDomainMask
+                            appropriateForURL:nil
+                                       create:YES
+                                        error:nil];
+        if (!libcache) {
+            return nil;
+        }
+        cache_dir = [libcache URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
+    }
+
+    NSError * mkdir_err = nil;
+    if (![fm createDirectoryAtURL:cache_dir
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:&mkdir_err]) {
+        GGML_LOG_WARN("%s: pipeline-cache dir %s unwritable (%s) - caching disabled\n",
+                __func__,
+                [[cache_dir path] UTF8String],
+                mkdir_err ? [[mkdir_err description] UTF8String] : "unknown");
+        return nil;
+    }
+
+    NSMutableCharacterSet * unsafe = [NSMutableCharacterSet whitespaceCharacterSet];
+    [unsafe addCharactersInString:@"/\\:*?\"|<>"];
+    NSArray<NSString *> * parts = [device_name componentsSeparatedByCharactersInSet:unsafe];
+    NSString * safe = [parts componentsJoinedByString:@"_"];
+    if (safe.length == 0) {
+        safe = @"unknown-device";
+    }
+
+    NSString * filename = [NSString stringWithFormat:@"%@.archive", safe];
+    return [cache_dir URLByAppendingPathComponent:filename];
+}
+
+static void openasr_metal_pipeline_cache_open(ggml_metal_device_t dev) {
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+        // continue
+    } else {
+        return;
+    }
+
+    const char * disable = getenv("GGML_METAL_PIPELINE_CACHE_DISABLE");
+    if (disable && disable[0] != '\0' && disable[0] != '0') {
+        GGML_LOG_INFO("%s: GGML_METAL_PIPELINE_CACHE_DISABLE set - skipping pipeline cache\n", __func__);
+        return;
+    }
+
+    NSURL * url = openasr_metal_pipeline_cache_url([dev->mtl_device name]);
+    if (!url) {
+        return;
+    }
+
+    MTLBinaryArchiveDescriptor * desc = [MTLBinaryArchiveDescriptor new];
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[url path]];
+    if (exists) {
+        desc.url = url;
+    }
+
+    NSError * err = nil;
+    id<MTLBinaryArchive> archive = [dev->mtl_device newBinaryArchiveWithDescriptor:desc error:&err];
+    [desc release];
+
+    if (!archive) {
+        if (exists) {
+            GGML_LOG_WARN("%s: cached archive %s rejected by Metal (%s) - discarding and starting fresh\n",
+                    __func__,
+                    [[url path] UTF8String],
+                    err ? [[err description] UTF8String] : "unknown");
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            err = nil;
+            MTLBinaryArchiveDescriptor * fresh = [MTLBinaryArchiveDescriptor new];
+            archive = [dev->mtl_device newBinaryArchiveWithDescriptor:fresh error:&err];
+            [fresh release];
+        }
+        if (!archive) {
+            GGML_LOG_WARN("%s: pipeline-cache init failed (%s) - caching disabled\n",
+                    __func__,
+                    err ? [[err description] UTF8String] : "unknown");
+            return;
+        }
+    }
+
+    dev->binary_archive = archive;
+    dev->binary_archive_url = [url retain];
+    dev->binary_archive_dirty = false;
+    GGML_LOG_INFO("%s: pipeline cache %s - %s\n",
+            __func__,
+            exists ? "loaded" : "created",
+            [[url path] UTF8String]);
+}
+
+static void openasr_metal_pipeline_cache_flush(ggml_metal_device_t dev) {
+    if (!dev->binary_archive || !dev->binary_archive_url || !dev->binary_archive_dirty) {
+        return;
+    }
+
+    NSError * err = nil;
+    if ([dev->binary_archive serializeToURL:dev->binary_archive_url error:&err]) {
+        GGML_LOG_INFO("%s: pipeline cache serialised -> %s\n",
+                __func__,
+                [[dev->binary_archive_url path] UTF8String]);
+        dev->binary_archive_dirty = false;
+    } else {
+        GGML_LOG_WARN("%s: pipeline cache serialise failed for %s (%s)\n",
+                __func__,
+                [[dev->binary_archive_url path] UTF8String],
+                err ? [[err description] UTF8String] : "unknown");
+    }
+}
 
 //
 // MTLResidenceSet wrapper
@@ -858,6 +1005,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             snprintf(dev->props.name, sizeof(dev->props.name), "%s%d", "MTL", device);
             snprintf(dev->props.desc, sizeof(dev->props.desc), "%s", [[dev->mtl_device name] UTF8String]);
 
+            openasr_metal_pipeline_cache_open(dev);
+
             dev->library = ggml_metal_library_init(dev);
             if (!dev->library) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
@@ -922,8 +1071,20 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
 
     ggml_metal_rsets_free(dev->rsets);
 
+    openasr_metal_pipeline_cache_flush(dev);
+
     ggml_metal_library_free(dev->library);
     dev->library = NULL;
+
+    if (dev->binary_archive) {
+        [dev->binary_archive release];
+        dev->binary_archive = nil;
+    }
+
+    if (dev->binary_archive_url) {
+        [dev->binary_archive_url release];
+        dev->binary_archive_url = nil;
+    }
 
     if (dev->mtl_queue) {
         [dev->mtl_queue release];
@@ -948,6 +1109,16 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
+}
+
+static id<MTLBinaryArchive> openasr_metal_device_archive(ggml_metal_device_t dev) {
+    return dev ? dev->binary_archive : nil;
+}
+
+static void openasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev) {
+    if (dev) {
+        dev->binary_archive_dirty = true;
+    }
 }
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
