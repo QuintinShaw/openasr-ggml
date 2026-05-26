@@ -700,7 +700,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_end,
             ctx->use_fusion,
             ctx->use_concurrency,
-            ctx->capture_compute,
+            ctx->capture_started,
             ctx->debug_graph,
             ctx->debug_fusion);
 
