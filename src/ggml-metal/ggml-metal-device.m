@@ -579,7 +579,10 @@ static NSURL * openasr_metal_pipeline_cache_url(NSString * device_name) {
         if (!libcache) {
             return nil;
         }
-        cache_dir = [libcache URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
+        // Keep OpenASR's Metal binary archive separate from other ggml-based apps so
+        // benchmark and runtime startup are not perturbed by a shared global cache file.
+        NSURL * app_cache = [libcache URLByAppendingPathComponent:@"openasr" isDirectory:YES];
+        cache_dir = [app_cache URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
     }
 
     NSError * mkdir_err = nil;
