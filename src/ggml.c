@@ -6657,12 +6657,16 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_CONT: {
             // same as cpy
+            // The cont op is a contiguous copy of src0.  Its gradient is the
+            // incoming grad reshaped back to src0's shape.  The incoming grad
+            // can be non-contiguous (e.g. when a permute-backward sets this
+            // node's gradient), so we make it contiguous first - equivalent to
+            // the GGML_OP_RESHAPE backward which handles the same pattern.
             if (src0_needs_grads) {
-                GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
-                GGML_ASSERT(ggml_is_contiguous(grad));
                 GGML_ASSERT(ggml_nelements(tensor) == ggml_nelements(src0));
+                struct ggml_tensor * grad_c = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
                 ggml_add_or_set(ctx, cgraph, isrc0,
-                    ggml_are_same_shape(tensor, src0) ? grad : ggml_reshape(ctx, grad, src0));
+                    ggml_are_same_shape(tensor, src0) ? grad_c : ggml_reshape(ctx, grad_c, src0));
             }
         } break;
         case GGML_OP_RESHAPE: {
