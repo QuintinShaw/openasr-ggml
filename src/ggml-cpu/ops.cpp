@@ -4003,6 +4003,87 @@ void ggml_compute_forward_rms_norm_back(
     }
 }
 
+// ggml_compute_forward_norm_back (OpenASR: LayerNorm input gradient for OADP)
+
+static void ggml_compute_forward_norm_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0]; // dz: gradient w.r.t. ggml_norm output
+    const ggml_tensor * src1 = dst->src[1]; // x:  ggml_norm forward input
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    // Forward: mu = mean(x), var = mean((x-mu)^2), s = 1/sqrt(var+eps),
+    //          y_i = (x_i - mu) * s.
+    // Backward (normalize-only LayerNorm), per row of ne00 elements:
+    //   dx_i = s * ( dz_i - mean(dz) - (x_i-mu) * s^2 * mean(dz*(x-mu)) )
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * dz = (const float *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * x  = (const float *) ((const char *) src1->data + i01*nb11 + i02*nb12 + i03*nb13);
+                float * dx = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                ggml_float sum_x = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum_x += (ggml_float) x[i00];
+                }
+                const float mean = (float) (sum_x / ne00);
+
+                ggml_float sum_xc2   = 0.0; // Sum (x-mu)^2
+                ggml_float sum_dz    = 0.0; // Sum dz
+                ggml_float sum_dz_xc = 0.0; // Sum dz*(x-mu)
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    const float xc = x[i00] - mean;
+                    sum_xc2   += (ggml_float) (xc * xc);
+                    sum_dz    += (ggml_float) dz[i00];
+                    sum_dz_xc += (ggml_float) (dz[i00] * xc);
+                }
+                const float var       = (float) (sum_xc2 / ne00);
+                const float s         = 1.0f / sqrtf(var + eps);     // 1/sigma
+                const float mean_dz   = (float) (sum_dz / ne00);
+                const float mean_dzxc = (float) (sum_dz_xc / ne00);  // mean(dz*(x-mu))
+                const float s2_mdzxc  = s * s * mean_dzxc;           // s^2 * mean(dz*(x-mu))
+
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    const float xc = x[i00] - mean;
+                    dx[i00] = s * (dz[i00] - mean_dz - xc * s2_mdzxc);
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_norm_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_norm_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_group_norm
 
 static void ggml_compute_forward_group_norm_f32(

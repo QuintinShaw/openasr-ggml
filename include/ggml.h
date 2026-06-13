@@ -583,6 +583,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // OpenASR: LayerNorm input-gradient op for OADP LoRA training. Appended
+        // at the end so existing op ordinals are unchanged. See ggml_norm_back.
+        GGML_OP_NORM_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -1406,6 +1410,15 @@ extern "C" {
     // a - x
     // b - dy
     GGML_API struct ggml_tensor * ggml_rms_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // OpenASR: LayerNorm (ggml_norm) input gradient, for OADP LoRA training.
+    // a - dy (gradient w.r.t. the ggml_norm output)
+    // b - x  (the ggml_norm forward input)
+    GGML_API struct ggml_tensor * ggml_norm_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,

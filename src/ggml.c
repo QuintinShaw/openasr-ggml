@@ -1085,9 +1085,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "NORM_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1195,9 +1197,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "norm_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3162,6 +3166,24 @@ struct ggml_tensor * ggml_rms_norm_back(
     ggml_set_op_params(result, &eps, sizeof(eps));
 
     result->op     = GGML_OP_RMS_NORM_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_norm_back (OpenASR: LayerNorm input gradient for OADP LoRA training)
+
+struct ggml_tensor * ggml_norm_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,   // dy: gradient w.r.t. the ggml_norm output
+        struct ggml_tensor  * b,   // x:  the ggml_norm forward input
+        float                 eps) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_NORM_BACK;
     result->src[0] = a;
     result->src[1] = b;
 
@@ -6523,6 +6545,15 @@ static void ggml_compute_backward(
                 float eps;
                 memcpy(&eps, tensor->op_params, sizeof(float));
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
+            }
+        } break;
+        case GGML_OP_NORM: {
+            // OpenASR: LayerNorm input gradient (OADP LoRA training). Mirrors
+            // the RMS_NORM case with the mean-subtracting LayerNorm backward.
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_norm_back(ctx, grad, src0, eps));
             }
         } break;
         case GGML_OP_MUL_MAT: {
