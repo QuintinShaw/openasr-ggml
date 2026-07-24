@@ -9216,6 +9216,166 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
+// ggml_compute_forward_flash_attn_rel_pos
+//
+// OpenASR local CPU kernel: Transformer-XL AC+BD relative attention with
+// online softmax. Never materializes the T x T score matrix.
+//
+// src[0]=q_u, src[1]=q_v, src[2]=k, src[3]=r, src[4]=v, src[5]=mask(opt)
+// All Q/K/R/V are F32 with contiguous rows. Output layout matches
+// ggml_flash_attn_ext: [Dv, H, Nq, B].
+
+void ggml_compute_forward_flash_attn_rel_pos(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q_u  = dst->src[0];
+    const ggml_tensor * q_v  = dst->src[1];
+    const ggml_tensor * k    = dst->src[2];
+    const ggml_tensor * r    = dst->src[3];
+    const ggml_tensor * v    = dst->src[4];
+    const ggml_tensor * mask = dst->src[5];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q_u, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q_u, nb)
+    GGML_TENSOR_LOCALS(int64_t, nevq, q_v, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbvq, q_v, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ner, r,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbr, r,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t Nq = neq1;
+    const int64_t Nk = nek1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne1 == neq2); // H
+    GGML_ASSERT(ne2 == Nq);
+    GGML_ASSERT(ne3 == neq3);
+
+    GGML_ASSERT(neq0 == DK && nevq0 == DK && ner0 == DK);
+    GGML_ASSERT(nevq1 == Nq && nevq2 == neq2 && nevq3 == neq3);
+    GGML_ASSERT(nev1 == Nk);
+    GGML_ASSERT(ner1 == Nq + Nk - 1);
+
+    // Contiguous rows on all feature tensors.
+    GGML_ASSERT(nbq0  == sizeof(float));
+    GGML_ASSERT(nbvq0 == sizeof(float));
+    GGML_ASSERT(nbk0  == sizeof(float));
+    GGML_ASSERT(nbr0  == sizeof(float));
+    GGML_ASSERT(nbv0  == sizeof(float));
+
+    // Destination cannot be transposed.
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    const int64_t rk2 = neq2 / nek2;
+    const int64_t rk3 = neq3 / nek3;
+    const int64_t rv2 = neq2 / nev2;
+    const int64_t rv3 = neq3 / nev3;
+    const int64_t rr2 = neq2 / ner2;
+    const int64_t rr3 = neq3 / ner3;
+
+    float scale = 1.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+
+    const int64_t nr  = neq3 * neq2 * neq1; // total query rows
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float * VKQ = (float *) params->wdata + params->ith * (DV + CACHE_LINE_SIZE_F32);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iq3 = ir / (neq2 * neq1);
+        const int64_t iq2 = (ir - iq3 * neq2 * neq1) / neq1;
+        const int64_t iq1 = (ir - iq3 * neq2 * neq1 - iq2 * neq1);
+
+        const int64_t ik3 = iq3 / rk3;
+        const int64_t ik2 = iq2 / rk2;
+        const int64_t iv3 = iq3 / rv3;
+        const int64_t iv2 = iq2 / rv2;
+        const int64_t ir3 = iq3 / rr3;
+        const int64_t ir2 = iq2 / rr2;
+
+        const float * pq_u = (const float *) ((const char *) q_u->data + iq1*nbq1  + iq2*nbq2  + iq3*nbq3);
+        const float * pq_v = (const float *) ((const char *) q_v->data + iq1*nbvq1 + iq2*nbvq2 + iq3*nbvq3);
+
+        // Optional F32 additive mask, broadcast over heads/batch like soft_max.
+        const float * mp = nullptr;
+        size_t mp_nb0 = sizeof(float);
+        if (mask) {
+            const int64_t im1 = iq1 % mask->ne[1];
+            const int64_t im2 = iq2 % mask->ne[2];
+            const int64_t im3 = iq3 % mask->ne[3];
+            mp = (const float *) ((const char *) mask->data
+                    + im1 * mask->nb[1]
+                    + im2 * mask->nb[2]
+                    + im3 * mask->nb[3]);
+            mp_nb0 = mask->nb[0];
+        }
+
+        float S = 0.0f;
+        float M = -INFINITY;
+        memset(VKQ, 0, DV * sizeof(float));
+
+        for (int64_t ic = 0; ic < Nk; ++ic) {
+            float mv = 0.0f;
+            if (mp) {
+                mv = * (const float *) ((const char *) mp + ic * mp_nb0);
+                if (mv == -INFINITY) {
+                    continue;
+                }
+            }
+
+            const char * k_data = (const char *) k->data + ic*nbk1 + ik2*nbk2 + ik3*nbk3;
+            float s_ac = 0.0f;
+            ggml_vec_dot_f32(DK, &s_ac, 0, (const float *) k_data, 0, pq_u, 0, 1);
+
+            // rel_idx = (Nq - 1) + key - query  (matches OpenASR rel_shift view)
+            const int64_t rel = (Nq - 1) + ic - iq1;
+            GGML_ASSERT(rel >= 0 && rel < ner1);
+            const char * r_data = (const char *) r->data + rel*nbr1 + ir2*nbr2 + ir3*nbr3;
+            float s_bd = 0.0f;
+            ggml_vec_dot_f32(DK, &s_bd, 0, (const float *) r_data, 0, pq_v, 0, 1);
+
+            float s = scale * (s_ac + s_bd) + mv;
+
+            const float Mold = M;
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            const char * v_data = (const char *) v->data + ic*nbv1 + iv2*nbv2 + iv3*nbv3;
+
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                ggml_vec_scale_f32(DV, VKQ, ms);
+                vs = 1.0f;
+            } else {
+                vs = expf(s - M);
+            }
+
+            ggml_vec_mad_f32(DV, VKQ, (const float *) v_data, vs);
+            S = S * ms + vs;
+        }
+
+        const float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+        ggml_vec_scale_f32(DV, VKQ, S_inv);
+
+        // dst layout: [Dv, H, Nq, B] with permute(0, 2, 1, 3) packing
+        // i0=Dv, i1=H=iq2, i2=Nq=iq1, i3=B=iq3
+        memcpy((char *) dst->data + iq3*nb3 + iq1*nb2 + iq2*nb1, VKQ, DV * sizeof(float));
+    }
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(

@@ -559,6 +559,9 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        // OpenASR local: CPU fused Transformer-XL relative-position attention
+        // (content + relative scores + online softmax; does not materialize T x T).
+        GGML_OP_FLASH_ATTN_REL_POS,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2445,6 +2448,30 @@ extern "C" {
            struct ggml_tensor  * v,
            struct ggml_tensor  * d,
            bool                  masked);
+
+    // OpenASR local (CPU-only): fused Transformer-XL relative-position attention.
+    //
+    // score(i, j) = scale * (dot(q_u[i], k[j]) + dot(q_v[i], r[(Nq-1) + j - i]))
+    //             + mask[j, i, ...]   (mask optional, F32, broadcastable)
+    //
+    // q_u/q_v: [D,  Nq, H,   B] F32
+    // k:       [D,  Nk, Hkv, B] F32
+    // r:       [D,  Nr, Hkv, B] F32   with Nr == Nq + Nk - 1
+    // v:       [Dv, Nk, Hkv, B] F32
+    // mask:    [Nk, Nq, ...]    F32 or NULL
+    // res:     [Dv, H,  Nq,  B] F32   (same layout as ggml_flash_attn_ext)
+    //
+    // Only the CPU backend implements this op. Other backends must report
+    // unsupported; callers should keep a naive mul_mat + rel_shift fallback.
+    GGML_API struct ggml_tensor * ggml_flash_attn_rel_pos(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_u,
+            struct ggml_tensor  * q_v,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
