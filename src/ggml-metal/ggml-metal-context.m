@@ -72,10 +72,6 @@ struct ggml_metal {
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
-    // abort ggml_metal_graph_compute if callback returns true
-    ggml_abort_callback abort_callback;
-    void *              abort_callback_data;
-
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
@@ -536,15 +532,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
 
-            // always enqueue the first two command buffers
-            // enqueue all of the command buffers if we don't need to abort
-            if (cb_idx < 2 || ctx->abort_callback == NULL) {
-                [cmd_buf enqueue];
+            [cmd_buf enqueue];
 
-                // update the pointer to the last queued command buffer
-                // this is needed to implement synchronize()
-                ctx->cmd_buf_last = cmd_buf;
-            }
+            // update the pointer to the last queued command buffer
+            // this is needed to implement synchronize()
+            ctx->cmd_buf_last = cmd_buf;
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
@@ -586,22 +578,6 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     return GGML_STATUS_FAILED;
                 }
 
-                id<MTLCommandBuffer> next_buffer = (i + 1 < n_cb ? ctx->cmd_bufs[i + 1].obj : nil);
-                if (!next_buffer) {
-                    continue;
-                }
-
-                const bool next_queued = ([next_buffer status] != MTLCommandBufferStatusNotEnqueued);
-                if (next_queued) {
-                    continue;
-                }
-
-                if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
-                    GGML_LOG_INFO("%s: command buffer %d aborted", __func__, i);
-                    return GGML_STATUS_ABORTED;
-                }
-
-                [next_buffer commit];
             }
 
             [ctx->capture_scope endScope];
@@ -715,15 +691,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
-        if (cb_idx < 2 || ctx->abort_callback == NULL) {
-            [cmd_buf commit];
-        }
+        [cmd_buf commit];
     });
-}
-
-void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
-    ctx->abort_callback = abort_callback;
-    ctx->abort_callback_data = user_data;
 }
 
 bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {

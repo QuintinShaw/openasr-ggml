@@ -104,6 +104,33 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
+    // Cooperative graph cancellation. Native mode means the backend polls
+    // inside one graph submission. Segmented mode is the shared fallback: the
+    // backend layer submits bounded graph views and synchronizes between them.
+    // In both modes an observed callback=true returns GGML_STATUS_ABORTED and
+    // no backend work remains in flight when the compute call returns.
+    enum ggml_backend_graph_cancel_mode {
+        GGML_BACKEND_GRAPH_CANCEL_DISABLED  = 0,
+        GGML_BACKEND_GRAPH_CANCEL_NATIVE    = 1,
+        GGML_BACKEND_GRAPH_CANCEL_SEGMENTED = 2,
+    };
+
+    // Non-native backends synchronize after at most this many graph nodes while
+    // cancellation is armed. 32 is half Metal's historical 64-node main
+    // submission: smaller segments would lower worst-case cancellation latency
+    // but add more submission/synchronization overhead, while larger segments
+    // improve throughput at the cost of slower cancellation observation. The
+    // callback-free async path is unchanged.
+#define GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES 32
+
+    // Synchronous, compute-scoped cancellation. `abort_callback_data` must stay
+    // alive only for this call; no job pointer is retained by the shared layer.
+    // `cancel_mode` reports the contract actually used for this compute.
+    GGML_API enum ggml_status ggml_backend_graph_compute_with_abort(
+            ggml_backend_t backend, struct ggml_cgraph * cgraph,
+            ggml_abort_callback abort_callback, void * abort_callback_data,
+            enum ggml_backend_graph_cancel_mode * cancel_mode);
+
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
     GGML_API bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
@@ -342,6 +369,13 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    // Synchronous cancellation also polls around scheduler-controlled input
+    // waits/copies. One backend call already in progress remains indivisible;
+    // every backend is synchronized before an observed abort returns.
+    GGML_API enum ggml_status ggml_backend_sched_graph_compute_with_abort(
+            ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+            ggml_abort_callback abort_callback, void * abort_callback_data,
+            enum ggml_backend_graph_cancel_mode * cancel_mode);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

@@ -168,6 +168,13 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+# shared backend graph cancellation contract
+set(TEST_TARGET test-backend-cancel)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 
 if (NOT GGML_BACKEND_DL)
     #
