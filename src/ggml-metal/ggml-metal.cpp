@@ -617,14 +617,6 @@ bool ggml_backend_is_metal(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
 }
 
-void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
-}
-
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

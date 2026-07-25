@@ -447,8 +447,72 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
     return err;
 }
 
+static ggml_backend_set_abort_callback_t ggml_backend_native_abort_callback(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
+    if (reg == NULL) {
+        return NULL;
+    }
+    return (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_set_abort_callback");
+}
+
+enum ggml_status ggml_backend_graph_compute_with_abort(
+        ggml_backend_t backend, struct ggml_cgraph * cgraph,
+        ggml_abort_callback abort_callback, void * abort_callback_data,
+        enum ggml_backend_graph_cancel_mode * cancel_mode) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(cgraph);
+    GGML_ASSERT(cancel_mode);
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    if (abort_callback == NULL) {
+        return ggml_backend_graph_compute(backend, cgraph);
+    }
+
+    ggml_backend_set_abort_callback_t native = ggml_backend_native_abort_callback(backend);
+    *cancel_mode = native != NULL
+        ? GGML_BACKEND_GRAPH_CANCEL_NATIVE
+        : GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+
+    // A pre-start cancellation still honors the synchronous return contract:
+    // no work previously queued on this backend remains in flight.
+    if (abort_callback(abort_callback_data)) {
+        ggml_backend_synchronize(backend);
+        return GGML_STATUS_ABORTED;
+    }
+
+    if (native != NULL) {
+        native(backend, abort_callback, abort_callback_data);
+        enum ggml_status status = ggml_backend_graph_compute(backend, cgraph);
+        native(backend, NULL, NULL);
+        return status;
+    }
+
+    // A backend without a native abort hook still receives a real, typed
+    // mid-graph cancellation contract. Graph views are already the scheduler's
+    // portable unit of partial execution; synchronizing each bounded view makes
+    // it safe to stop without leaving queued work that can touch reused buffers.
+    // The callback-free path remains exactly the backend's original async path.
+    for (int i = 0; i < cgraph->n_nodes; i += GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES) {
+        const int i_end = std::min(i + GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES, cgraph->n_nodes);
+        struct ggml_cgraph view = ggml_graph_view(cgraph, i, i_end);
+        enum ggml_status status = backend->iface.graph_compute(backend, &view);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_synchronize(backend);
+            return status;
+        }
+        ggml_backend_synchronize(backend);
+        if (abort_callback(abort_callback_data)) {
+            return GGML_STATUS_ABORTED;
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+
     return backend->iface.graph_compute(backend, cgraph);
 }
 
@@ -1538,7 +1602,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(
+        ggml_backend_sched_t sched, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1546,13 +1611,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    const auto abort_requested = [&]() {
+        return abort_callback != NULL && abort_callback(abort_callback_data);
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        // A scheduler split may first wait for or copy inputs owned by another
+        // backend. Poll at every scheduler-controlled boundary so cancellation
+        // cannot silently traverse the rest of the transfer phase. An already
+        // entered backend wait/copy remains indivisible; the public synchronous
+        // wrapper drains every backend before returning ABORTED.
+        if (abort_requested()) {
+            return GGML_STATUS_ABORTED;
+        }
+
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (abort_requested()) {
+                return GGML_STATUS_ABORTED;
+            }
+
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1564,6 +1646,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                if (abort_requested()) {
+                    return GGML_STATUS_ABORTED;
+                }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -1571,6 +1656,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+                if (abort_requested()) {
+                    return GGML_STATUS_ABORTED;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1586,6 +1674,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
                     ggml_backend_synchronize(input_backend);
+                    if (abort_requested()) {
+                        return GGML_STATUS_ABORTED;
+                    }
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1605,6 +1696,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1622,6 +1716,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (abort_requested()) {
+                            return false;
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -1633,6 +1730,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        return !abort_requested();
                     };
 
                     int id = 0;
@@ -1652,30 +1750,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             continue;
                         }
 
-                        copy_experts(first_id, last_id);
+                        if (!copy_experts(first_id, last_id)) {
+                            return GGML_STATUS_ABORTED;
+                        }
 
                         first_id = id;
                         last_id = id;
                     }
-                    copy_experts(first_id, last_id);
+                    if (!copy_experts(first_id, last_id)) {
+                        return GGML_STATUS_ABORTED;
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
+
+            if (abort_requested()) {
+                return GGML_STATUS_ABORTED;
+            }
+        }
+
+        if (abort_requested()) {
+            return GGML_STATUS_ABORTED;
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec;
+            if (abort_callback == NULL) {
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            } else {
+                enum ggml_backend_graph_cancel_mode unused_mode;
+                ec = ggml_backend_graph_compute_with_abort(
+                    split_backend, &split->graph, abort_callback, abort_callback_data, &unused_mode);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1697,7 +1820,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec;
+                if (abort_callback == NULL) {
+                    ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                } else {
+                    enum ggml_backend_graph_cancel_mode unused_mode;
+                    ec = ggml_backend_graph_compute_with_abort(
+                        split_backend, &gv, abort_callback, abort_callback_data, &unused_mode);
+                }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
@@ -1898,7 +2028,51 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    return ggml_backend_sched_compute_splits(sched, NULL, NULL);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_with_abort(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_abort_callback abort_callback, void * abort_callback_data,
+        enum ggml_backend_graph_cancel_mode * cancel_mode) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(graph);
+    GGML_ASSERT(cancel_mode);
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    if (abort_callback == NULL) {
+        return ggml_backend_sched_graph_compute(sched, graph);
+    }
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (ggml_backend_native_abort_callback(sched->backends[i]) == NULL) {
+            *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+        }
+    }
+
+    // Avoid graph splitting/allocation and its possible backend synchronization
+    // when the request was already cancelled before this compute began.
+    if (abort_callback(abort_callback_data)) {
+        ggml_backend_sched_synchronize(sched);
+        return GGML_STATUS_ABORTED;
+    }
+
+    if (!sched->is_reset && !sched->is_alloc) {
+        ggml_backend_sched_reset(sched);
+    }
+    if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    if (abort_callback(abort_callback_data)) {
+        ggml_backend_sched_synchronize(sched);
+        return GGML_STATUS_ABORTED;
+    }
+
+    enum ggml_status status = ggml_backend_sched_compute_splits(sched, abort_callback, abort_callback_data);
+    ggml_backend_sched_synchronize(sched);
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
