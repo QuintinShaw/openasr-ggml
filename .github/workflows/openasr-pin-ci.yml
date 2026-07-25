@@ -51,6 +51,7 @@ jobs:
           ${{ runner.os == 'Windows' && '-A x64' || '-G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++' }}
           -DCMAKE_BUILD_TYPE=Release
           -DGGML_BUILD_TESTS=ON
+          -DGGML_METAL=OFF
           -DBUILD_SHARED_LIBS=${{ matrix.linkage == 'shared' && 'ON' || 'OFF' }}
 
       - name: Build
