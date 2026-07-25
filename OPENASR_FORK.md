@@ -26,6 +26,12 @@ revisions remain reproducible.
 5. Require the `OpenASR pin / required` check and the OpenASR superproject's
    full regression before updating its submodule gitlink.
 
+The required hosted-runner matrix validates CPU portability on Linux, macOS,
+and Windows with both shared and static linkage. Accelerator changes also need
+validation on representative hardware; hosted macOS runners expose a
+paravirtual Metal device and are not a substitute for an Apple Silicon Metal
+run. Record those hardware results in the superproject pull request.
+
 The superproject helper `tooling/ggml-sync/sync.sh` performs the local replay.
 It intentionally leaves review, pushing, and the gitlink update as separate
 steps.
