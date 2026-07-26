@@ -2356,8 +2356,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
-        CUDA_CHECK(err);
+        GGML_LOG_ERROR("%s: %s failed: %s\n", __func__, ggml_op_desc(dst), cudaGetErrorString(err));
+        ctx.terminal_status = err == cudaErrorDeviceLost
+            ? GGML_STATUS_DEVICE_LOST
+            : GGML_STATUS_EXECUTION_FAILED;
+        return false;
     }
 
     return true;
@@ -2380,111 +2383,79 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+static enum ggml_status ggml_backend_cuda_completion_status(cudaError_t error) {
+    if (error == cudaSuccess) return GGML_STATUS_SUCCESS;
+    return error == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
 }
 
-static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    return ggml_backend_cuda_completion_status(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
-static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
-        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+static enum ggml_status ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    return ggml_backend_cuda_completion_status(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
-static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
-        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+static enum ggml_status ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    return ggml_backend_cuda_completion_status(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
-static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static enum ggml_status ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    return ggml_backend_cuda_completion_status(cudaMemcpy2DAsync(data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+}
+
+static enum ggml_status ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
-
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
-        return false;
-    }
-
-    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
-        return false;
-    }
-
-    // device -> device copy
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst) || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) return GGML_STATUS_FAILED;
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
-
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
-
-    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
-#endif // NDEBUG
-        return false;
-    }
-
+    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) return GGML_STATUS_FAILED;
+    cudaError_t error;
     if (backend_src != backend_dst) {
-        // copy on src stream
-        // compare the backing physical devices: distinct virtual devices may share one physical GPU,
-        // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
-        if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-        } else {
+        if (src_physical == dst_physical) error = cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream());
 #ifdef GGML_CUDA_NO_PEER_COPY
-            return false;
+        else return GGML_STATUS_FAILED;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
-#endif // GGML_CUDA_NO_PEER_COPY
-        }
-
-        // record event on src stream after the copy
+        else error = cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream());
+#endif
+        if (error != cudaSuccess) return ggml_backend_cuda_completion_status(error);
         if (!cuda_ctx_src->copy_event) {
             ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            error = cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming);
+            if (error != cudaSuccess) return ggml_backend_cuda_completion_status(error);
         }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-
-        // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        error = cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream());
+        if (error != cudaSuccess) return ggml_backend_cuda_completion_status(error);
+        error = cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0);
     } else {
-        // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        error = cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream());
     }
-    return true;
+    return ggml_backend_cuda_completion_status(error);
 }
 
-static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+
+
+static enum ggml_status ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-
-    GGML_UNUSED(backend);
+    return ggml_backend_cuda_completion_status(cudaStreamSynchronize(cuda_ctx->stream()));
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -2574,7 +2545,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static enum ggml_status ggml_cuda_status(cudaError_t error) {
+    return error == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
+}
+
+static void ggml_cuda_graph_capture_finished() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+    if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        ggml_cuda_lock_cv.notify_all();
+    }
+}
+
+static enum ggml_status ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -2591,15 +2573,24 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
 
-        // The pre-existing graph exec cannot be updated due to violated constraints
-        // so instead clear error and re-instantiate
-        (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        // The pre-existing graph exec cannot be updated due to violated constraints,
+        // so discard it and instantiate a replacement. Any runtime failure is a
+        // terminal graph failure, never a process-wide abort.
+        (void) cudaGetLastError();
+        cudaError_t destroy_status = cudaGraphExecDestroy(graph->instance);
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    } else {
-        GGML_ASSERT(stat == cudaSuccess);
+        if (destroy_status != cudaSuccess) {
+            return destroy_status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
+        }
+        cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        return instantiate_status == cudaSuccess
+            ? GGML_STATUS_SUCCESS
+            : (instantiate_status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
     }
+
+    return stat == cudaSuccess
+        ? GGML_STATUS_SUCCESS
+        : (stat == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 #endif // USE_CUDA_GRAPH
 
@@ -3852,7 +3843,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -3864,22 +3855,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool                         should_launch_concurrent_events = false;
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
-        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
-            concurrent_event = &stream_ctx.concurrent_events[node];
-
-            is_concurrent_event_active = true;
-
-            GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
-
-            cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
-            GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
-            CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
-
-            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
-                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
-            }
+        if (stream_ctx.concurrent_events.find(node) == stream_ctx.concurrent_events.end()) {
+            return GGML_STATUS_SUCCESS;
         }
+        concurrent_event = &stream_ctx.concurrent_events[node];
+        GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
+
+        cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
+        GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+        cudaError_t error = cudaEventRecord(concurrent_event->fork_event, main_stream);
+        if (error != cudaSuccess) return ggml_backend_cuda_completion_status(error);
+        for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+            cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
+            error = cudaStreamWaitEvent(stream, concurrent_event->fork_event);
+            if (error != cudaSuccess) return ggml_backend_cuda_completion_status(error);
+        }
+        is_concurrent_event_active = true;
+        return GGML_STATUS_SUCCESS;
     };
 
     while (!graph_evaluated_or_captured) {
@@ -3959,9 +3951,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->curr_stream_no = 0;
                         for (int i = 1; i <= concurrent_event->n_streams; ++i) {
                             // Wait on join events of forked streams in the main stream
-                            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
-                                                       cuda_ctx->stream(cuda_ctx->device, i)));
-                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
+                            cudaError_t join_status = cudaEventRecord(concurrent_event->join_events[i - 1],
+                                                                         cuda_ctx->stream(cuda_ctx->device, i));
+                            if (join_status != cudaSuccess) return ggml_backend_cuda_completion_status(join_status);
+                            join_status = cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]);
+                            if (join_status != cudaSuccess) return ggml_backend_cuda_completion_status(join_status);
                         }
 
                         is_concurrent_event_active = false;
@@ -3974,7 +3968,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 } else if (i - prev_i > 1) {
                     //the previous node was fused
                     const ggml_tensor * prev_node = cgraph->nodes[i - 1];
-                    try_launch_concurrent_event(prev_node);
+                    const enum ggml_status launch_status = try_launch_concurrent_event(prev_node);
+                    if (launch_status != GGML_STATUS_SUCCESS) return launch_status;
 
                     if (is_concurrent_event_active) {
                         cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
@@ -4019,12 +4014,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
-                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    GGML_LOG_ERROR("%s: op not supported or dispatch failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+#ifdef USE_CUDA_GRAPH
+                    if (use_cuda_graph && cuda_graph_update_required) {
+                        cudaGraph_t abandoned = nullptr;
+                        (void) cudaStreamEndCapture(cuda_ctx->stream(), &abandoned);
+                        if (abandoned != nullptr) {
+                            (void) cudaGraphDestroy(abandoned);
+                        }
+                        ggml_cuda_graph_capture_finished();
+                    }
+#endif
+                    return cuda_ctx->terminal_status;
                 }
-                GGML_ASSERT(ok);
 
                 if (!is_concurrent_event_active) {
-                    try_launch_concurrent_event(node);
+                    const enum ggml_status launch_status = try_launch_concurrent_event(node);
+                    if (launch_status != GGML_STATUS_SUCCESS) return launch_status;
                }
             }
         }
@@ -4033,17 +4039,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
             if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                cudaError_t destroy_status = cudaGraphDestroy(graph->graph);
                 graph->graph = nullptr;
+                if (destroy_status != cudaSuccess) {
+                    ggml_cuda_graph_capture_finished();
+                    return ggml_cuda_status(destroy_status);
+                }
             }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            cudaError_t capture_status = cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph);
+            ggml_cuda_graph_capture_finished();
+            if (capture_status != cudaSuccess) {
+                graph->graph = nullptr;
+                return ggml_cuda_status(capture_status);
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
-
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
-            }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -4052,19 +4062,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (instantiate_status != cudaSuccess) {
+                graph->instance = nullptr;
+                return ggml_cuda_status(instantiate_status);
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            enum ggml_status update_status = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            if (update_status != GGML_STATUS_SUCCESS) {
+                return update_status;
+            }
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        cudaError_t launch_status = cudaGraphLaunch(graph->instance, cuda_ctx->stream());
+        if (launch_status != cudaSuccess) {
+            return ggml_cuda_status(launch_status);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
-}
+
+    return GGML_STATUS_SUCCESS;
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
@@ -4087,6 +4108,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->terminal_status = GGML_STATUS_SUCCESS;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4134,37 +4156,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
-        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        cudaError_t capture_status = cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed);
+        if (capture_status != cudaSuccess) {
+            ggml_cuda_graph_capture_finished();
+            return ggml_cuda_status(capture_status);
+        }
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-
-    return GGML_STATUS_SUCCESS;
+    return ggml_cuda_graph_evaluate_and_capture(
+        cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 }
 
-static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_cuda_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
-
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    cudaError_t status = cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream());
+    return status == cudaSuccess
+        ? GGML_STATUS_SUCCESS
+        : (status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 
-static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
-
-    if (ggml_backend_is_cuda(backend)) {
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
-    } else {
-#if 0
-        // untested
-        auto wait_fn = [](void * user_data) {
-            ggml_backend_event_t event = (ggml_backend_event_t)user_data;
-            ggml_backend_event_synchronize(event);
-        };
-
-        CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), wait_fn, event));
-#endif
-        GGML_ABORT("fatal error");
+static enum ggml_status ggml_backend_cuda_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return GGML_STATUS_EXECUTION_FAILED;
     }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    cudaError_t status = cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0);
+    return status == cudaSuccess
+        ? GGML_STATUS_SUCCESS
+        : (status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -4425,8 +4444,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
-    /* .event_record            = */ ggml_backend_cuda_event_record,
-    /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .event_record_status     = */ ggml_backend_cuda_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_cuda_event_wait_status,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
 };
 
@@ -5164,7 +5183,11 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
     ggml_cuda_set_device(dev_ctx->device);
 
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    const cudaError_t status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: failed to create event: %s\n", __func__, cudaGetErrorString(status));
+        return nullptr;
+    }
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -5175,14 +5198,21 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
-
-    CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
+    if (event == nullptr) {
+        return;
+    }
+    if (event->context != nullptr) {
+        const cudaError_t status = cudaEventDestroy((cudaEvent_t)event->context);
+        if (status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: failed to destroy event: %s\n", __func__, cudaGetErrorString(status));
+        }
+    }
     delete event;
 }
 
-static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
-    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+    return ggml_backend_cuda_completion_status(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {

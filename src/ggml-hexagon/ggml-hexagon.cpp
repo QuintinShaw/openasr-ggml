@@ -3743,13 +3743,14 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
-    // Wait until all pending ops complete
+    // flush is the terminal completion boundary for this synchronous session.
     sess->flush();
+    return GGML_STATUS_SUCCESS;
 }
 
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {
@@ -3891,8 +3892,8 @@ static struct ggml_backend_i hexagon_backend_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_hexagon_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record_status     = */ NULL,
+    /* .event_wait_status       = */ NULL,
     /* .graph_optimize          = */ ggml_backend_hexagon_graph_optimize,
 };
 

@@ -72,8 +72,8 @@ struct ggml_metal {
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
-    // error state - set when a command buffer fails during synchronize
-    // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
+    // error state - set when a command buffer fails during completion
+    // once set, new submissions fail until the backend is recreated
     bool has_error;
 };
 
@@ -232,7 +232,11 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
-void ggml_metal_synchronize(ggml_metal_t ctx) {
+enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
+    if (ctx->has_error) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
@@ -256,7 +260,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                 }
                 ctx->has_error = true;
-                return;
+                return GGML_STATUS_EXECUTION_FAILED;
             }
         }
     }
@@ -280,7 +284,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 [ctx->cmd_bufs_ext removeAllObjects];
 
                 ctx->has_error = true;
-                return;
+                return GGML_STATUS_EXECUTION_FAILED;
             }
 
             [cmd_buf release];
@@ -288,6 +292,8 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
         [ctx->cmd_bufs_ext removeAllObjects];
     }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -300,141 +306,60 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
     return ggml_metal_buffer_get_id(buffer->context, t);
 }
 
-void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_metal_submit_blit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+    if (cmd_buf == nil) { ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+    [cmd_buf commit];
+    [ctx->cmd_bufs_ext addObject:cmd_buf];
+    ctx->cmd_buf_last = cmd_buf;
+    [cmd_buf retain];
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (ctx->has_error) return GGML_STATUS_BACKEND_POISONED;
     @autoreleasepool {
-        // wrap the source data into a Metal buffer
-        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
-                                                    length:size
-                                                   options:MTLResourceStorageModeShared];
-
-        GGML_ASSERT(buf_src);
-
-        struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(tensor);
-        if (bid_dst.metal == nil) {
-            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
-        }
-
-        bid_dst.offs += offset;
-
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-        [encoder copyFromBuffer:buf_src
-                   sourceOffset:0
-                       toBuffer:bid_dst.metal
-              destinationOffset:bid_dst.offs
-                           size:size];
-
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_src release];
-
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
-
-        [cmd_buf retain];
+        id<MTLBuffer> src = [(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        struct ggml_metal_buffer_id dst = ggml_metal_get_buffer_id(tensor);
+        if (src == nil || dst.metal == nil) { [src release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        id<MTLCommandBuffer> cmd = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx->dev) commandBuffer];
+        id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
+        if (enc == nil) { [src release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        [enc copyFromBuffer:src sourceOffset:0 toBuffer:dst.metal destinationOffset:dst.offs + offset size:size];
+        [enc endEncoding]; [src release]; return ggml_metal_submit_blit(ctx, cmd);
     }
 }
 
-void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+enum ggml_status ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (ctx->has_error) return GGML_STATUS_BACKEND_POISONED;
     @autoreleasepool {
-        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
-
-        GGML_ASSERT(buf_dst);
-
-        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
-        if (bid_src.metal == nil) {
-            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
-        }
-
-        bid_src.offs += offset;
-
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:buf_dst
-              destinationOffset:0
-                           size:size];
-
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_dst release];
-
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
-
-        [cmd_buf retain];
+        id<MTLBuffer> dst = [(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) newBufferWithBytesNoCopy:data length:size options:MTLResourceStorageModeShared deallocator:nil];
+        struct ggml_metal_buffer_id src = ggml_metal_get_buffer_id(tensor);
+        if (dst == nil || src.metal == nil) { [dst release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        id<MTLCommandBuffer> cmd = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx->dev) commandBuffer]; id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
+        if (enc == nil) { [dst release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        [enc copyFromBuffer:src.metal sourceOffset:src.offs + offset toBuffer:dst destinationOffset:0 size:size];
+        [enc endEncoding]; [dst release]; return ggml_metal_submit_blit(ctx, cmd);
     }
 }
 
-bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+enum ggml_status ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (ctx_src->has_error || ctx_dst->has_error) return GGML_STATUS_BACKEND_POISONED;
     @autoreleasepool {
-        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
-        struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
-
-        if (bid_src.metal == nil || bid_dst.metal == nil) {
-            return false;
-        }
-
-        // queue the copy operation into the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:bid_dst.metal
-              destinationOffset:bid_dst.offs
-                           size:ggml_nbytes(src)];
-
-        [encoder endEncoding];
-
-        ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx_src);
-        ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
-
-        [cmd_buf commit];
-
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx_src->cmd_bufs_ext addObject:cmd_buf];
-        ctx_src->cmd_buf_last = cmd_buf;
-
-        [cmd_buf retain];
-
-        ggml_metal_event_wait(ctx_dst, ev_cpy);
-
-        return true;
+        struct ggml_metal_buffer_id src_id = ggml_metal_get_buffer_id(src), dst_id = ggml_metal_get_buffer_id(dst);
+        if (src_id.metal == nil || dst_id.metal == nil) { ctx_src->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        id<MTLCommandBuffer> cmd = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx_src->dev) commandBuffer]; id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
+        if (enc == nil) { ctx_src->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        [enc copyFromBuffer:src_id.metal sourceOffset:src_id.offs toBuffer:dst_id.metal destinationOffset:dst_id.offs size:ggml_nbytes(src)];
+        [enc endEncoding]; ggml_metal_event_encode_signal(ggml_metal_get_ev_cpy(ctx_src), cmd);
+        enum ggml_status status = ggml_metal_submit_blit(ctx_src, cmd);
+        return status == GGML_STATUS_SUCCESS ? ggml_metal_event_wait(ctx_dst, ggml_metal_get_ev_cpy(ctx_src)) : status;
     }
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
-        return GGML_STATUS_FAILED;
+        return GGML_STATUS_BACKEND_POISONED;
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -587,7 +512,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
-    return GGML_STATUS_SUCCESS;
+    // Encoding rejection is the first observed terminal error. Do not turn it
+    // into BACKEND_POISONED until the caller has seen this result once.
+    return ctx->has_error ? GGML_STATUS_EXECUTION_FAILED : GGML_STATUS_SUCCESS;
 }
 
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
@@ -600,10 +527,17 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }
 
-void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+enum ggml_status ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    if (ctx->has_error) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        if (cmd_buf == nil) {
+            ctx->has_error = true;
+            return GGML_STATUS_EXECUTION_FAILED;
+        }
 
         ggml_metal_event_encode_signal(ev, cmd_buf);
 
@@ -613,13 +547,21 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ctx->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        return GGML_STATUS_SUCCESS;
     }
 }
 
-void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+enum ggml_status ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    if (ctx->has_error) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        if (cmd_buf == nil) {
+            ctx->has_error = true;
+            return GGML_STATUS_EXECUTION_FAILED;
+        }
 
         ggml_metal_event_encode_wait(ev, cmd_buf);
 
@@ -629,6 +571,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ctx->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        return GGML_STATUS_SUCCESS;
     }
 }
 
@@ -680,9 +623,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph,
             ctx->debug_fusion);
 
+        bool encoded = true;
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
+                encoded = false;
                 break;
             }
 
@@ -691,7 +636,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
-        [cmd_buf commit];
+        if (encoded) {
+            [cmd_buf commit];
+        } else {
+            ctx->has_error = true;
+        }
     });
 }
 

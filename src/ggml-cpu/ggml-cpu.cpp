@@ -204,8 +204,8 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ ggml_backend_cpu_graph_plan_compute,
     /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record_status     = */ NULL,
+    /* .event_wait_status       = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

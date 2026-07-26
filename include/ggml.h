@@ -360,6 +360,9 @@ extern "C" {
         GGML_STATUS_FAILED = -1,
         GGML_STATUS_SUCCESS = 0,
         GGML_STATUS_ABORTED = 1,
+        GGML_STATUS_EXECUTION_FAILED = 2,
+        GGML_STATUS_DEVICE_LOST = 3,
+        GGML_STATUS_BACKEND_POISONED = 4,
     };
 
     // get ggml_status name string

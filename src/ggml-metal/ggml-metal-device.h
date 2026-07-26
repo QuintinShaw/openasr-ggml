@@ -289,7 +289,7 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev);
 
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
-void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
+enum ggml_status ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);

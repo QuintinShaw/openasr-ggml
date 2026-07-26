@@ -43,10 +43,20 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <stdexcept>
 
 #define GGML_COMMON_DECL_C
 
 #include "ggml-common.h"
+
+struct ggml_cann_runtime_error : std::runtime_error {
+    ggml_cann_runtime_error() : std::runtime_error("CANN runtime allocation failed") {}
+    explicit ggml_cann_runtime_error(aclError error)
+        : std::runtime_error("CANN runtime allocation failed"), error(error), has_acl_error(true) {}
+
+    aclError error = ACL_SUCCESS;
+    bool has_acl_error = false;
+};
 
 #define GGML_CANN_NAME "CANN"
 
@@ -343,7 +353,10 @@ struct ggml_cann_pool_buf_prio : public ggml_cann_pool {
 
         // allocate a new buffer if no buffer can be reused
         ggml_cann_set_device(device);
-        ACL_CHECK(aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+        const aclError alloc_status = aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (alloc_status != ACL_SUCCESS) {
+            throw ggml_cann_runtime_error(alloc_status);
+        }
         *actual_size = size;
         pool_size += size;
 #ifdef DEBUG_CANN_MALLOC
@@ -534,7 +547,10 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
             // allocate a new buffer if no buffer can be reused
             ggml_cann_buffer & b = buffer_pool[i];
             ggml_cann_set_device(device);
-            ACL_CHECK(aclrtMalloc(&b.ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+            const aclError alloc_status = aclrtMalloc(&b.ptr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (alloc_status != ACL_SUCCESS) {
+                throw ggml_cann_runtime_error(alloc_status);
+            }
             pool_size += size;
             *actual_size = size;
             b.size       = size;
@@ -553,7 +569,8 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
             return b.ptr;
         }
 
-        GGML_ABORT("cann pool[%d]: slots full\n", device);
+        GGML_LOG_ERROR("cann pool[%d]: slots full\n", device);
+        throw ggml_cann_runtime_error();
     }
 
     /**
@@ -579,7 +596,8 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
 #endif
             return;
         }
-        GGML_ABORT("cann pool[%d]: slots full\n", device);
+        GGML_LOG_ERROR("cann pool[%d]: unknown pool allocation returned\n", device);
+        terminal_status = GGML_STATUS_EXECUTION_FAILED;
     }
 };
 
@@ -2073,19 +2091,23 @@ static void ggml_backend_cann_free(ggml_backend_t backend) {
  * @param offset Offset in bytes within the host data.
  * @param size Size of the data to copy in bytes.
  */
-static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
+static enum ggml_status ggml_backend_cann_terminal_status(
+        ggml_backend_cann_context * cann_ctx, aclError status);
+
+static enum ggml_status ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *  tensor,
                                                const void *   data,
                                                size_t         offset,
                                                size_t         size) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->poisoned) return GGML_STATUS_BACKEND_POISONED;
     ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
-                               cann_ctx->stream()));
+    return ggml_backend_cann_terminal_status(cann_ctx, aclrtMemcpyAsync(
+        (char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE, cann_ctx->stream()));
 }
 
 /**
@@ -2099,19 +2121,20 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
  * @param offset Offset in bytes within the host data.
  * @param size Size of the data to copy in bytes.
  */
-static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
+static enum ggml_status ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
                                                const ggml_tensor * tensor,
                                                void *              data,
                                                size_t              offset,
                                                size_t              size) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->poisoned) return GGML_STATUS_BACKEND_POISONED;
     ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
-                               cann_ctx->stream()));
+    return ggml_backend_cann_terminal_status(cann_ctx, aclrtMemcpyAsync(
+        data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST, cann_ctx->stream()));
 }
 
 /**
@@ -2127,7 +2150,7 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
  * @param dst Pointer to the destination tensor to copy data to.
  * @return true if the copy operation succeeds, false otherwise.
  */
-static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
+static enum ggml_status ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
                                                ggml_backend_t      backend_dst,
                                                const ggml_tensor * src,
                                                ggml_tensor *       dst) {
@@ -2136,7 +2159,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
     GGML_ASSERT(!is_matmul_weight((const ggml_tensor *) src));
 
     if (!ggml_backend_buft_is_cann(src->buffer->buft) || !ggml_backend_buft_is_cann(dst->buffer->buft)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
@@ -2144,15 +2167,16 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
 
     ggml_backend_cann_context * cann_ctx_src = (ggml_backend_cann_context *) backend_src->context;
     ggml_backend_cann_context * cann_ctx_dst = (ggml_backend_cann_context *) backend_dst->context;
+    if (cann_ctx_src->poisoned || cann_ctx_dst->poisoned) return GGML_STATUS_BACKEND_POISONED;
 
     size_t copy_size = ggml_nbytes(dst);
     if (copy_size == 0) {
-        return true;
+        return GGML_STATUS_SUCCESS;
     }
     if (backend_src != backend_dst) {
 #ifdef ASCEND_310P
         // TODO: Support 310p P2P copy
-        return false;
+        return GGML_STATUS_FAILED;
 #endif
         ggml_backend_cann_buffer_context * buf_ctx_src = (ggml_backend_cann_buffer_context *) buf_src->context;
         ggml_backend_cann_buffer_context * buf_ctx_dst = (ggml_backend_cann_buffer_context *) buf_dst->context;
@@ -2161,19 +2185,32 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         GGML_ASSERT(cann_ctx_dst->device == buf_ctx_dst->device);
 
         int32_t canAccessPeer = 0;
-        ACL_CHECK(aclrtDeviceCanAccessPeer(&canAccessPeer, cann_ctx_src->device, cann_ctx_dst->device));
-        if (!canAccessPeer) {
-            return false;
+        const aclError peer_query_status = aclrtDeviceCanAccessPeer(
+            &canAccessPeer, cann_ctx_src->device, cann_ctx_dst->device);
+        if (peer_query_status != ACL_SUCCESS) {
+            return ggml_backend_cann_terminal_status(cann_ctx_src, peer_query_status);
+        }
+        if (canAccessPeer == 0) {
+            // The runtime answered successfully, but this device pair has no P2P path.
+            // Do not turn a capability miss into a device-loss report.
+            return GGML_STATUS_FAILED;
         }
 
-        // need open both directions for memcpyasync between devices.
-        ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_src->device, 0));
+        // Need open both directions for memcpyasync between devices.
+        const aclError enable_src_status = aclrtDeviceEnablePeerAccess(cann_ctx_src->device, 0);
+        if (enable_src_status != ACL_SUCCESS) {
+            return ggml_backend_cann_terminal_status(cann_ctx_src, enable_src_status);
+        }
         ggml_cann_set_device(cann_ctx_src->device);
-        ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
+        const aclError enable_dst_status = aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0);
+        if (enable_dst_status != ACL_SUCCESS) {
+            return ggml_backend_cann_terminal_status(cann_ctx_dst, enable_dst_status);
+        }
 
         // wait for task_queue empty to keep task order.
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
-                                   cann_ctx_src->stream()));
+        { const enum ggml_status status = ggml_backend_cann_terminal_status(cann_ctx_src, aclrtMemcpyAsync(
+            dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE, cann_ctx_src->stream()));
+          if (status != GGML_STATUS_SUCCESS) return status; }
         // record event on src stream after the copy
         // TODO: this event is not effective with acl graph mode, change to use aclrtSynchronizeStream
         // if (!cann_ctx_src->copy_event) {
@@ -2184,14 +2221,14 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         // // wait on dst stream for the copy to complete
         // ggml_cann_set_device(cann_ctx_dst->device);
         // ACL_CHECK(aclrtStreamWaitEvent(cann_ctx_dst->stream(), cann_ctx_src->copy_event));
-        ACL_CHECK(aclrtSynchronizeStream(cann_ctx_src->stream()));
+        if (const enum ggml_status status = ggml_backend_cann_terminal_status(cann_ctx_src, aclrtSynchronizeStream(cann_ctx_src->stream())); status != GGML_STATUS_SUCCESS) return status;
     } else {
         // src and dst are on the same backend
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
-                                   cann_ctx_dst->stream()));
+        if (const enum ggml_status status = ggml_backend_cann_terminal_status(cann_ctx_dst, aclrtMemcpyAsync(
+            dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE, cann_ctx_dst->stream())); status != GGML_STATUS_SUCCESS) return status;
     }
 
-    return true;
+    return GGML_STATUS_SUCCESS;
 }
 
 /**
@@ -2202,10 +2239,40 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
  *
  * @param backend Pointer to the CANN backend structure to synchronize.
  */
-static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_cann_terminal_status(
+        ggml_backend_cann_context * cann_ctx, aclError status) {
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    if (status == ACL_SUCCESS) {
+        return GGML_STATUS_SUCCESS;
+    }
+    // ACL has no stable public reset/lost classification across supported
+    // toolkits. Preserve the actual runtime status for diagnostics, poison this
+    // context, and report the existing generic terminal execution failure.
+    cann_ctx->first_terminal_error = status;
+    cann_ctx->first_terminal_status = GGML_STATUS_EXECUTION_FAILED;
+    cann_ctx->poisoned = true;
+    return cann_ctx->first_terminal_status;
+}
+
+static enum ggml_status ggml_backend_cann_execution_failure(
+        ggml_backend_cann_context * cann_ctx) {
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    cann_ctx->first_terminal_status = GGML_STATUS_EXECUTION_FAILED;
+    cann_ctx->poisoned = true;
+    return cann_ctx->first_terminal_status;
+}
+
+static enum ggml_status ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
     ggml_cann_set_device(cann_ctx->device);
-    ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+    return ggml_backend_cann_terminal_status(cann_ctx, aclrtSynchronizeStream(cann_ctx->stream()));
 }
 
 /**
@@ -2255,13 +2322,14 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
  * @param use_cann_graph               Whether to use CANN graph execution.
  * @param cann_graph_capture_required  Whether graph capture is needed due to graph changes.
  */
-static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
-                                            ggml_cgraph *               cgraph,
-                                            bool                        use_cann_graph,
-                                            bool                        cann_graph_capture_required) {
+static enum ggml_status evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
+                                                           ggml_cgraph *               cgraph,
+                                                           bool                        use_cann_graph,
+                                                           bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
-    if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
-        ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
+    if (use_cann_graph && cann_graph_capture_required &&
+        aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL) != ACL_SUCCESS) {
+        return GGML_STATUS_EXECUTION_FAILED;
     }
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
@@ -2289,26 +2357,33 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             }
 
             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
-            if (!ok) {
-                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            if (!ok || cann_ctx->pool_status() != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("%s: dispatch failed or op is not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                return GGML_STATUS_EXECUTION_FAILED;
             }
-            GGML_ASSERT(ok);
         }
     }
 
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph) {
-        GGML_ASSERT(!cann_ctx->graph_lru_cache.cache_list.empty());
+        if (cann_ctx->graph_lru_cache.cache_list.empty()) {
+            return GGML_STATUS_FAILED;
+        }
         ggml_cann_graph * matched_graph = cann_ctx->graph_lru_cache.cache_list.front();
 
         if (cann_graph_capture_required) {  // End CANN graph capture
-            ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            if (aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph) != ACL_SUCCESS) {
+                return GGML_STATUS_EXECUTION_FAILED;
+            }
         }
 
         // Execute CANN graph
-        ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
+        if (aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()) != ACL_SUCCESS) {
+            return GGML_STATUS_EXECUTION_FAILED;
+        }
     }
 #endif  // USE_ACL_GRAPH
+    return GGML_STATUS_SUCCESS;
 }
 
 /**
@@ -2325,12 +2400,16 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
  */
 static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
     ggml_cann_set_device(cann_ctx->device);
     g_nz_workspaces[cann_ctx->device].clear();
 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
+    try {
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
     bool use_cann_graph = true;
@@ -2380,9 +2459,15 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 #else
     bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
-    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required);
-
-    return GGML_STATUS_SUCCESS;
+    const enum ggml_status status = evaluate_and_capture_cann_graph(
+        cann_ctx, cgraph, use_cann_graph, graph_capture_required);
+    return status == GGML_STATUS_SUCCESS ? status : ggml_backend_cann_execution_failure(cann_ctx);
+    } catch (const ggml_cann_runtime_error & error) {
+        if (error.has_acl_error) {
+            return ggml_backend_cann_terminal_status(cann_ctx, error.error);
+        }
+        return ggml_backend_cann_execution_failure(cann_ctx);
+    }
 }
 
 /**
@@ -2710,9 +2795,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
  *
  * @param event Pointer to the event structure to be recorded.
  */
-static void ggml_backend_cann_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_cann_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
-    ACL_CHECK(aclrtRecordEvent((aclrtEvent) event->context, cann_ctx->stream()));
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    return ggml_backend_cann_terminal_status(cann_ctx,
+        aclrtRecordEvent((aclrtEvent) event->context, cann_ctx->stream()));
 }
 
 /**
@@ -2725,13 +2814,16 @@ static void ggml_backend_cann_event_record(ggml_backend_t backend, ggml_backend_
  * @param event Pointer to the event structure that the backend needs to wait
  * for.
  */
-static void ggml_backend_cann_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
-    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
-    if (ggml_backend_is_cann(backend)) {
-        ACL_CHECK(aclrtStreamWaitEvent(cann_ctx->stream(), (aclrtEvent) event->context));
-    } else {
-        GGML_ABORT("fatal error");
+static enum ggml_status ggml_backend_cann_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
+    if (!ggml_backend_is_cann(backend)) {
+        return GGML_STATUS_FAILED;
     }
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->poisoned) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    return ggml_backend_cann_terminal_status(cann_ctx,
+        aclrtStreamWaitEvent(cann_ctx->stream(), (aclrtEvent) event->context));
 }
 
 /**
@@ -2755,8 +2847,8 @@ static const ggml_backend_i ggml_backend_cann_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_cann_graph_compute,
-    /* .event_record            = */ ggml_backend_cann_event_record,
-    /* .event_wait              = */ ggml_backend_cann_event_wait,
+    /* .event_record_status     = */ ggml_backend_cann_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_cann_event_wait_status,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -2892,7 +2984,10 @@ static ggml_backend_event_t ggml_backend_cann_device_event_new(ggml_backend_dev_
     ggml_cann_set_device(dev_ctx->device);
 
     aclrtEvent event;
-    ACL_CHECK(aclrtCreateEvent(&event));
+    if (aclrtCreateEvent(&event) != ACL_SUCCESS) {
+        GGML_LOG_ERROR("%s: failed to create event\n", __func__);
+        return nullptr;
+    }
 
     return new ggml_backend_event{
         /* .device = */ ggml_backend_reg_dev_get(ggml_backend_cann_reg(), dev_ctx->device),
@@ -2909,10 +3004,14 @@ static ggml_backend_event_t ggml_backend_cann_device_event_new(ggml_backend_dev_
  * @param event Pointer to the event structure to be freed.
  */
 static void ggml_backend_cann_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    ACL_CHECK(aclrtDestroyEvent((aclrtEvent) event->context));
-
-    delete event;
     GGML_UNUSED(dev);
+    if (event == nullptr) {
+        return;
+    }
+    if (event->context != nullptr && aclrtDestroyEvent((aclrtEvent) event->context) != ACL_SUCCESS) {
+        GGML_LOG_ERROR("%s: failed to destroy event\n", __func__);
+    }
+    delete event;
 }
 
 /**
@@ -2922,10 +3021,13 @@ static void ggml_backend_cann_device_event_free(ggml_backend_dev_t dev, ggml_bac
  *
  * @param event Pointer to the event structure to be synchronized.
  */
-static void ggml_backend_cann_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    ACL_CHECK(aclrtSynchronizeEvent((aclrtEvent) event->context));
+static enum ggml_status ggml_backend_cann_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    const aclError status = aclrtSynchronizeEvent((aclrtEvent) event->context);
 
+    // Device events can outlive a stream backend. Preserve terminal loss for
+    // the caller even without a backend context to poison directly.
     GGML_UNUSED(dev);
+    return status == ACL_SUCCESS ? GGML_STATUS_SUCCESS : GGML_STATUS_DEVICE_LOST;
 }
 
 static const ggml_backend_device_i ggml_backend_cann_device_interface = {

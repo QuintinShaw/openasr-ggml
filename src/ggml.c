@@ -445,8 +445,11 @@ const char * ggml_status_to_string(enum ggml_status status) {
     switch (status) {
         case GGML_STATUS_ALLOC_FAILED: return "GGML status: error (failed to allocate memory)";
         case GGML_STATUS_FAILED:       return "GGML status: error (operation failed)";
-        case GGML_STATUS_SUCCESS:      return "GGML status: success";
-        case GGML_STATUS_ABORTED:      return "GGML status: warning (operation aborted)";
+        case GGML_STATUS_SUCCESS:          return "GGML status: success";
+        case GGML_STATUS_ABORTED:          return "GGML status: warning (operation aborted)";
+        case GGML_STATUS_EXECUTION_FAILED: return "GGML status: error (execution failed)";
+        case GGML_STATUS_DEVICE_LOST:      return "GGML status: error (device lost)";
+        case GGML_STATUS_BACKEND_POISONED: return "GGML status: error (backend poisoned)";
     }
 
     return "GGML status: unknown";

@@ -501,14 +501,14 @@ static ggml_backend_buffer_type_t ggml_backend_et_get_default_buffer_type(ggml_b
     return ggml_backend_et_buffer_type(et_ctx->devidx);
 }
 
-static void ggml_backend_et_set_tensor_async(ggml_backend_t backend,
+static enum ggml_status ggml_backend_et_set_tensor_async(ggml_backend_t backend,
                                              ggml_tensor *  tensor,
                                              const void *   data,
                                              size_t         offset,
                                              size_t         size) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
-        return;
+        return GGML_STATUS_BACKEND_POISONED;
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
@@ -518,16 +518,17 @@ static void ggml_backend_et_set_tensor_async(ggml_backend_t backend,
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
     runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
+static enum ggml_status ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
                                              const ggml_tensor * tensor,
                                              void *              data,
                                              size_t              offset,
                                              size_t              size) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
-        return;
+        return GGML_STATUS_BACKEND_POISONED;
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
@@ -537,9 +538,10 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
     runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    return GGML_STATUS_SUCCESS;
 }
 
-static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t      backend_src,
+static enum ggml_status ggml_backend_et_cpy_tensor_async(ggml_backend_t      backend_src,
                                              ggml_backend_t      backend_dst,
                                              const ggml_tensor * src,
                                              ggml_tensor *       dst) {
@@ -547,13 +549,13 @@ static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t      backend_src,
     GGML_UNUSED(backend_dst);
     GGML_UNUSED(src);
     GGML_UNUSED(dst);
-    return false;
+    return GGML_STATUS_FAILED;
 }
 
-static void ggml_backend_et_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_et_synchronize(ggml_backend_t backend) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
-        return;
+        return GGML_STATUS_BACKEND_POISONED;
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
@@ -561,13 +563,13 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
 
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
     if (errors.empty()) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
     for (const auto & err : errors) {
         GGML_LOG_ERROR("ET: stream error detected at synchronization point. Code: %d,Type: %d\n", (int) err.errorCode_,
                        (int) err.errorContext_.value()[0].type_);
     }
-    abort();
+    return GGML_STATUS_EXECUTION_FAILED;
 }
 
 static bool ggml_et_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<ggml_op> ops) {
@@ -1606,8 +1608,8 @@ static const struct ggml_backend_i ggml_backend_et_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_et_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record_status     = */ NULL,
+    /* .event_wait_status       = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

@@ -24,6 +24,7 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// Returns 0 for unsupported input/operation; positive values are encoded nodes.
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //

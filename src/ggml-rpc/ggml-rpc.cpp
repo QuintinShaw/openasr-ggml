@@ -649,9 +649,10 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    // RPC has no deferred operations at this boundary.
+    return GGML_STATUS_SUCCESS;
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -734,8 +735,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record_status     = */ NULL,
+    /* .event_wait_status       = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

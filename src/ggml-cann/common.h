@@ -110,6 +110,10 @@ int                        parse_integer(const std::string & value);
  * @brief Abstract base class for memory pools used by CANN.
  */
 struct ggml_cann_pool {
+    // A deallocation cannot return status through the RAII destructor. Record a
+    // terminal pool fault so the owning graph context can fail closed.
+    enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
+
     /**
      * @brief Virtual destructor for the memory pool.
      */
@@ -566,6 +570,11 @@ struct ggml_backend_cann_context {
     bool                      acl_graph_mode = true;
 #endif
     bool                   async_mode;
+    // The first terminal runtime failure is reported to its caller. Every later
+    // submission is rejected until the backend is recreated.
+    bool                   poisoned = false;
+    enum ggml_status       first_terminal_status = GGML_STATUS_SUCCESS;
+    aclError                first_terminal_error = ACL_SUCCESS;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
     // Constant Pool
@@ -645,6 +654,10 @@ struct ggml_backend_cann_context {
             mem_pool = new_pool_for_device(device);
         }
         return *mem_pool;
+    }
+
+    enum ggml_status pool_status() const {
+        return mem_pool == nullptr ? GGML_STATUS_SUCCESS : mem_pool->terminal_status;
     }
 };
 
