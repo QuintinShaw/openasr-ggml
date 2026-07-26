@@ -72,7 +72,7 @@ static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t bu
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
 
     if (!ggml_backend_buffer_is_metal(src->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     return ggml_metal_buffer_cpy_tensor(ctx, src, dst);
@@ -148,7 +148,7 @@ static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t b
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
 
     if (!ggml_backend_buffer_is_metal(src->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     return ggml_metal_buffer_cpy_tensor(ctx, src, dst);
@@ -492,31 +492,31 @@ static void ggml_backend_metal_free(ggml_backend_t backend) {
     free(backend);
 }
 
-static void ggml_backend_metal_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_metal_synchronize(ggml_backend_t backend) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_synchronize(ctx);
+    return ggml_metal_synchronize(ctx);
 }
 
-static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
+    return ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
 }
 
-static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
+    return ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
 }
 
-static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static enum ggml_status ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     ggml_metal_t ctx_src = (ggml_metal_t)backend_src->context;
@@ -537,18 +537,18 @@ static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend,
     return ggml_metal_graph_compute(ctx, cgraph);
 }
 
-static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
 
-    ggml_metal_event_record(ctx, ev);
+    return ggml_metal_event_record(ctx, ev);
 }
 
-static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
 
-    ggml_metal_event_wait(ctx, ev);
+    return ggml_metal_event_wait(ctx, ev);
 }
 
 static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -579,8 +579,8 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_metal_graph_compute,
-    /* .event_record            = */ ggml_backend_metal_event_record,
-    /* .event_wait              = */ ggml_backend_metal_event_wait,
+    /* .event_record_status     = */ ggml_backend_metal_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_metal_event_wait_status,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
 };
 
@@ -778,12 +778,12 @@ static void ggml_backend_metal_device_event_free(ggml_backend_dev_t dev, ggml_ba
     delete event;
 }
 
-static void ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_event_t evt = (ggml_metal_event_t)event->context;
 
-    ggml_metal_device_event_synchronize(ctx_dev, evt);
+    return ggml_metal_device_event_synchronize(ctx_dev, evt);
 }
 
 static ggml_backend_device_i ggml_backend_metal_device_i = {

@@ -1394,6 +1394,7 @@ struct ggml_cuda_stream_context {
 
 struct ggml_backend_cuda_context {
     int device;
+    enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
     std::string name;
     cudaEvent_t copy_event = nullptr;
 

@@ -168,13 +168,17 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
+static enum ggml_status ggml_vk_status(vk::Result result) {
+    return result == vk::Result::eErrorDeviceLost
+        ? GGML_STATUS_DEVICE_LOST
+        : GGML_STATUS_EXECUTION_FAILED;
+}
+
 #define VK_CHECK(err, msg)                                          \
     do {                                                            \
         vk::Result err_ = (err);                                    \
         if (err_ != vk::Result::eSuccess) {                         \
-            fprintf(stderr, "ggml_vulkan: %s error %s at %s:%d\n",  \
-                #err, to_string(err_).c_str(), __FILE__, __LINE__); \
-            exit(1);                                                \
+            throw vk::SystemError(err_, msg);                       \
         }                                                           \
     } while (0)
 
@@ -704,6 +708,7 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    std::atomic<bool> poisoned {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -2135,6 +2140,9 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // A lost Vulkan device cannot be recovered in place. The first caller
+    // receives DEVICE_LOST; all later boundaries fail closed.
+    bool poisoned {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -2344,12 +2352,19 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
-// Wait for ctx->fence to be signaled.
-static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+// Wait for ctx->fence to be signaled. Completion failures must leave the
+// context recoverable so the caller can propagate a typed terminal status.
+static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
+        vk::Result result = ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX);
+        if (result != vk::Result::eSuccess) {
+            ctx->almost_ready_fence_pending = false;
+            const enum ggml_status status = ggml_vk_status(result);
+            if (status == GGML_STATUS_DEVICE_LOST) { ctx->poisoned = true; ctx->device->poisoned.store(true); }
+            return status;
+        }
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
     }
@@ -2358,8 +2373,9 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     vk::Result result;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
+            const enum ggml_status status = ggml_vk_status(result);
+            if (status == GGML_STATUS_DEVICE_LOST) { ctx->poisoned = true; ctx->device->poisoned.store(true); }
+            return status;
         }
         for (uint32_t i = 0; i < 100; ++i) {
             YIELD();
@@ -2375,6 +2391,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+    return GGML_STATUS_SUCCESS;
 }
 
 static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
@@ -8863,8 +8880,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
     }
 
-    // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+    if (!y_non_contig && qy_needs_dequant) {
+        throw vk::SystemError(vk::Result::eErrorUnknown, "unsupported Vulkan conversion");
+    }
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
@@ -8906,8 +8924,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
-    GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
-    GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
+    if ((qx_needs_dequant && to_fp16_vk_0 == nullptr) ||
+        (qy_needs_dequant && to_fp16_vk_1 == nullptr)) {
+        throw vk::SystemError(vk::Result::eErrorUnknown, "missing Vulkan conversion pipeline");
+    }
 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
@@ -8919,7 +8939,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
                 (qy_needs_dequant && y_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
                 (split_k > 1 && split_k_size > ctx->device->properties.limits.maxStorageBufferRange)) {
-            GGML_ABORT("Requested preallocation size is too large");
+            throw vk::SystemError(vk::Result::eErrorUnknown, "Vulkan preallocation exceeds storage-buffer range");
         }
         if (qx_needs_dequant && ctx->prealloc_size_x < x_sz) {
             ctx->prealloc_size_x = x_sz;
@@ -9230,7 +9250,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         if (
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
                 (qy_needs_dequant && y_sz > ctx->device->properties.limits.maxStorageBufferRange)) {
-            GGML_ABORT("Requested preallocation size is too large");
+            throw vk::SystemError(vk::Result::eErrorUnknown, "Vulkan preallocation exceeds storage-buffer range");
         }
         if (qx_needs_dequant && ctx->prealloc_size_x < x_sz) {
             ctx->prealloc_size_x = x_sz;
@@ -9870,7 +9890,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         if (
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
                 (qy_needs_dequant && y_sz > ctx->device->properties.limits.maxStorageBufferRange)) {
-            GGML_ABORT("Requested preallocation size is too large");
+            throw vk::SystemError(vk::Result::eErrorUnknown, "Vulkan preallocation exceeds storage-buffer range");
         }
         if (qx_needs_dequant && ctx->prealloc_size_x < x_sz) {
             ctx->prealloc_size_x = x_sz;
@@ -10110,11 +10130,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
     }
 
-    // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
-    GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
-    GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
-    GGML_ASSERT(dmmv != nullptr);
+    if ((!y_non_contig && qy_needs_dequant) ||
+        (qx_needs_dequant && to_fp16_vk_0 == nullptr) ||
+        (qy_needs_dequant && to_fp16_vk_1 == nullptr) || dmmv == nullptr) {
+        throw vk::SystemError(vk::Result::eErrorUnknown, "unsupported Vulkan conversion pipeline");
+    }
 
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = ggml_nelements(src1);
@@ -10128,7 +10148,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if (
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
                 (qy_needs_dequant && y_sz > ctx->device->properties.limits.maxStorageBufferRange)) {
-            GGML_ABORT("Requested preallocation size is too large");
+            throw vk::SystemError(vk::Result::eErrorUnknown, "Vulkan preallocation exceeds storage-buffer range");
         }
         if (qx_needs_dequant && ctx->prealloc_size_x < x_sz) {
             ctx->prealloc_size_x = x_sz;
@@ -10561,7 +10581,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // For L/M, the order is (inner to outer) [ne1, k, ne2, ne3].
     const uint64_t split_k_size = split_k > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k * ne2 * ne3 : 0;
     if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
-        GGML_ABORT("Requested preallocation size is too large");
+        throw vk::SystemError(vk::Result::eErrorUnknown, "Vulkan preallocation exceeds storage-buffer range");
     }
     if (ctx->prealloc_size_split_k < split_k_size) {
         ctx->prealloc_size_split_k = split_k_size;
@@ -11563,7 +11583,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             std::cerr << " and " << ggml_type_name(src1->type);
         }
         std::cerr << " to " << ggml_type_name(dst->type) << std::endl;
-        GGML_ABORT("fatal error");
+        throw vk::SystemError(vk::Result::eErrorUnknown, "missing Vulkan operation pipeline");
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -11992,7 +12012,7 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
 
     if (pipeline == nullptr) {
         std::cerr << "ggml_vulkan: Error: Missing multi_add";
-        GGML_ABORT("fatal error");
+        throw vk::SystemError(vk::Result::eErrorUnknown, "missing Vulkan multi-add pipeline");
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -15667,14 +15687,14 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
-static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
+static enum ggml_status ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
@@ -15723,21 +15743,22 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         }
         ggml_vk_synchronize(ctx);
     }
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async(" << size << ")");
-    ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
+    return ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
-static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
+static enum ggml_status ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
@@ -15779,24 +15800,25 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         }
         ggml_vk_synchronize(ctx);
     }
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_async(" << size << ")");
-    ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
+    return ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
-static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static enum ggml_status ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
 
     // Skip zero-size tensors
     if (ggml_nbytes(src) == 0) {
-        return true;
+        return GGML_STATUS_SUCCESS;
     }
 
     if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
@@ -15807,7 +15829,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
         // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+            return GGML_STATUS_FAILED;
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -15815,7 +15837,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         ggml_vk_buffer_copy_async(compute_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
                                    src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
                                    ggml_nbytes(src));
-        return true;
+        return GGML_STATUS_SUCCESS;
     }
 
     if (ggml_backend_buffer_is_host(src->buffer)) {
@@ -15823,7 +15845,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         size_t pinned_offset = 0;
         ggml_vk_host_get(ctx->device, src->data, pinned_buf, pinned_offset);
         if (pinned_buf == nullptr) {
-            return false;
+            return GGML_STATUS_FAILED;
         }
 
         vk_context cpy_ctx;
@@ -15835,14 +15857,14 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
         return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
                                           vk_tensor_offset(dst) + dst->view_offs,
-                                          src->data, ggml_nbytes(src));
+                                          src->data, ggml_nbytes(src)) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
     }
 
     GGML_UNUSED(backend_src);
-    return false;
+    return GGML_STATUS_FAILED;
 }
 
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
     bool do_transfer = !ctx->compute_ctx.expired();
@@ -15889,11 +15911,17 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             std::lock_guard<std::mutex> guard(queue_mutex);
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
-        ggml_vk_wait_for_fence(ctx);
+        enum ggml_status wait_status = ggml_vk_wait_for_fence(ctx);
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
+        }
+        if (wait_status != GGML_STATUS_SUCCESS) {
+            if (do_transfer) {
+                ctx->compute_ctx.reset();
+            }
+            return wait_status;
         }
     }
 
@@ -15903,15 +15931,31 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->poisoned || ctx->device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
 
-    ggml_vk_synchronize(ctx);
-
-    ggml_vk_graph_cleanup(ctx);
+    try {
+        enum ggml_status status = ggml_vk_synchronize(ctx);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        ggml_vk_graph_cleanup(ctx);
+        return GGML_STATUS_SUCCESS;
+    } catch (const vk::SystemError & error) {
+        if (error.code() == vk::Result::eErrorDeviceLost) {
+            ctx->poisoned = true;
+            ctx->device->poisoned.store(true);
+            return GGML_STATUS_DEVICE_LOST;
+        }
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -16444,7 +16488,11 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->poisoned || ctx->device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
 
+    try {
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
         dul.pLabelName = "ggml_backend_vk_graph_compute";
@@ -16846,12 +16894,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (!ctx->device->support_async) {
-        ggml_vk_synchronize(ctx);
+        return ggml_backend_vk_synchronize(backend);
     }
 
     return GGML_STATUS_SUCCESS;
-
-    UNUSED(backend);
+    } catch (const vk::SystemError & error) {
+        const enum ggml_status submitted = ggml_vk_status(error.code());
+        if (submitted == GGML_STATUS_DEVICE_LOST) {
+            ctx->poisoned = true;
+            return submitted;
+        }
+        const enum ggml_status completed = ggml_backend_vk_synchronize(backend);
+        return completed == GGML_STATUS_SUCCESS ? submitted : completed;
+    }
 }
 
 // Sort the graph for improved parallelism.
@@ -17112,7 +17167,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     }
 }
 
-static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+static void ggml_backend_vk_event_record_impl(ggml_backend_t backend, ggml_backend_event_t event) {
     VK_LOG_DEBUG("ggml_backend_vk_event_record(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
@@ -17150,7 +17205,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     ctx->compute_ctx.reset();
 }
 
-static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+static void ggml_backend_vk_event_wait_impl(ggml_backend_t backend, ggml_backend_event_t event) {
     VK_LOG_DEBUG("ggml_backend_vk_event_wait(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
@@ -17165,6 +17220,51 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
             vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
             transfer_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
         }
+    }
+}
+
+static enum ggml_status ggml_backend_vk_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->poisoned || ctx->device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    try {
+        ggml_backend_vk_event_record_impl(backend, event);
+        return GGML_STATUS_SUCCESS;
+    } catch (const vk::SystemError & error) {
+        if (!ctx->compute_ctx.expired()) {
+            vk_context compute_ctx = ctx->compute_ctx.lock();
+            if (compute_ctx->s && compute_ctx->s->buffer) {
+                compute_ctx->s->buffer->in_use = false;
+                compute_ctx->s->buffer->buf.reset();
+            }
+            ctx->compute_ctx.reset();
+        }
+        ctx->submit_pending = false;
+        if (error.code() == vk::Result::eErrorDeviceLost) {
+            ctx->poisoned = true;
+            ctx->device->poisoned.store(true);
+            return GGML_STATUS_DEVICE_LOST;
+        }
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+static enum ggml_status ggml_backend_vk_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->poisoned || ctx->device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    try {
+        ggml_backend_vk_event_wait_impl(backend, event);
+        return GGML_STATUS_SUCCESS;
+    } catch (const vk::SystemError & error) {
+        if (error.code() == vk::Result::eErrorDeviceLost) {
+            ctx->poisoned = true;
+            ctx->device->poisoned.store(true);
+            return GGML_STATUS_DEVICE_LOST;
+        }
+        return GGML_STATUS_EXECUTION_FAILED;
     }
 }
 
@@ -17183,8 +17283,8 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_vk_graph_compute,
-    /* .event_record            = */ ggml_backend_vk_event_record,
-    /* .event_wait              = */ ggml_backend_vk_event_wait,
+    /* .event_record_status     = */ ggml_backend_vk_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_vk_event_wait_status,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
 };
 
@@ -18021,35 +18121,51 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
     delete event;
 }
 
-static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     VK_LOG_DEBUG("ggml_backend_vk_device_event_synchronize(backend=" << dev << ", event=" << event << ")");
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
     vk_event *vkev = (vk_event *)event->context;
 
-    // Only do something if the event has actually been used
-    if (vkev->has_event) {
-        vk::Semaphore sem = vkev->tl_semaphore.s;
-        uint64_t val = vkev->tl_semaphore.value;
-        vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
-        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize");
-
-        // Reset and move submitted events
-        for (auto& event : vkev->events_submitted) {
-            device->device.resetEvent(event);
-        }
-        vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
-        vkev->events_submitted.clear();
-
-        // Finished using current command buffer so we flag for reuse
-        if (vkev->cmd_buffer) {
-            // Only flag for reuse if it hasn't been reused already
-            if (vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
-                vkev->cmd_buffer->in_use = false;
-                vkev->cmd_buffer->buf.reset();
+    try {
+        // Only do something if the event has actually been used
+        if (vkev->has_event) {
+            vk::Semaphore sem = vkev->tl_semaphore.s;
+            uint64_t val = vkev->tl_semaphore.value;
+            vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
+            vk::Result wait_status = device->device.waitSemaphores(swi, UINT64_MAX);
+            if (wait_status != vk::Result::eSuccess) {
+                if (vkev->cmd_buffer && vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
+                    vkev->cmd_buffer->in_use = false;
+                    vkev->cmd_buffer->buf.reset();
+                }
+                vkev->cmd_buffer = nullptr;
+                const enum ggml_status status = ggml_vk_status(wait_status);
+                if (status == GGML_STATUS_DEVICE_LOST) device->poisoned.store(true);
+                return status;
             }
-            vkev->cmd_buffer = nullptr;
+
+            for (auto& event : vkev->events_submitted) {
+                device->device.resetEvent(event);
+            }
+            vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
+            vkev->events_submitted.clear();
+
+            if (vkev->cmd_buffer) {
+                if (vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
+                    vkev->cmd_buffer->in_use = false;
+                    vkev->cmd_buffer->buf.reset();
+                }
+                vkev->cmd_buffer = nullptr;
+            }
         }
+        return GGML_STATUS_SUCCESS;
+    } catch (const vk::SystemError & error) {
+        if (error.code() == vk::Result::eErrorDeviceLost) {
+            device->poisoned.store(true);
+            return GGML_STATUS_DEVICE_LOST;
+        }
+        return GGML_STATUS_EXECUTION_FAILED;
     }
 }
 

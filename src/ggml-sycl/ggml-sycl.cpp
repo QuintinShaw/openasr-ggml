@@ -3199,7 +3199,11 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                         SYCL_CHECK(ggml_sycl_cpy_tensor_2d(src1_ddf_i, src1, i03, i02, src1_col_0,
                                                            src1_col_0 + src1_ncols, stream));
                     } else {
-                        GGML_ABORT("src1 is non-contiguous and not on device");
+                        // supports_op rejects this layout before submission.
+                        // Keep the compute path fail-closed if it is reached by
+                        // a direct backend caller.
+                        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                                              "non-contiguous SYCL RHS is not on its owning device");
                     }
 
                     if constexpr (quantize_enabled) {
@@ -3281,10 +3285,10 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
     }
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+catch (sycl::exception const &) {
+    // Let the graph dispatcher turn a direct-call layout failure into its
+    // typed execution status instead of terminating the process.
+    throw;
 }
 
 static void ggml_sycl_repeat_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -4896,6 +4900,13 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
     }
 
+    if ((dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID) &&
+        !ggml_is_contiguous(dst->src[1]) &&
+        (ggml_backend_buffer_is_sycl_split(dst->src[1]->buffer) ||
+         ggml_backend_buffer_is_sycl_split(dst->buffer))) {
+        return false;
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_sycl_argmax(ctx, dst);
@@ -5225,8 +5236,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_arange(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_sycl_flash_attn_ext(ctx, dst);
-            break;
+            return ggml_sycl_flash_attn_ext(ctx, dst);
         default:
             return false;
     }
@@ -5235,7 +5245,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
 } catch (sycl::exception & e) {
     std::cerr << e.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::cerr << "Error OP "<<ggml_op_name(dst->op)<< std::endl;
-    std::exit(1);
+    return false;
 }
 
 GGML_API void ggml_backend_sycl_get_device_description(int device, char *description,
@@ -5284,7 +5294,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+static enum ggml_status ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *tensor,
                                                const void *data, size_t offset,
                                                size_t size) try {
@@ -5298,14 +5308,16 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
+    return GGML_STATUS_SUCCESS;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  ((ggml_backend_sycl_context *)backend->context)->terminal_status = GGML_STATUS_EXECUTION_FAILED;
+  return GGML_STATUS_EXECUTION_FAILED;
 }
 
-static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+static enum ggml_status ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
                                                const ggml_tensor *tensor,
                                                void *data, size_t offset,
                                                size_t size) try {
@@ -5319,58 +5331,38 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
+    return GGML_STATUS_SUCCESS;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  ((ggml_backend_sycl_context *)backend->context)->terminal_status = GGML_STATUS_EXECUTION_FAILED;
+  return GGML_STATUS_EXECUTION_FAILED;
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
-                                               const ggml_tensor *src,
-                                               ggml_tensor *dst) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
-                            ggml_backend_buffer_is_sycl(src->buffer);
-    GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
-    GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
-    GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
-    GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
-    if (is_cpy_supported) {
-        /*
-        DPCT1009:215: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
-        return true;
-    }
-
-    return false;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
+static enum ggml_status ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    const enum ggml_status submitted = sycl_ctx->terminal_status;
+    sycl_ctx->terminal_status = GGML_STATUS_SUCCESS;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    enum ggml_status completed = GGML_STATUS_SUCCESS;
+    try {
+        (stream)->wait_and_throw();
+    } catch (sycl::exception const & exc) {
+        GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+        completed = GGML_STATUS_EXECUTION_FAILED;
+    }
 
     GGML_UNUSED(backend);
+    return submitted == GGML_STATUS_SUCCESS ? completed : submitted;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+catch (sycl::exception const & exc) {
+  GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+  return GGML_STATUS_EXECUTION_FAILED;
 }
 
-static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5397,10 +5389,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
-            GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            GGML_LOG_ERROR("%s: dispatch failed or op is not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            return GGML_STATUS_EXECUTION_FAILED;
         }
-        GGML_ASSERT(ok);
     }
+    return GGML_STATUS_SUCCESS;
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -5446,7 +5439,7 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
-static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) try {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
@@ -5458,15 +5451,18 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
         if (!graph_support) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] can not use graphs on device:%d\n", sycl_ctx->device);
-            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
-            return GGML_STATUS_SUCCESS;
+            return ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
         }
 
         sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
 
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
-        ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+        enum ggml_status recording_status = ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
         model_sycl_graph.end_recording();
+        if (recording_status != GGML_STATUS_SUCCESS) {
+            sycl_ctx->exec_graph.reset();
+            return recording_status;
+        }
 
         const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
         if (!sycl_ctx->exec_graph || !graph_update_support) {
@@ -5490,42 +5486,41 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     } else
 #endif
     {
-        ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+        return ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     }
     return GGML_STATUS_SUCCESS;
+} catch (sycl::exception const & exc) {
+    GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+    return GGML_STATUS_EXECUTION_FAILED;
 }
 
-static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event)
+static enum ggml_status ggml_backend_sycl_event_record_status(ggml_backend_t backend, ggml_backend_event_t event)
 try
 {
     ggml_backend_sycl_context *sycl_ctx =
         (ggml_backend_sycl_context *)backend->context;
-
     sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
-
     const queue_ptr &stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    // Record the current state of the queue
     SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
+    return GGML_STATUS_SUCCESS;
 }
-catch (sycl::exception const &exc)
+catch (sycl::exception const & exc)
 {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-              << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+    return GGML_STATUS_EXECUTION_FAILED;
 }
 
-static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) try {
+static enum ggml_status ggml_backend_sycl_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+    if (!ggml_backend_is_sycl(backend)) {
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
     sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
-
-    if (ggml_backend_is_sycl(backend)) {
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
-    } else
-        GGML_ABORT("fatal error");
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-              << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait_and_throw()));
+    return GGML_STATUS_SUCCESS;
+} catch (sycl::exception const & exc) {
+    GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+    return GGML_STATUS_EXECUTION_FAILED;
 }
 
 static ggml_backend_i ggml_backend_sycl_interface = {
@@ -5535,17 +5530,15 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
-                                           // // TODO: update for the new
-                                           // interface
+    /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
-    /* .event_record            = */ ggml_backend_sycl_event_record,
-    /* .event_wait              = */ ggml_backend_sycl_event_wait,
+    /* .event_record_status     = */ ggml_backend_sycl_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_sycl_event_wait_status,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -5706,6 +5699,14 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 struct ggml_tensor * b = op->src[1];
 
                 if (a->ne[3] != b->ne[3]) {
+                    return false;
+                }
+                // The general matrix dispatcher only stages a non-contiguous
+                // RHS from its owning device. Reject the cross-device layout
+                // here so scheduler placement cannot reach its fatal path.
+                if (!ggml_is_contiguous(b) &&
+                    (ggml_backend_buffer_is_sycl_split(b->buffer) ||
+                     ggml_backend_buffer_is_sycl_split(op->buffer))) {
                     return false;
                 }
 
@@ -6073,36 +6074,31 @@ ggml_backend_sycl_device_event_new(ggml_backend_dev_t dev) {
 #endif
 }
 
-static void ggml_backend_sycl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) try {
+static void ggml_backend_sycl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
   GGML_UNUSED(dev);
   if (event == nullptr) {
     return;
   }
 
   if (event->context != nullptr) {
-    sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
-    delete sycl_event;
+    delete static_cast<sycl::event *>(event->context);
     event->context = nullptr;
   }
 
   delete event;
-} catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 
-static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) try {
+static enum ggml_status ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) try {
   GGML_UNUSED(dev);
   GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
 
   sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
-  SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+  sycl_event->wait_and_throw();
+  return GGML_STATUS_SUCCESS;
 } catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_LOG_ERROR("%s: %s\n", __func__, exc.what());
+  return GGML_STATUS_EXECUTION_FAILED;
 }
 
 static const ggml_backend_device_i ggml_backend_sycl_device_interface = {

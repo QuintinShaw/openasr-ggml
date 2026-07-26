@@ -340,6 +340,7 @@ struct mmid_row_mapping {
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 struct ggml_backend_sycl_context {
     int device;
+    enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
     std::string name;
     optimize_feature opt_feature;
 

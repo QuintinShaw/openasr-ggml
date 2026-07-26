@@ -68,7 +68,7 @@ extern "C" {
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
     // tensor copy between different backends
-    GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
+    GGML_API enum ggml_status ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
     //
     // Backend (stream)
@@ -83,19 +83,22 @@ extern "C" {
     GGML_API size_t                     ggml_backend_get_alignment(ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_get_max_size(ggml_backend_t backend);
 
-    GGML_API void ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
-    GGML_API void ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
-    GGML_API void ggml_backend_tensor_set_2d_async(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
-    GGML_API void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    GGML_API enum ggml_status ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    GGML_API enum ggml_status ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+    GGML_API enum ggml_status ggml_backend_tensor_set_2d_async(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    GGML_API enum ggml_status ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
 
-    // "offset" refers to the offset in tensor->data for setting/getting data
-    GGML_API void ggml_backend_tensor_set   (      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
-    GGML_API void ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
-    GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
-    GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    // "offset" refers to the offset in tensor->data for setting/getting data.
+    // A non-success result guarantees no fallback operation touched the destination.
+    GGML_API enum ggml_status ggml_backend_tensor_set   (      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    GGML_API enum ggml_status ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+    GGML_API enum ggml_status ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    GGML_API enum ggml_status ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
-    GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
+    // Completion is terminal: a successful return guarantees this backend has no
+    // work from the completed operation still pending.
+    GGML_API enum ggml_status ggml_backend_synchronize(ggml_backend_t backend);
 
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API void                      ggml_backend_graph_plan_free  (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
@@ -140,7 +143,7 @@ extern "C" {
     // the copy is performed after all the currently queued operations in backend_src
     // backend_dst will wait for the copy to complete before performing other operations
     // automatic fallback to sync copy if async is not supported
-    GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    GGML_API enum ggml_status ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 
@@ -150,9 +153,9 @@ extern "C" {
 
     GGML_API ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device);
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
-    GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
-    GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
-    GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+    GGML_API enum ggml_status     ggml_backend_event_record_status(ggml_backend_event_t event, ggml_backend_t backend);
+    GGML_API enum ggml_status     ggml_backend_event_synchronize(ggml_backend_event_t event);
+    GGML_API enum ggml_status     ggml_backend_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event);
 
     //
     // Backend device
@@ -368,7 +371,7 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
-    GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status     ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
     // Synchronous cancellation also polls around scheduler-controlled input
     // waits/copies. One backend call already in progress remains indivisible;
     // every backend is synchronized before an observed abort returns.

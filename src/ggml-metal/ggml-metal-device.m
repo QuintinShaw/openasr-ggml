@@ -1206,14 +1206,12 @@ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev
     GGML_UNUSED(dev);
 }
 
-void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+enum ggml_status ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = ev->obj;
     const bool res = [event waitUntilSignaledValue:atomic_load_explicit(&ev->value, memory_order_relaxed) timeoutMS:60000];
-    if (!res) {
-        GGML_ABORT("%s: failed to wait for event\n", __func__);
-    }
 
     GGML_UNUSED(dev);
+    return res ? GGML_STATUS_SUCCESS : GGML_STATUS_EXECUTION_FAILED;
 }
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
