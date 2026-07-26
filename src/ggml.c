@@ -985,6 +985,7 @@ struct ggml_context {
     size_t mem_size;
     void * mem_buffer;
     bool   mem_buffer_owned;
+    bool   context_buffer_owned;
     bool   no_alloc;
 
     int    n_objects;
@@ -1619,7 +1620,9 @@ static inline bool ggml_can_repeat_rows(const struct ggml_tensor * t0, const str
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct ggml_context * ggml_init(struct ggml_init_params params) {
+#define GGML_CONTEXT_ALIGN 64
+
+static void ggml_init_time_once(void) {
     static bool is_first_call = true;
 
     ggml_critical_section_start();
@@ -1632,6 +1635,67 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     }
 
     ggml_critical_section_end();
+}
+
+static bool ggml_is_aligned(const void * ptr, size_t alignment) {
+    return ptr != NULL && ((uintptr_t) ptr)%alignment == 0;
+}
+
+static bool ggml_init_params_normalize(const struct ggml_init_params * params, size_t * mem_size) {
+    size_t size = params->mem_size == 0 ? GGML_MEM_ALIGN : params->mem_size;
+
+    if (params->mem_buffer == NULL) {
+        if (size > SIZE_MAX - (GGML_MEM_ALIGN - 1)) {
+            return false;
+        }
+        size = GGML_PAD(size, GGML_MEM_ALIGN);
+    }
+
+    *mem_size = size;
+    return true;
+}
+
+size_t ggml_context_size(void) {
+    return sizeof(struct ggml_context);
+}
+
+size_t ggml_context_alignment(void) {
+    return GGML_CONTEXT_ALIGN;
+}
+
+struct ggml_context * ggml_try_init(
+        struct ggml_init_params params,
+        void *                  context_buffer,
+        size_t                  context_buffer_size) {
+    ggml_init_time_once();
+
+    size_t mem_size;
+    if (context_buffer_size < sizeof(struct ggml_context) ||
+            !ggml_is_aligned(context_buffer, GGML_CONTEXT_ALIGN) ||
+            !ggml_init_params_normalize(&params, &mem_size) ||
+            !ggml_is_aligned(params.mem_buffer, GGML_CONTEXT_ALIGN)) {
+        return NULL;
+    }
+
+    struct ggml_context * ctx = context_buffer;
+    *ctx = (struct ggml_context) {
+        /*.mem_size              =*/ mem_size,
+        /*.mem_buffer            =*/ params.mem_buffer,
+        /*.mem_buffer_owned      =*/ false,
+        /*.context_buffer_owned  =*/ false,
+        /*.no_alloc              =*/ params.no_alloc,
+        /*.n_objects             =*/ 0,
+        /*.objects_begin         =*/ NULL,
+        /*.objects_end           =*/ NULL,
+    };
+
+    GGML_PRINT_DEBUG("%s: context initialized\n", __func__);
+
+    return ctx;
+}
+
+struct ggml_context * ggml_init(struct ggml_init_params params) {
+    ggml_init_time_once();
 
     struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
 
@@ -1643,13 +1707,14 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
     *ctx = (struct ggml_context) {
-        /*.mem_size           =*/ mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
-        /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
-        /*.no_alloc           =*/ params.no_alloc,
-        /*.n_objects          =*/ 0,
-        /*.objects_begin      =*/ NULL,
-        /*.objects_end        =*/ NULL,
+        /*.mem_size              =*/ mem_size,
+        /*.mem_buffer            =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+        /*.mem_buffer_owned      =*/ params.mem_buffer ? false : true,
+        /*.context_buffer_owned  =*/ true,
+        /*.no_alloc              =*/ params.no_alloc,
+        /*.n_objects             =*/ 0,
+        /*.objects_begin         =*/ NULL,
+        /*.objects_end           =*/ NULL,
     };
 
     GGML_ASSERT(ctx->mem_buffer != NULL);
@@ -1680,7 +1745,9 @@ void ggml_free(struct ggml_context * ctx) {
         ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
     }
 
-    GGML_FREE(ctx);
+    if (ctx->context_buffer_owned) {
+        GGML_FREE(ctx);
+    }
 }
 
 size_t ggml_used_mem(const struct ggml_context * ctx) {

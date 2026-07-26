@@ -814,6 +814,25 @@ extern "C" {
 
     // main
 
+    // Returns the number of bytes and required alignment for caller-owned context storage.
+    // Both values are stable for the loaded ggml library, but callers should query them instead
+    // of depending on the private struct ggml_context layout.
+    GGML_API size_t ggml_context_size     (void);
+    GGML_API size_t ggml_context_alignment(void);
+
+    // Initializes a context without allocating memory. context_buffer must point to at least
+    // ggml_context_size() bytes aligned to ggml_context_alignment(). params.mem_buffer must
+    // point to params.mem_size bytes with the same alignment; a zero mem_size requires a
+    // ggml_context_alignment()-byte buffer. The caller retains ownership of both buffers and
+    // must keep them alive until ggml_free() returns. ggml_free() never frees caller-owned
+    // buffers. Returns NULL for invalid, undersized, misaligned, or otherwise unusable input.
+    GGML_API struct ggml_context * ggml_try_init(
+            struct ggml_init_params params,
+            void *                  context_buffer,
+            size_t                  context_buffer_size);
+
+    // Legacy allocating initializer. Its ABI and abort-on-allocation-failure behavior are
+    // preserved; use ggml_try_init() when allocation failure must be non-fatal.
     GGML_API struct ggml_context * ggml_init (struct ggml_init_params params);
     GGML_API void                  ggml_reset(struct ggml_context * ctx);
     GGML_API void                  ggml_free (struct ggml_context * ctx);
