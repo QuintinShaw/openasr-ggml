@@ -343,6 +343,27 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Returns the caller-owned scratch-buffer size required by a scheduler for
+    // `graph_size`, or 0 when the size calculation overflows. This buffer holds
+    // scheduler-created tensor metadata, not backend tensor data.
+    GGML_API size_t               ggml_backend_sched_context_buffer_size(size_t graph_size);
+
+    // Fallible scheduler initialization with caller-owned context storage. Both
+    // buffers must be aligned to ggml_context_alignment() and stay alive until
+    // ggml_backend_sched_free() returns. The scheduler never frees them. Returns
+    // NULL for invalid, undersized, or otherwise unusable storage.
+    GGML_API ggml_backend_sched_t ggml_backend_sched_try_new(
+            ggml_backend_t * backends,
+            ggml_backend_buffer_type_t * bufts,
+            int n_backends,
+            size_t graph_size,
+            bool parallel,
+            bool op_offload,
+            void * context_buffer,
+            size_t context_buffer_size,
+            void * context_storage,
+            size_t context_storage_size);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);

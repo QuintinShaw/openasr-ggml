@@ -835,6 +835,9 @@ struct ggml_backend_sched {
 
     char * context_buffer;
     size_t context_buffer_size;
+    bool context_buffer_owned;
+    void * context_storage;
+    size_t context_storage_size;
 
     bool op_offload;
 
@@ -1045,7 +1048,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_free(sched->ctx);
 
-    sched->ctx = ggml_init(params);
+    sched->ctx = sched->context_storage != NULL
+        ? ggml_try_init(params, sched->context_storage, sched->context_storage_size)
+        : ggml_init(params);
     if (sched->ctx == NULL) {
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
@@ -1843,18 +1848,71 @@ static enum ggml_status ggml_backend_sched_compute_splits(
     return GGML_STATUS_SUCCESS;
 }
 
-ggml_backend_sched_t ggml_backend_sched_new(
+size_t ggml_backend_sched_context_buffer_size(size_t graph_size) {
+    const size_t split_tensor_factor = GGML_SCHED_MAX_SPLIT_INPUTS * 2;
+    if (graph_size == 0 ||
+            graph_size > SIZE_MAX / split_tensor_factor / sizeof(struct ggml_tensor)) {
+        return 0;
+    }
+
+    const size_t split_tensor_bytes =
+        graph_size * split_tensor_factor * sizeof(struct ggml_tensor);
+    const size_t graph_bytes = ggml_graph_overhead_custom(graph_size, false);
+    if (split_tensor_bytes > SIZE_MAX - graph_bytes) {
+        return 0;
+    }
+    return split_tensor_bytes + graph_bytes;
+}
+
+static bool ggml_backend_sched_storage_is_aligned(const void * storage) {
+    return storage != NULL &&
+        (uintptr_t) storage % ggml_context_alignment() == 0;
+}
+
+static ggml_backend_sched_t ggml_backend_sched_new_impl(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
         int n_backends,
         size_t graph_size,
         bool parallel,
-        bool op_offload) {
+        bool op_offload,
+        char * context_buffer,
+        size_t context_buffer_size,
+        bool context_buffer_owned,
+        void * context_storage,
+        size_t context_storage_size) {
     GGML_ASSERT(n_backends > 0);
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
+    const size_t required_context_buffer_size =
+        ggml_backend_sched_context_buffer_size(graph_size);
+    const bool has_caller_context = context_storage != NULL;
+    if (required_context_buffer_size == 0 ||
+            context_buffer_size < required_context_buffer_size ||
+            (has_caller_context && (
+                context_storage_size < ggml_context_size() ||
+                !ggml_backend_sched_storage_is_aligned(context_buffer) ||
+                !ggml_backend_sched_storage_is_aligned(context_storage)))) {
+        if (context_buffer_owned) {
+            free(context_buffer);
+        }
+        return NULL;
+    }
+
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    if (sched == NULL) {
+        if (context_buffer_owned) {
+            free(context_buffer);
+        }
+        return NULL;
+    }
+
+    sched->context_buffer = context_buffer;
+    sched->context_buffer_size = required_context_buffer_size;
+    sched->context_buffer_owned = context_buffer_owned;
+    sched->context_storage = context_storage;
+    sched->context_storage_size = context_storage_size;
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -1885,12 +1943,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
-
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
+
+    if (sched->hv_tensor_backend_ids == NULL ||
+            sched->hv_tensor_copies == NULL ||
+            sched->node_backend_ids == NULL ||
+            sched->leaf_backend_ids == NULL ||
+            sched->prev_node_backend_ids == NULL ||
+            sched->prev_leaf_backend_ids == NULL ||
+            sched->splits == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
 
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
@@ -1912,6 +1978,64 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+ggml_backend_sched_t ggml_backend_sched_try_new(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        void * context_buffer,
+        size_t context_buffer_size,
+        void * context_storage,
+        size_t context_storage_size) {
+    if (context_storage == NULL) {
+        return NULL;
+    }
+    return ggml_backend_sched_new_impl(
+        backends,
+        bufts,
+        n_backends,
+        graph_size,
+        parallel,
+        op_offload,
+        (char *) context_buffer,
+        context_buffer_size,
+        false,
+        context_storage,
+        context_storage_size);
+}
+
+ggml_backend_sched_t ggml_backend_sched_new(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload) {
+    const size_t context_buffer_size =
+        ggml_backend_sched_context_buffer_size(graph_size);
+    if (context_buffer_size == 0) {
+        return NULL;
+    }
+    char * context_buffer = (char *) malloc(context_buffer_size);
+    if (context_buffer == NULL) {
+        return NULL;
+    }
+    return ggml_backend_sched_new_impl(
+        backends,
+        bufts,
+        n_backends,
+        graph_size,
+        parallel,
+        op_offload,
+        context_buffer,
+        context_buffer_size,
+        true,
+        NULL,
+        0);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
@@ -1931,7 +2055,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
-    free(sched->context_buffer);
+    if (sched->context_buffer_owned) {
+        free(sched->context_buffer);
+    }
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
