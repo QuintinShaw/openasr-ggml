@@ -329,7 +329,7 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -16899,7 +16899,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     return GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
-        const enum ggml_status submitted = ggml_vk_status(error.code());
+        // vk::SystemError::code() is a std::error_code whose value is the VkResult.
+        const enum ggml_status submitted = ggml_vk_status(static_cast<vk::Result>(error.code().value()));
         if (submitted == GGML_STATUS_DEVICE_LOST) {
             ctx->poisoned = true;
             return submitted;

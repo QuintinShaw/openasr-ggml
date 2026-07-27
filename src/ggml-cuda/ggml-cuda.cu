@@ -106,6 +106,22 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
 
+// CUDA has no single "device lost" code the way Vulkan does. These are the runtime
+// errors after which the context is corrupted and every later call on it fails too,
+// which is exactly what GGML_STATUS_DEVICE_LOST reports to the caller. Everything
+// else stays GGML_STATUS_EXECUTION_FAILED, i.e. the device is still usable.
+static bool ggml_cuda_is_device_lost(cudaError_t error) {
+    switch (error) {
+        case cudaErrorLaunchFailure:
+        case cudaErrorIllegalAddress:
+        case cudaErrorECCUncorrectable:
+        case cudaErrorContextIsDestroyed:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // map a (possibly virtual) device id to the physical CUDA device that backs it
 static int ggml_cuda_get_physical_device(int device) {
     const ggml_cuda_device_info & info = ggml_cuda_info();
@@ -698,6 +714,19 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
+
+// Both helpers are used from the graph-capture entry path, which is compiled even
+// when USE_CUDA_GRAPH is off (the capture branch is then statically unreachable).
+static enum ggml_status ggml_cuda_status(cudaError_t error) {
+    return ggml_cuda_is_device_lost(error) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
+}
+
+static void ggml_cuda_graph_capture_finished() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+    if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        ggml_cuda_lock_cv.notify_all();
+    }
+}
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
@@ -2357,7 +2386,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed: %s\n", __func__, ggml_op_desc(dst), cudaGetErrorString(err));
-        ctx.terminal_status = err == cudaErrorDeviceLost
+        ctx.terminal_status = ggml_cuda_is_device_lost(err)
             ? GGML_STATUS_DEVICE_LOST
             : GGML_STATUS_EXECUTION_FAILED;
         return false;
@@ -2385,7 +2414,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_cuda_completion_status(cudaError_t error) {
     if (error == cudaSuccess) return GGML_STATUS_SUCCESS;
-    return error == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
+    return ggml_cuda_is_device_lost(error) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
 }
 
 static enum ggml_status ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -2545,17 +2574,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static enum ggml_status ggml_cuda_status(cudaError_t error) {
-    return error == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
-}
-
-static void ggml_cuda_graph_capture_finished() {
-    std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-    if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-        ggml_cuda_lock_cv.notify_all();
-    }
-}
-
 static enum ggml_status ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -2580,17 +2598,17 @@ static enum ggml_status ggml_cuda_graph_update_executable(ggml_backend_cuda_cont
         cudaError_t destroy_status = cudaGraphExecDestroy(graph->instance);
         graph->instance = nullptr;
         if (destroy_status != cudaSuccess) {
-            return destroy_status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
+            return ggml_cuda_is_device_lost(destroy_status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
         }
         cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
         return instantiate_status == cudaSuccess
             ? GGML_STATUS_SUCCESS
-            : (instantiate_status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+            : (ggml_cuda_is_device_lost(instantiate_status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
     }
 
     return stat == cudaSuccess
         ? GGML_STATUS_SUCCESS
-        : (stat == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+        : (ggml_cuda_is_device_lost(stat) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4086,6 +4104,7 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
     }
 
     return GGML_STATUS_SUCCESS;
+}
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
@@ -4172,7 +4191,7 @@ static enum ggml_status ggml_backend_cuda_event_record_status(ggml_backend_t bac
     cudaError_t status = cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream());
     return status == cudaSuccess
         ? GGML_STATUS_SUCCESS
-        : (status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+        : (ggml_cuda_is_device_lost(status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 
 static enum ggml_status ggml_backend_cuda_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -4183,7 +4202,7 @@ static enum ggml_status ggml_backend_cuda_event_wait_status(ggml_backend_t backe
     cudaError_t status = cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0);
     return status == cudaSuccess
         ? GGML_STATUS_SUCCESS
-        : (status == cudaErrorDeviceLost ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+        : (ggml_cuda_is_device_lost(status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
