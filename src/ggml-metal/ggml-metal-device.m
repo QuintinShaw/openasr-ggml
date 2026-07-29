@@ -1689,6 +1689,10 @@ static void * ggml_metal_host_malloc(size_t n) {
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (res == NULL) {
+        GGML_LOG_ERROR("%s: error: failed to allocate buffer metadata\n", __func__);
+        return NULL;
+    }
 
     res->dev = dev;
 
@@ -1738,7 +1742,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     if (size_aligned > 0 && (res->all_data == NULL || res->buffers[0].metal == nil)) {
         GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1746,7 +1750,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1759,6 +1763,10 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (res == NULL) {
+        GGML_LOG_ERROR("%s: error: failed to allocate buffer metadata\n", __func__);
+        return NULL;
+    }
 
     res->dev = dev;
 
@@ -1797,7 +1805,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
-                free(res);
+                ggml_metal_buffer_free(res);
                 return NULL;
             }
         }
@@ -1824,7 +1832,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
-                    free(res);
+                    ggml_metal_buffer_free(res);
                     return NULL;
                 }
             }
@@ -1843,7 +1851,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1853,6 +1861,10 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    if (buf == NULL) {
+        return;
+    }
+
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     for (int i = 0; i < buf->n_buffers; i++) {
@@ -1861,7 +1873,7 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
 
     ggml_metal_buffer_rset_free(buf);
 
-    if (buf->is_shared && buf->owned) {
+    if (buf->is_shared && buf->owned && buf->all_data != NULL) {
 #if TARGET_OS_OSX
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
 #else

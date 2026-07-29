@@ -202,6 +202,9 @@ typedef std::unique_ptr<ggml_backend_metal_buffer_type, ggml_backend_metal_buffe
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size, bool shared) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
+    if (res == nullptr) {
+        return nullptr;
+    }
 
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
@@ -600,6 +603,11 @@ ggml_backend_t ggml_backend_metal_init(void) {
     }
 
     ggml_backend_t backend = (ggml_backend_t) malloc(sizeof(ggml_backend));
+    if (backend == nullptr) {
+        ggml_metal_free(ctx);
+        GGML_LOG_ERROR("%s: error: failed to allocate backend metadata\n", __func__);
+        return nullptr;
+    }
 
     *backend = {
         /* .guid      = */ ggml_backend_metal_guid(),
@@ -686,6 +694,11 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
     }
 
     ggml_backend_t backend = (ggml_backend_t) malloc(sizeof(ggml_backend));
+    if (backend == nullptr) {
+        ggml_metal_free(ctx);
+        GGML_LOG_ERROR("%s: error: failed to allocate backend metadata\n", __func__);
+        return nullptr;
+    }
 
     *backend = {
         /* .guid      = */ ggml_backend_metal_guid(),
@@ -713,6 +726,9 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    if (res == nullptr) {
+        return nullptr;
+    }
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
