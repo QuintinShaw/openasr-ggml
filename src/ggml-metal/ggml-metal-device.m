@@ -1027,7 +1027,16 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
+            dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+#if TARGET_OS_OSX
+            // Apple-Silicon Macs before the Tensor API still benefit materially
+            // from wiring model buffers across warm graph submissions. Keep the
+            // conservative non-Tensor default on mobile, where the memory budget
+            // is tighter, and on Intel/eGPU devices without an Apple GPU family.
+            dev->props.use_residency_sets = dev->props.has_tensor || dev->props.supports_gpu_family_apple7;
+#else
             dev->props.use_residency_sets = dev->props.has_tensor;
+#endif
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
             if (getenv("GGML_METAL_RESIDENCY_ENABLE") != NULL) {
                 dev->props.use_residency_sets = true;
@@ -1047,8 +1056,6 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             if (getenv("GGML_METAL_SHARED_BUFFERS_ENABLE") != NULL) {
                 dev->props.use_shared_buffers = true;
             }
-
-            dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
 
