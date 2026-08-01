@@ -565,6 +565,13 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+static void ggml_backend_metal_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+    ggml_metal_set_abort_callback(ctx, abort_callback, abort_callback_data);
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -863,6 +870,9 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_metal_set_abort_callback;
     }
 
     return NULL;

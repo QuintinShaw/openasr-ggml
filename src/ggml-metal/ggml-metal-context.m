@@ -11,6 +11,8 @@
 
 #import <Metal/Metal.h>
 
+#include <stdint.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -75,7 +77,20 @@ struct ggml_metal {
     // error state - set when a command buffer fails during completion
     // once set, new submissions fail until the backend is recreated
     bool has_error;
+
+    // Compute-scoped cooperative cancellation. The abort flag is host-visible;
+    // each command buffer owns a separate indirect-dispatch argument buffer so
+    // the backend can still encode its command buffers on parallel host tasks.
+    ggml_abort_callback abort_callback;
+    void * abort_callback_data;
+    id<MTLBuffer> abort_flag;
+    id<MTLBuffer> abort_indirect_args[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    dispatch_semaphore_t abort_monitor_stop;
+    dispatch_semaphore_t abort_monitor_done;
+    bool abort_monitor_active;
 };
+
+static bool ggml_metal_abort_monitor_stop(ggml_metal_t ctx);
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -179,11 +194,43 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->pipelines_ext = ggml_metal_pipelines_init();
 
+    res->abort_flag = [device newBufferWithLength:sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        res->abort_indirect_args[i] = [device newBufferWithLength:sizeof(struct ggml_metal_cancel_dispatch_args)
+                                                           options:MTLResourceStorageModePrivate];
+    }
+    if (res->abort_flag == nil) {
+        GGML_LOG_ERROR("%s: failed to allocate Metal cancellation flag\n", __func__);
+        ggml_metal_free(res);
+        return NULL;
+    }
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        if (res->abort_indirect_args[i] == nil) {
+            GGML_LOG_ERROR("%s: failed to allocate Metal cancellation indirect buffer\n", __func__);
+            ggml_metal_free(res);
+            return NULL;
+        }
+    }
+
     return res;
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->abort_monitor_active) {
+        dispatch_semaphore_signal(ctx->abort_monitor_stop);
+        dispatch_semaphore_wait(ctx->abort_monitor_done, DISPATCH_TIME_FOREVER);
+        dispatch_release(ctx->abort_monitor_stop);
+        dispatch_release(ctx->abort_monitor_done);
+        ctx->abort_monitor_active = false;
+    }
+
+    [ctx->abort_flag release];
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        [ctx->abort_indirect_args[i] release];
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -234,6 +281,7 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 
 enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->has_error) {
+        ggml_metal_abort_monitor_stop(ctx);
         return GGML_STATUS_BACKEND_POISONED;
     }
 
@@ -242,6 +290,8 @@ enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+
+    const bool aborted = ggml_metal_abort_monitor_stop(ctx);
 
     // check status of all command buffers
     {
@@ -293,7 +343,7 @@ enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
         [ctx->cmd_bufs_ext removeAllObjects];
     }
 
-    return GGML_STATUS_SUCCESS;
+    return aborted ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -356,10 +406,66 @@ enum ggml_status ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t 
     }
 }
 
+static void ggml_metal_abort_monitor_run(void * opaque) {
+    ggml_metal_t ctx = opaque;
+    volatile uint32_t * device_flag = (volatile uint32_t *) [ctx->abort_flag contents];
+    while (true) {
+        if (ctx->abort_callback(ctx->abort_callback_data)) {
+            __atomic_store_n(device_flag, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC);
+        if (dispatch_semaphore_wait(ctx->abort_monitor_stop, deadline) == 0) {
+            break;
+        }
+    }
+    dispatch_semaphore_signal(ctx->abort_monitor_done);
+}
+
+static void ggml_metal_abort_monitor_start(ggml_metal_t ctx) {
+    GGML_ASSERT(!ctx->abort_monitor_active);
+    GGML_ASSERT(ctx->abort_callback != NULL);
+    volatile uint32_t * device_flag = (volatile uint32_t *) [ctx->abort_flag contents];
+    __atomic_store_n(device_flag, 0, __ATOMIC_RELEASE);
+    ctx->abort_monitor_stop = dispatch_semaphore_create(0);
+    ctx->abort_monitor_done = dispatch_semaphore_create(0);
+    ctx->abort_monitor_active = true;
+    dispatch_async_f(
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ctx,
+        ggml_metal_abort_monitor_run);
+}
+
+static bool ggml_metal_abort_monitor_stop(ggml_metal_t ctx) {
+    if (!ctx->abort_monitor_active) {
+        return false;
+    }
+    dispatch_semaphore_signal(ctx->abort_monitor_stop);
+    dispatch_semaphore_wait(ctx->abort_monitor_done, DISPATCH_TIME_FOREVER);
+    volatile uint32_t * device_flag = (volatile uint32_t *) [ctx->abort_flag contents];
+    const bool aborted = __atomic_load_n(device_flag, __ATOMIC_ACQUIRE) != 0
+        || ctx->abort_callback(ctx->abort_callback_data);
+    dispatch_release(ctx->abort_monitor_stop);
+    dispatch_release(ctx->abort_monitor_done);
+    ctx->abort_monitor_stop = nil;
+    ctx->abort_monitor_done = nil;
+    ctx->abort_monitor_active = false;
+    return aborted;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_BACKEND_POISONED;
+    }
+
+    if (ctx->abort_callback != NULL) {
+        // Metal cannot cancel a committed command buffer. A tiny gate kernel
+        // before every normal dispatch samples a host-visible abort flag and
+        // turns the remaining work into zero-sized indirect dispatches. This
+        // preserves prompt cancellation without fragmenting a graph into
+        // hundreds of command buffers and host synchronizations.
+        ggml_metal_abort_monitor_start(ctx);
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -527,6 +633,13 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }
 
+void ggml_metal_set_abort_callback(
+        ggml_metal_t ctx, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    GGML_ASSERT(!ctx->abort_monitor_active);
+    ctx->abort_callback = abort_callback;
+    ctx->abort_callback_data = abort_callback_data;
+}
+
 enum ggml_status ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     if (ctx->has_error) {
         return GGML_STATUS_BACKEND_POISONED;
@@ -618,10 +731,17 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_start,
             idx_end,
             ctx->use_fusion,
-            ctx->use_concurrency,
+            ctx->use_concurrency && !ctx->abort_monitor_active,
             ctx->capture_started,
             ctx->debug_graph,
             ctx->debug_fusion);
+
+        if (ctx->abort_monitor_active) {
+            ggml_metal_op_set_cancel_buffers(
+                ctx_op,
+                (struct ggml_metal_buffer_id) { ctx->abort_flag, 0 },
+                (struct ggml_metal_buffer_id) { ctx->abort_indirect_args[cb_idx], 0 });
+        }
 
         bool encoded = true;
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {

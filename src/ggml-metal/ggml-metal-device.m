@@ -2,6 +2,7 @@
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
+#import "ggml-metal-impl.h"
 
 #include <Foundation/Foundation.h>
 
@@ -482,6 +483,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    bool concurrent;
+    id<MTLComputePipelineState> current_pipeline;
+    id<MTLComputePipelineState> cancel_gate_pipeline;
+    id<MTLBuffer> cancel_abort_flag;
+    NSUInteger cancel_abort_flag_offset;
+    id<MTLBuffer> cancel_indirect_args;
+    NSUInteger cancel_indirect_args_offset;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -494,6 +502,8 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     } else {
         res->obj = [cmd_buf computeCommandEncoder];
     }
+
+    res->concurrent = concurrent;
 
     [res->obj retain];
 
@@ -514,7 +524,24 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    encoder->current_pipeline = pipeline.pipeline->obj;
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+}
+
+void ggml_metal_encoder_set_cancel_buffers(
+        ggml_metal_encoder_t encoder,
+        struct ggml_metal_pipeline_with_params gate_pipeline,
+        struct ggml_metal_buffer_id abort_flag,
+        struct ggml_metal_buffer_id indirect_args) {
+    GGML_ASSERT(!encoder->concurrent);
+    GGML_ASSERT(gate_pipeline.pipeline != NULL);
+    GGML_ASSERT(abort_flag.metal != NULL);
+    GGML_ASSERT(indirect_args.metal != NULL);
+    encoder->cancel_gate_pipeline = gate_pipeline.pipeline->obj;
+    encoder->cancel_abort_flag = (id<MTLBuffer>) abort_flag.metal;
+    encoder->cancel_abort_flag_offset = abort_flag.offs;
+    encoder->cancel_indirect_args = (id<MTLBuffer>) indirect_args.metal;
+    encoder->cancel_indirect_args_offset = indirect_args.offs;
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
@@ -530,6 +557,32 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (encoder->cancel_gate_pipeline != nil) {
+        GGML_ASSERT(encoder->current_pipeline != nil);
+        struct ggml_metal_cancel_dispatch_args desired = {
+            (uint32_t) tg0,
+            (uint32_t) tg1,
+            (uint32_t) tg2,
+            0,
+        };
+        [encoder->obj setComputePipelineState:encoder->cancel_gate_pipeline];
+        [encoder->obj setBuffer:encoder->cancel_abort_flag
+                         offset:encoder->cancel_abort_flag_offset
+                        atIndex:GGML_METAL_CANCEL_ABORT_BUFFER_INDEX];
+        [encoder->obj setBytes:&desired
+                        length:sizeof(desired)
+                       atIndex:GGML_METAL_CANCEL_DESIRED_BUFFER_INDEX];
+        [encoder->obj setBuffer:encoder->cancel_indirect_args
+                         offset:encoder->cancel_indirect_args_offset
+                        atIndex:GGML_METAL_CANCEL_INDIRECT_BUFFER_INDEX];
+        [encoder->obj dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [encoder->obj setComputePipelineState:encoder->current_pipeline];
+        [encoder->obj dispatchThreadgroupsWithIndirectBuffer:encoder->cancel_indirect_args
+                                      indirectBufferOffset:encoder->cancel_indirect_args_offset
+                                     threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        return;
+    }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
