@@ -2549,7 +2549,9 @@ static enum ggml_status ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backen
 static enum ggml_status ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    return ggml_backend_cuda_completion_status(cudaStreamSynchronize(cuda_ctx->stream()));
+    const enum ggml_status status = ggml_backend_cuda_completion_status(
+        cudaStreamSynchronize(cuda_ctx->stream()));
+    return ggml_backend_abort_context_status(&cuda_ctx->abort, status);
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -3926,6 +3928,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+#ifdef USE_CUDA_GRAPH
+static enum ggml_status ggml_cuda_abort_graph_capture(ggml_backend_cuda_context * cuda_ctx) {
+    cudaGraph_t abandoned = nullptr;
+    const cudaError_t end_status = cudaStreamEndCapture(cuda_ctx->stream(), &abandoned);
+    enum ggml_status status = end_status == cudaSuccess
+        ? GGML_STATUS_ABORTED
+        : ggml_cuda_status(end_status);
+    if (abandoned != nullptr) {
+        const cudaError_t destroy_status = cudaGraphDestroy(abandoned);
+        if (status == GGML_STATUS_ABORTED && destroy_status != cudaSuccess) {
+            status = ggml_cuda_status(destroy_status);
+        }
+    }
+    ggml_cuda_graph_capture_finished();
+    return status;
+}
+#endif
+
 static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -3936,6 +3956,15 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
+
+    if (ggml_backend_abort_context_requested(&cuda_ctx->abort)) {
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph && cuda_graph_update_required) {
+            return ggml_cuda_abort_graph_capture(cuda_ctx);
+        }
+#endif
+        return GGML_STATUS_ABORTED;
+    }
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) == stream_ctx.concurrent_events.end()) {
@@ -4026,6 +4055,20 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
             }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
+                // Poll only at a main-stream boundary. A concurrent branch is
+                // allowed to reach its join first so every auxiliary stream is
+                // ordered back into stream 0 before an early return is drained.
+                if (!is_concurrent_event_active &&
+                    ggml_backend_abort_context_requested(&cuda_ctx->abort)) {
+                    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+#ifdef USE_CUDA_GRAPH
+                    if (use_cuda_graph && cuda_graph_update_required) {
+                        return ggml_cuda_abort_graph_capture(cuda_ctx);
+                    }
+#endif
+                    return GGML_STATUS_ABORTED;
+                }
+
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
@@ -4199,6 +4242,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->terminal_status = GGML_STATUS_SUCCESS;
 
     try {
+        if (ggml_backend_abort_context_requested(&cuda_ctx->abort)) {
+            return GGML_STATUS_ABORTED;
+        }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4520,6 +4567,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     }
+}
+
+static void ggml_backend_cuda_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_abort_context_set(&cuda_ctx->abort, abort_callback, abort_callback_data);
 }
 
 static const ggml_backend_i ggml_backend_cuda_interface = {
@@ -5646,6 +5700,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MEMORY_API_V1_PROC) == 0) {
         return (void *) ggml_backend_cuda_memory_get_api_v1;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_cuda_set_abort_callback;
     }
     return nullptr;
 }

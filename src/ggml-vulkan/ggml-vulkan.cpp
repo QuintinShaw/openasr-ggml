@@ -2138,6 +2138,7 @@ struct ggml_backend_vk_context {
     std::string name;
 
     vk_device device;
+    struct ggml_backend_abort_context abort = {};
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -2383,6 +2384,7 @@ static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             if (status == GGML_STATUS_DEVICE_LOST) { ctx->poisoned = true; ctx->device->poisoned.store(true); }
             return status;
         }
+        ggml_backend_abort_context_requested(&ctx->abort);
         for (uint32_t i = 0; i < 100; ++i) {
             YIELD();
             YIELD();
@@ -2397,7 +2399,7 @@ static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
-    return GGML_STATUS_SUCCESS;
+    return ggml_backend_abort_context_status(&ctx->abort, GGML_STATUS_SUCCESS);
 }
 
 static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
@@ -15937,7 +15939,7 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
-    return GGML_STATUS_SUCCESS;
+    return ggml_backend_abort_context_status(&ctx->abort, GGML_STATUS_SUCCESS);
 }
 
 static enum ggml_status ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -15949,11 +15951,11 @@ static enum ggml_status ggml_backend_vk_synchronize(ggml_backend_t backend) {
 
     try {
         enum ggml_status status = ggml_vk_synchronize(ctx);
-        if (status != GGML_STATUS_SUCCESS) {
+        if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_ABORTED) {
             return status;
         }
         ggml_vk_graph_cleanup(ctx);
-        return GGML_STATUS_SUCCESS;
+        return status;
     } catch (const vk::SystemError & error) {
         const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
         if (status == GGML_STATUS_DEVICE_LOST) {
@@ -16497,6 +16499,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (ctx->poisoned || ctx->device->poisoned.load()) {
         return GGML_STATUS_BACKEND_POISONED;
     }
+    if (ggml_backend_abort_context_requested(&ctx->abort)) {
+        return GGML_STATUS_ABORTED;
+    }
 
     try {
     if (vk_instance.debug_utils_support) {
@@ -16587,8 +16592,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    bool aborted = false;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (ggml_backend_abort_context_requested(&ctx->abort)) {
+            aborted = true;
+            break;
+        }
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
@@ -16854,7 +16864,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask = 0;
     }
 
-    ctx->last_total_flops = total_flops;
+    if (!aborted) {
+        ctx->last_total_flops = total_flops;
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -16903,7 +16915,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         return ggml_backend_vk_synchronize(backend);
     }
 
-    return GGML_STATUS_SUCCESS;
+    return aborted ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
         // vk::SystemError::code() is a std::error_code whose value is the VkResult.
         const enum ggml_status submitted = ggml_vk_status(static_cast<vk::Result>(error.code().value()));
@@ -16912,7 +16924,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             return submitted;
         }
         const enum ggml_status completed = ggml_backend_vk_synchronize(backend);
-        return completed == GGML_STATUS_SUCCESS ? submitted : completed;
+        return ggml_backend_status_merge(submitted, completed);
     }
 }
 
@@ -17273,6 +17285,13 @@ static enum ggml_status ggml_backend_vk_event_wait_status(ggml_backend_t backend
         }
         return status;
     }
+}
+
+static void ggml_backend_vk_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_backend_abort_context_set(&ctx->abort, abort_callback, abort_callback_data);
 }
 
 // TODO: enable async and synchronize
@@ -18628,6 +18647,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, GGML_BACKEND_DEVICE_PCI_VENDOR_ID_PROC) == 0) {
         return (void *) ggml_backend_vk_device_pci_vendor_id;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_vk_set_abort_callback;
     }
     return NULL;
 }

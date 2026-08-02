@@ -102,6 +102,56 @@ extern "C" {
     // Backend (stream)
     //
 
+    // Merge queue submission with the terminal completion/drain result.
+    // Completion normally wins because it describes work that reached a
+    // terminal device state. Cancellation is the exception: a later cancel
+    // observation must never hide a concrete submit or device failure.
+    static inline enum ggml_status ggml_backend_status_merge(
+            enum ggml_status submitted, enum ggml_status completed) {
+        if (completed == GGML_STATUS_SUCCESS) {
+            return submitted;
+        }
+        if (completed == GGML_STATUS_ABORTED &&
+            submitted != GGML_STATUS_SUCCESS && submitted != GGML_STATUS_ABORTED) {
+            return submitted;
+        }
+        return completed;
+    }
+
+    // Compute-scoped cancellation state shared by native backend adapters.
+    // The public backend layer installs and clears this state on the same host
+    // thread around one synchronous graph-compute call. Backends may poll it at
+    // safe submission boundaries; once observed, cancellation stays sticky
+    // until the public layer clears the context after draining pending work.
+    struct ggml_backend_abort_context {
+        ggml_abort_callback callback;
+        void * callback_data;
+        bool observed;
+    };
+
+    static inline void ggml_backend_abort_context_set(
+            struct ggml_backend_abort_context * ctx,
+            ggml_abort_callback callback, void * callback_data) {
+        ctx->callback = callback;
+        ctx->callback_data = callback != NULL ? callback_data : NULL;
+        ctx->observed = false;
+    }
+
+    static inline bool ggml_backend_abort_context_requested(struct ggml_backend_abort_context * ctx) {
+        if (!ctx->observed && ctx->callback != NULL) {
+            ctx->observed = ctx->callback(ctx->callback_data);
+        }
+        return ctx->observed;
+    }
+
+    static inline enum ggml_status ggml_backend_abort_context_status(
+            struct ggml_backend_abort_context * ctx, enum ggml_status status) {
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        return ggml_backend_abort_context_requested(ctx) ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
+    }
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
