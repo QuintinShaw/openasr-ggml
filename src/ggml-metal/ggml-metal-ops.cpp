@@ -140,6 +140,19 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
 }
 
+void ggml_metal_op_set_cancel_buffers(
+        ggml_metal_op_t ctx,
+        struct ggml_metal_buffer_id abort_flag,
+        struct ggml_metal_buffer_id indirect_args) {
+    auto gate_pipeline = ggml_metal_library_compile_pipeline(
+        ctx->lib,
+        "kernel_openasr_cancel_dispatch",
+        "kernel_openasr_cancel_dispatch",
+        nullptr);
+    assert(gate_pipeline.pipeline != nullptr);
+    ggml_metal_encoder_set_cancel_buffers(ctx->enc, gate_pipeline, abort_flag, indirect_args);
+}
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }

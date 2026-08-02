@@ -14,6 +14,13 @@
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
 
+// Reserved buffer slots used only by the cooperative-cancellation gate
+// pipeline. Keep these below Metal's 31-buffer limit and above every normal
+// GGML kernel binding.
+#define GGML_METAL_CANCEL_ABORT_BUFFER_INDEX    28
+#define GGML_METAL_CANCEL_DESIRED_BUFFER_INDEX  29
+#define GGML_METAL_CANCEL_INDIRECT_BUFFER_INDEX 30
+
 // kernel parameters for mat-vec threadgroups
 //
 // N_R0: number of src0 rows to process per simdgroup
