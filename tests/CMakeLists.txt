@@ -189,10 +189,18 @@ if (GGML_VULKAN)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
-if (GGML_HIP AND GGML_HIP_GRAPHS)
-    set(TEST_TARGET test-backend-hip-cancel-contract)
+if ((GGML_CUDA AND GGML_CUDA_GRAPHS) OR (GGML_HIP AND GGML_HIP_GRAPHS))
+    # CUDA and HIP share the ggml-cuda graph implementation. Build the same
+    # hardware contract test against the concrete provider selected here so a
+    # backend cannot silently drift from submission-checkpoint capture to
+    # graph-completion replay semantics.
+    set(TEST_TARGET test-backend-cuda-graph-cancel-contract)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-hip ggml-cpu Threads::Threads)
+    if (GGML_HIP)
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-hip ggml-cpu Threads::Threads)
+    else()
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-cuda ggml-cpu Threads::Threads)
+    endif()
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 

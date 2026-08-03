@@ -112,8 +112,8 @@ static void wait_for_launch_and_cancel(
     }
     const auto cancel_at = steady_clock::now() + delay;
     while (steady_clock::now() < cancel_at) {
-        // Windows timer granularity can overshoot a short sleep by an entire
-        // replay. A bounded spin keeps this hardware contract test precise.
+        // A short sleep can overshoot by an entire replay on common host timer
+        // implementations. A bounded spin keeps this hardware test precise.
     }
     probe.cancel.store(true, std::memory_order_release);
 }
