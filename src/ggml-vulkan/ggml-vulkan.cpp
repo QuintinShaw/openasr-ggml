@@ -2334,10 +2334,11 @@ struct vk_instance_t {
 
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
+    std::once_flag device_init_flags[GGML_VK_MAX_DEVICES];
     vk_device devices[GGML_VK_MAX_DEVICES];
 };
 
-static bool vk_instance_initialized = false;
+static std::once_flag vk_instance_init_flag;
 static vk_instance_t vk_instance;
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -5869,10 +5870,10 @@ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev)
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
-    if (vk_instance.devices[idx] == nullptr) {
+    GGML_ASSERT(idx < vk_instance.device_indices.size());
+    std::call_once(vk_instance.device_init_flags[idx], [idx]() {
         VK_LOG_DEBUG("Initializing new vk_device");
         vk_device device = std::make_shared<vk_device_struct>();
-        vk_instance.devices[idx] = device;
 
         device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
 
@@ -6755,8 +6756,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
-        return device;
-    }
+        // Publish only after every interface and runtime resource is ready.
+        vk_instance.devices[idx] = std::move(device);
+    });
 
     return vk_instance.devices[idx];
 }
@@ -6765,7 +6767,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     GGML_ASSERT(idx < vk_instance.device_indices.size());
     size_t dev_num = vk_instance.device_indices[idx];
     VK_LOG_DEBUG("ggml_vk_print_gpu_info(" << dev_num << ")");
-    GGML_ASSERT(vk_instance_initialized);
+    GGML_ASSERT(vk_instance.instance);
 
     std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
 
@@ -7017,10 +7019,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
 
-static void ggml_vk_instance_init() {
-    if (vk_instance_initialized) {
-        return;
-    }
+static void ggml_vk_instance_init_impl() try {
     VK_LOG_DEBUG("ggml_vk_instance_init()");
 
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
@@ -7077,7 +7076,6 @@ static void ggml_vk_instance_init() {
 #endif
 
     vk_instance.instance = vk::createInstance(instance_create_info);
-    vk_instance_initialized = true;
 
     if (debug_utils_ext) {
         vk_instance.debug_utils_support              = true;
@@ -7265,6 +7263,31 @@ static void ggml_vk_instance_init() {
 
         ggml_vk_print_gpu_info(i);
     }
+} catch (...) {
+    if (vk_instance.instance) {
+        vkDestroyInstance(static_cast<VkInstance>(vk_instance.instance), nullptr);
+        vk_instance.instance = nullptr;
+    }
+    vk_instance.debug_utils_support = false;
+    vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = nullptr;
+    vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = nullptr;
+    vk_instance.device_indices.clear();
+    vk_instance.device_supports_membudget.clear();
+    vk_perf_logger_enabled = false;
+    vk_perf_logger_concurrent = false;
+    vk_enable_sync_logger = false;
+    vk_memory_logger_enabled = false;
+    vk_perf_logger_frequency = 1;
+    vk_pipeline_stats_filter.clear();
+    throw;
+}
+
+static void ggml_vk_instance_init() {
+    std::call_once(vk_instance_init_flag, ggml_vk_instance_init_impl);
 }
 
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
