@@ -2,6 +2,8 @@
 
 #include "ggml-metal-device.h"
 
+struct ggml_backend_graph_cancel_capability;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
