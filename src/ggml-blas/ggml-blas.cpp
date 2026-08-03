@@ -292,6 +292,9 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_BACKEND_POISONED;
     }
 
+    ggml_backend_abort_context_mark_native(
+        &ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (ggml_backend_abort_context_requested(&ctx->abort)) {
             return GGML_STATUS_ABORTED;
@@ -694,10 +697,12 @@ void ggml_backend_blas_set_n_threads(ggml_backend_t backend_blas, int n_threads)
 }
 
 static void ggml_backend_blas_set_abort_callback(
-        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(ggml_backend_is_blas(backend));
     ggml_backend_blas_context * ctx = (ggml_backend_blas_context *) backend->context;
-    ggml_backend_abort_context_set(&ctx->abort, abort_callback, abort_callback_data);
+    ggml_backend_abort_context_set(
+        &ctx->abort, abort_callback, abort_callback_data, cancel_capability);
 }
 
 // device interface

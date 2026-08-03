@@ -16718,6 +16718,8 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_backend_abort_context_mark_native(
+        &ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     if (ctx->poisoned || ctx->device->poisoned.load()) {
         return GGML_STATUS_BACKEND_POISONED;
     }
@@ -17516,10 +17518,12 @@ static enum ggml_status ggml_backend_vk_event_wait_status(ggml_backend_t backend
 }
 
 static void ggml_backend_vk_set_abort_callback(
-        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
-    ggml_backend_abort_context_set(&ctx->abort, abort_callback, abort_callback_data);
+    ggml_backend_abort_context_set(
+        &ctx->abort, abort_callback, abort_callback_data, cancel_capability);
 }
 
 // TODO: enable async and synchronize

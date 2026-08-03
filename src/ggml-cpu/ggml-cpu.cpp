@@ -112,6 +112,7 @@ struct ggml_backend_cpu_context {
 
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
+    struct ggml_backend_graph_cancel_capability * cancel_capability;
 
     bool                use_ref;  // use reference implementation
 
@@ -197,6 +198,12 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
         return GGML_STATUS_BACKEND_POISONED;
     }
 
+    if (cpu_ctx->abort_callback != NULL && cpu_ctx->cancel_capability != NULL) {
+        cpu_ctx->cancel_capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+        cpu_ctx->cancel_capability->observation_granularity =
+            GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
+    }
+
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
@@ -259,6 +266,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
+    ctx->cancel_capability   = NULL;
     ctx->use_ref             = false;
     ctx->memory_generation   = 1;
     ctx->memory_high_water   = 0;
@@ -305,12 +313,15 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
     ctx->threadpool = threadpool;
 }
 
-void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
+void ggml_backend_cpu_set_abort_callback(
+        ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
+    ctx->cancel_capability = abort_callback != NULL ? cancel_capability : NULL;
 }
 
 void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {

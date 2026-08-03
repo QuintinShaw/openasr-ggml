@@ -126,15 +126,27 @@ extern "C" {
     struct ggml_backend_abort_context {
         ggml_abort_callback callback;
         void * callback_data;
+        struct ggml_backend_graph_cancel_capability * cancel_capability;
         bool observed;
     };
 
     static inline void ggml_backend_abort_context_set(
             struct ggml_backend_abort_context * ctx,
-            ggml_abort_callback callback, void * callback_data) {
+            ggml_abort_callback callback, void * callback_data,
+            struct ggml_backend_graph_cancel_capability * cancel_capability) {
         ctx->callback = callback;
         ctx->callback_data = callback != NULL ? callback_data : NULL;
+        ctx->cancel_capability = callback != NULL ? cancel_capability : NULL;
         ctx->observed = false;
+    }
+
+    static inline void ggml_backend_abort_context_mark_native(
+            struct ggml_backend_abort_context * ctx,
+            enum ggml_backend_graph_cancel_observation_granularity observation_granularity) {
+        if (ctx->callback != NULL && ctx->cancel_capability != NULL) {
+            ctx->cancel_capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+            ctx->cancel_capability->observation_granularity = observation_granularity;
+        }
     }
 
     static inline bool ggml_backend_abort_context_requested(struct ggml_backend_abort_context * ctx) {

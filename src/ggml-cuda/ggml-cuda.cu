@@ -4240,6 +4240,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->terminal_status = GGML_STATUS_SUCCESS;
+    ggml_backend_abort_context_mark_native(
+        &cuda_ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
 
     try {
         if (ggml_backend_abort_context_requested(&cuda_ctx->abort)) {
@@ -4284,6 +4286,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (use_cuda_graph && !cuda_graph_update_required) {
+        ggml_backend_abort_context_mark_native(
+            &cuda_ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION);
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -4570,10 +4577,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 }
 
 static void ggml_backend_cuda_set_abort_callback(
-        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_abort_context_set(&cuda_ctx->abort, abort_callback, abort_callback_data);
+    ggml_backend_abort_context_set(
+        &cuda_ctx->abort, abort_callback, abort_callback_data, cancel_capability);
 }
 
 static const ggml_backend_i ggml_backend_cuda_interface = {

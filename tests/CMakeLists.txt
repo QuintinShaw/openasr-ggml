@@ -189,6 +189,13 @@ if (GGML_VULKAN)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
+if (GGML_HIP AND GGML_HIP_GRAPHS)
+    set(TEST_TARGET test-backend-hip-cancel-contract)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-hip ggml-cpu Threads::Threads)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
 # shared backend graph cancellation contract
 set(TEST_TARGET test-backend-cancel)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)

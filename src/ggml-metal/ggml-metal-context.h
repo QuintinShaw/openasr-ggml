@@ -28,7 +28,8 @@ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph 
 void             ggml_metal_quarantine(ggml_metal_t ctx);
 bool             ggml_metal_is_quarantined(ggml_metal_t ctx);
 void             ggml_metal_set_abort_callback(
-        ggml_metal_t ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+        ggml_metal_t ctx, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability);
 
 enum ggml_status ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 enum ggml_status ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);

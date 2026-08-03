@@ -302,15 +302,25 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
-    // Cooperative graph cancellation. Native mode means the backend polls
-    // inside one graph submission. Segmented mode is the shared fallback: the
-    // backend layer submits bounded graph views and synchronizes between them.
-    // In both modes an observed callback=true returns GGML_STATUS_ABORTED and
-    // no backend work remains in flight when the compute call returns.
-    enum ggml_backend_graph_cancel_mode {
+    // Cooperative graph cancellation reports two orthogonal properties for
+    // the execution path actually used by this compute. The mechanism says
+    // where polling is implemented; the observation granularity says the
+    // coarsest boundary at which a newly raised request can be observed.
+    enum ggml_backend_graph_cancel_mechanism {
         GGML_BACKEND_GRAPH_CANCEL_DISABLED  = 0,
         GGML_BACKEND_GRAPH_CANCEL_NATIVE    = 1,
         GGML_BACKEND_GRAPH_CANCEL_SEGMENTED = 2,
+    };
+
+    enum ggml_backend_graph_cancel_observation_granularity {
+        GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE                  = 0,
+        GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT = 1,
+        GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION      = 2,
+    };
+
+    struct ggml_backend_graph_cancel_capability {
+        enum ggml_backend_graph_cancel_mechanism mechanism;
+        enum ggml_backend_graph_cancel_observation_granularity observation_granularity;
     };
 
     // Non-native backends synchronize after at most this many graph nodes while
@@ -323,11 +333,18 @@ extern "C" {
 
     // Synchronous, compute-scoped cancellation. `abort_callback_data` must stay
     // alive only for this call; no job pointer is retained by the shared layer.
-    // `cancel_mode` reports the contract actually used for this compute.
+    // `cancel_capability` reports the execution path actually used. A request
+    // observed before graph submission reports DISABLED/NONE because no backend
+    // cancellation mechanism ran. GRAPH_COMPLETION means an already launched
+    // monolithic graph cannot be interrupted; cancellation is observed after
+    // that graph completes and prevents later upper-layer work from being
+    // submitted. ABORTED means the request was observed, accepted work has been
+    // completed or drained, and the backend is safe to reuse. Concrete device,
+    // execution, or poisoned-backend failures take precedence over ABORTED.
     GGML_API enum ggml_status ggml_backend_graph_compute_with_abort(
             ggml_backend_t backend, struct ggml_cgraph * cgraph,
             ggml_abort_callback abort_callback, void * abort_callback_data,
-            enum ggml_backend_graph_cancel_mode * cancel_mode);
+            struct ggml_backend_graph_cancel_capability * cancel_capability);
 
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
@@ -444,7 +461,7 @@ extern "C" {
     // Implementations must poll at safe submission/completion boundaries,
     // report GGML_STATUS_ABORTED after an observed request (without hiding a
     // device/execute failure), and retain neither pointer after the clear call.
-    typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+    typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data, struct ggml_backend_graph_cancel_capability * cancel_capability);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;
@@ -602,7 +619,7 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_sched_graph_compute_with_abort(
             ggml_backend_sched_t sched, struct ggml_cgraph * graph,
             ggml_abort_callback abort_callback, void * abort_callback_data,
-            enum ggml_backend_graph_cancel_mode * cancel_mode);
+            struct ggml_backend_graph_cancel_capability * cancel_capability);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

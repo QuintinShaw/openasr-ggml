@@ -88,10 +88,10 @@ static void run_prior_pending_case(
     cancel_after_precheck probe;
     std::atomic<bool> returned{false};
     enum ggml_status status = GGML_STATUS_FAILED;
-    enum ggml_backend_graph_cancel_mode mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    struct ggml_backend_graph_cancel_capability capability = {};
     std::thread compute([&]() {
         status = ggml_backend_graph_compute_with_abort(
-            backend, fixture.graph, cancel_on_first_native_poll, &probe, &mode);
+            backend, fixture.graph, cancel_on_first_native_poll, &probe, &capability);
         returned.store(true, std::memory_order_release);
     });
 
@@ -109,7 +109,9 @@ static void run_prior_pending_case(
 
     assert(!returned_before_gate);
     assert(status == GGML_STATUS_ABORTED);
-    assert(mode == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity ==
+           GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     assert(ggml_backend_graph_compute(backend, fixture.graph) == GGML_STATUS_SUCCESS);
 }
 
@@ -137,10 +139,12 @@ int main() {
 
     // Establish a completed historical armed value, then enqueue new
     // callback-free work. The old value must not cover the new submission.
-    enum ggml_backend_graph_cancel_mode prime_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    struct ggml_backend_graph_cancel_capability prime_capability = {};
     assert(ggml_backend_graph_compute_with_abort(
-        backend, fixture.graph, never_cancel, nullptr, &prime_mode) == GGML_STATUS_SUCCESS);
-    assert(prime_mode == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        backend, fixture.graph, never_cancel, nullptr, &prime_capability) == GGML_STATUS_SUCCESS);
+    assert(prime_capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(prime_capability.observation_granularity ==
+           GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
 
     void * historical_gate = gate_create(backend);
     run_prior_pending_case(backend, fixture, historical_gate, enqueue_wait, signal_gate);

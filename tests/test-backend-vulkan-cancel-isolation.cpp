@@ -117,15 +117,17 @@ int main() {
         }
     });
 
-    enum ggml_backend_graph_cancel_mode mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    struct ggml_backend_graph_cancel_capability capability = {};
     const enum ggml_status canceled = ggml_backend_graph_compute_with_abort(
-        canceled_backend, graph, cancel_after_own_submission, &probe, &mode);
+        canceled_backend, graph, cancel_after_own_submission, &probe, &capability);
     canceled_returned.store(true, std::memory_order_release);
     release_gate_once(false);
     watchdog.join();
 
     assert(canceled == GGML_STATUS_ABORTED);
-    assert(mode == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity ==
+           GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     assert(probe.tail_enqueued.load(std::memory_order_acquire));
     assert(!watchdog_was_needed.load(std::memory_order_acquire));
     assert(ggml_backend_synchronize(tail_backend) == GGML_STATUS_SUCCESS);
