@@ -2145,6 +2145,7 @@ struct ggml_backend_vk_context {
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
+    vk_semaphore compute_completion;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
     // A lost Vulkan device cannot be recovered in place. The first caller
@@ -2400,6 +2401,42 @@ static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+    return ggml_backend_abort_context_status(&ctx->abort, GGML_STATUS_SUCCESS);
+}
+
+// Wait for work submitted by this backend context without imposing a queue-wide
+// completion boundary. The abort callback is still polled while GPU work drains;
+// a concrete Vulkan failure remains authoritative over cancellation.
+static enum ggml_status ggml_vk_wait_for_compute_completion(
+        ggml_backend_vk_context * ctx, uint64_t value) {
+    uint64_t completed = 0;
+    VkResult result = VK_SUCCESS;
+    while ((result = vkGetSemaphoreCounterValue(
+                static_cast<VkDevice>(ctx->device->device),
+                static_cast<VkSemaphore>(ctx->compute_completion.s),
+                &completed)) == VK_SUCCESS && completed < value) {
+        ggml_backend_abort_context_requested(&ctx->abort);
+        for (uint32_t i = 0; i < 100; ++i) {
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+        }
+    }
+    if (result != VK_SUCCESS) {
+        const enum ggml_status status = ggml_vk_status(static_cast<vk::Result>(result));
+        if (status == GGML_STATUS_DEVICE_LOST) {
+            ctx->poisoned = true;
+            ctx->device->poisoned.store(true);
+        }
+        return status;
+    }
     return ggml_backend_abort_context_status(&ctx->abort, GGML_STATUS_SUCCESS);
 }
 
@@ -3009,6 +3046,29 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     ctx->p->q->queue.submit(submit_infos, fence);
 
     ctx->seqs.clear();
+}
+
+// Armed cancellation needs a completion point owned by this backend context.
+// Callback-free work keeps the original submissions byte-for-byte unchanged.
+static void ggml_vk_submit_compute(
+        ggml_backend_vk_context * backend_ctx, vk_context & submit_ctx, vk::Fence fence) {
+    if (backend_ctx->abort.callback == nullptr) {
+        ggml_vk_submit(submit_ctx, fence);
+        return;
+    }
+
+    GGML_ASSERT(!submit_ctx->seqs.empty());
+    GGML_ASSERT(!submit_ctx->seqs.back().empty());
+    vk_semaphore completion = backend_ctx->compute_completion;
+    ++completion.value;
+    submit_ctx->seqs.back().back().signal_semaphores.push_back(completion);
+    try {
+        ggml_vk_submit(submit_ctx, fence);
+    } catch (...) {
+        submit_ctx->seqs.back().back().signal_semaphores.pop_back();
+        throw;
+    }
+    backend_ctx->compute_completion.value = completion.value;
 }
 
 static uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyProperties>& queue_family_props, const vk::QueueFlags& required, const vk::QueueFlags& avoid, int32_t compute_index, uint32_t min_num_queues) {
@@ -7310,6 +7370,11 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
+    vk::SemaphoreTypeCreateInfo compute_completion_type{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo compute_completion_info{};
+    compute_completion_info.setPNext(&compute_completion_type);
+    ctx->compute_completion.s = ctx->device->device.createSemaphore(compute_completion_info);
+    ctx->compute_completion.value = 0;
 
     ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
     if (ctx->device->async_use_transfer_queue) {
@@ -7945,6 +8010,47 @@ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
     ggml_vk_submit(cpy_ctx, {});
     ctx->transfer_ctx.reset();
     return true;
+}
+
+// Discard only command buffers that have never reached a queue. If one carried
+// a transfer-timeline wait, move that wait to the terminal fence so graph
+// cleanup cannot race the transfer queue.
+static void ggml_vk_discard_compute_ctx(ggml_backend_vk_context * ctx) {
+    if (ctx->compute_ctx.expired()) {
+        return;
+    }
+
+    vk_context compute_ctx = ctx->compute_ctx.lock();
+    uint64_t transfer_wait_value = 0;
+    std::set<vk_command_buffer *> buffers;
+    for (const auto& sequence : compute_ctx->seqs) {
+        for (const auto& submission : sequence) {
+            if (submission.buffer != nullptr) {
+                buffers.insert(submission.buffer);
+            }
+            for (const auto& wait : submission.wait_semaphores) {
+                if (wait.s == ctx->transfer_semaphore.s) {
+                    transfer_wait_value = std::max(transfer_wait_value, wait.value);
+                }
+            }
+        }
+    }
+
+    compute_ctx->s = nullptr;
+    for (vk_command_buffer * buffer : buffers) {
+        buffer->buf.reset();
+        buffer->in_use = false;
+    }
+    compute_ctx->seqs.clear();
+    compute_ctx->in_memcpys.clear();
+    compute_ctx->out_memcpys.clear();
+    compute_ctx->memsets.clear();
+    ctx->compute_ctx.reset();
+
+    if (transfer_wait_value > 0) {
+        ctx->transfer_semaphore_last_submitted = transfer_wait_value - 1;
+        ctx->submit_pending = true;
+    }
 }
 
 static size_t ggml_vk_align_size(size_t width, size_t align) {
@@ -14713,7 +14819,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
-        ggml_vk_submit(subctx, {});
+        ggml_vk_submit_compute(ctx, subctx, {});
         ctx->submit_pending = true;
         ggml_vk_synchronize(ctx);
         GGML_ASSERT(ctx->compute_ctx.expired());
@@ -15306,10 +15412,10 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
 
         if (almost_ready && !ctx->almost_ready_fence_pending) {
-            ggml_vk_submit(subctx, ctx->almost_ready_fence);
+            ggml_vk_submit_compute(ctx, subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
         } else {
-            ggml_vk_submit(subctx, {});
+            ggml_vk_submit_compute(ctx, subctx, {});
         }
         ctx->submit_pending = true;
 
@@ -15400,6 +15506,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    ctx->device->device.destroySemaphore(ctx->compute_completion.s);
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -15918,8 +16025,59 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
-        ggml_vk_submit(compute_ctx, {});
+        ggml_vk_submit_compute(ctx, compute_ctx, {});
         ctx->submit_pending = true;
+    }
+
+    // Armed submissions carry a per-context timeline completion point. Waiting
+    // for that value drains this context without waiting for later work from a
+    // different backend that happens to share the same VkQueue.
+    if (ctx->submit_pending && ctx->abort.callback != nullptr) {
+        enum ggml_status wait_status = GGML_STATUS_SUCCESS;
+        if (ctx->compute_completion.value > 0) {
+            wait_status = ggml_vk_wait_for_compute_completion(ctx, ctx->compute_completion.value);
+        }
+        if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+            vk::Semaphore sem = ctx->transfer_semaphore.s;
+            uint64_t val = ctx->transfer_semaphore.value;
+            vk::SemaphoreWaitInfo wait_info{ vk::SemaphoreWaitFlags{}, sem, val };
+            vk::Result wait_result = ctx->device->device.waitSemaphores(wait_info, UINT64_MAX);
+            if (wait_result != vk::Result::eSuccess) {
+                const enum ggml_status status = ggml_vk_status(wait_result);
+                if (status == GGML_STATUS_DEVICE_LOST) {
+                    ctx->poisoned = true;
+                    ctx->device->poisoned.store(true);
+                }
+                wait_status = ggml_backend_status_merge(wait_status, status);
+            }
+            ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+        }
+        if (ctx->almost_ready_fence_pending) {
+            vk::Result almost_ready_status = ctx->device->device.waitForFences(
+                { ctx->almost_ready_fence }, true, UINT64_MAX);
+            if (almost_ready_status == vk::Result::eSuccess) {
+                ctx->device->device.resetFences({ ctx->almost_ready_fence });
+            } else {
+                const enum ggml_status status = ggml_vk_status(almost_ready_status);
+                if (status == GGML_STATUS_DEVICE_LOST) {
+                    ctx->poisoned = true;
+                    ctx->device->poisoned.store(true);
+                }
+                wait_status = ggml_backend_status_merge(wait_status, status);
+            }
+            ctx->almost_ready_fence_pending = false;
+        }
+        ctx->submit_pending = false;
+        if (cmd_buf) {
+            cmd_buf->in_use = false;
+            cmd_buf->buf.reset();
+        }
+        if (wait_status != GGML_STATUS_SUCCESS) {
+            if (do_transfer) {
+                ctx->compute_ctx.reset();
+            }
+            return wait_status;
+        }
     }
 
     if (ctx->submit_pending) {
@@ -16891,7 +17049,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->last_total_flops = total_flops;
     }
 
-    if (vk_perf_logger_enabled) {
+    if (aborted) {
+        ggml_vk_discard_compute_ctx(ctx);
+    }
+
+    if (vk_perf_logger_enabled && !aborted) {
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
@@ -17240,7 +17402,7 @@ static void ggml_backend_vk_event_record_impl(ggml_backend_t backend, ggml_backe
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
-    ggml_vk_submit(compute_ctx, {});
+    ggml_vk_submit_compute(ctx, compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
     vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
@@ -18662,6 +18824,64 @@ static uint32_t ggml_backend_vk_device_pci_vendor_id(ggml_backend_dev_t dev) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
     return ggml_vk_get_device(ctx->device)->vendor_id;
 }
+#ifdef GGML_VULKAN_TESTS
+struct ggml_vk_test_gate {
+    vk_device device;
+    vk::Semaphore semaphore;
+};
+
+static void * ggml_backend_vk_test_gate_create(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    vk::SemaphoreTypeCreateInfo type_info{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo create_info{};
+    create_info.setPNext(&type_info);
+    return new ggml_vk_test_gate{
+        ctx->device,
+        ctx->device->device.createSemaphore(create_info),
+    };
+}
+
+static bool ggml_backend_vk_test_gate_enqueue_wait(ggml_backend_t backend, void * opaque_gate) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_vk_test_gate * gate = (ggml_vk_test_gate *) opaque_gate;
+    GGML_ASSERT(gate->device == ctx->device);
+
+    const uint64_t wait_value = 1;
+    vk::TimelineSemaphoreSubmitInfo timeline_info{ 1, &wait_value, 0, nullptr };
+    vk::PipelineStageFlags stage = ctx->device->compute_queue.stage_flags;
+    vk::SubmitInfo submit_info{
+        1, &gate->semaphore, &stage,
+        0, nullptr,
+        0, nullptr,
+    };
+    submit_info.setPNext(&timeline_info);
+    std::lock_guard<std::mutex> guard(queue_mutex);
+    ctx->device->compute_queue.queue.submit({ submit_info }, {});
+    ctx->submit_pending = true;
+    return true;
+}
+
+static void ggml_backend_vk_test_gate_signal(ggml_backend_t backend, void * opaque_gate) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_vk_test_gate * gate = (ggml_vk_test_gate *) opaque_gate;
+    GGML_ASSERT(gate->device == ctx->device);
+    vk::SemaphoreSignalInfo signal_info{ gate->semaphore, 1 };
+    ctx->device->device.signalSemaphore(signal_info);
+}
+
+static void ggml_backend_vk_test_gate_free(ggml_backend_t backend, void * opaque_gate) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_vk_test_gate * gate = (ggml_vk_test_gate *) opaque_gate;
+    GGML_ASSERT(gate->device == ctx->device);
+    ctx->device->device.destroySemaphore(gate->semaphore);
+    delete gate;
+}
+
+static bool ggml_backend_vk_test_has_pending_submission(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->submit_pending;
+}
+#endif
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -18674,6 +18894,23 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_vk_set_abort_callback;
     }
+#ifdef GGML_VULKAN_TESTS
+    if (strcmp(name, "ggml_backend_vk_test_gate_create") == 0) {
+        return (void *)ggml_backend_vk_test_gate_create;
+    }
+    if (strcmp(name, "ggml_backend_vk_test_gate_enqueue_wait") == 0) {
+        return (void *)ggml_backend_vk_test_gate_enqueue_wait;
+    }
+    if (strcmp(name, "ggml_backend_vk_test_gate_signal") == 0) {
+        return (void *)ggml_backend_vk_test_gate_signal;
+    }
+    if (strcmp(name, "ggml_backend_vk_test_gate_free") == 0) {
+        return (void *)ggml_backend_vk_test_gate_free;
+    }
+    if (strcmp(name, "ggml_backend_vk_test_has_pending_submission") == 0) {
+        return (void *)ggml_backend_vk_test_has_pending_submission;
+    }
+#endif
     return NULL;
 }
 

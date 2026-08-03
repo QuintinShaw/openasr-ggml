@@ -177,6 +177,11 @@ if (GGML_VULKAN)
     add_test(
         NAME test-backend-vulkan-instance-retry
         COMMAND $<TARGET_FILE:${TEST_TARGET}> --retry-after-failure)
+
+    set(TEST_TARGET test-backend-vulkan-cancel-isolation)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
 # shared backend graph cancellation contract
