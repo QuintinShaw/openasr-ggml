@@ -20,12 +20,120 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <new>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+static uint64_t ggml_backend_memory_hash_u64_v1(uint64_t hash, uint64_t value) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+        hash ^= (uint8_t) (value >> (byte * 8));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t ggml_backend_memory_request_fingerprint_v1(
+        const ggml_backend_memory_request_v1 * requests,
+        uint32_t request_count) {
+    if (request_count > 0 && requests == NULL) {
+        return 0;
+    }
+
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = ggml_backend_memory_hash_u64_v1(hash, GGML_BACKEND_MEMORY_ABI_V1);
+    hash = ggml_backend_memory_hash_u64_v1(hash, request_count);
+    for (uint32_t index = 0; index < request_count; ++index) {
+        const ggml_backend_memory_request_v1 & request = requests[index];
+        const uint64_t values[] = {
+            index,
+            request.kind,
+            request.flags,
+            request.usage,
+            request.request_id,
+            (uint64_t) (uintptr_t) request.backend,
+            (uint64_t) (uintptr_t) request.peer_backend,
+            (uint64_t) (uintptr_t) request.buft,
+            (uint64_t) (uintptr_t) request.graph,
+            (uint64_t) (uintptr_t) request.host_ptr,
+            request.requested_bytes,
+            request.currently_allocated_bytes,
+            request.max_tensor_bytes,
+        };
+        for (uint64_t value : values) {
+            hash = ggml_backend_memory_hash_u64_v1(hash, value);
+        }
+    }
+    return hash;
+}
+
+static int ggml_backend_memory_hex_nibble_v1(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static bool ggml_backend_memory_parse_hex_byte_v1(
+        const char * text,
+        size_t digits,
+        uint32_t * value) {
+    uint32_t parsed = 0;
+    for (size_t index = 0; index < digits; ++index) {
+        const int nibble = ggml_backend_memory_hex_nibble_v1(text[index]);
+        if (nibble < 0) {
+            return false;
+        }
+        parsed = (parsed << 4) | (uint32_t) nibble;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool ggml_backend_memory_encode_pci_bdf_v1(
+        const char * pci_bus_id,
+        uint8_t physical_device_uuid[16]) {
+    if (physical_device_uuid == NULL) {
+        return false;
+    }
+    memset(physical_device_uuid, 0, 16);
+    if (pci_bus_id == NULL || strlen(pci_bus_id) != 12 ||
+            pci_bus_id[4] != ':' || pci_bus_id[7] != ':' || pci_bus_id[10] != '.') {
+        return false;
+    }
+
+    uint32_t domain = 0;
+    uint32_t bus = 0;
+    uint32_t device = 0;
+    uint32_t function = 0;
+    if (!ggml_backend_memory_parse_hex_byte_v1(pci_bus_id, 4, &domain) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 5, 2, &bus) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 8, 2, &device) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 11, 1, &function) ||
+            device > 0x1f || function > 0x07) {
+        return false;
+    }
+
+    physical_device_uuid[0] = 'P';
+    physical_device_uuid[1] = 'C';
+    physical_device_uuid[2] = 'I';
+    physical_device_uuid[3] = 1;
+    physical_device_uuid[4] = (uint8_t) (domain >> 8);
+    physical_device_uuid[5] = (uint8_t) domain;
+    physical_device_uuid[6] = (uint8_t) bus;
+    physical_device_uuid[7] = (uint8_t) device;
+    physical_device_uuid[8] = (uint8_t) function;
+    return true;
+}
 
 
 // backend buffer type
@@ -791,9 +899,21 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_memory_plan {
+    ggml_backend_sched_t sched;
+    struct ggml_cgraph * source_graph;
+    std::vector<ggml_backend_memory_request_v1> items;
+    uint64_t fingerprint;
+    uint64_t source_graph_fingerprint;
+    int previous_cur_copy;
+    bool committed;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool memory_plan_active;
+    ggml_backend_sched_memory_plan * active_memory_plan;
 
     int n_backends;
 
@@ -1916,6 +2036,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->active_memory_plan != NULL) {
+        // The plan may outlive an accidentally-early scheduler free. Detach it
+        // so later commit/free is a clean failure rather than a use-after-free.
+        sched->active_memory_plan->sched = NULL;
+        sched->active_memory_plan = NULL;
+        sched->memory_plan_active = false;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -1939,6 +2066,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        GGML_LOG_ERROR("%s: scheduler is owned by an uncommitted memory plan\n", __func__);
+        return;
+    }
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1980,8 +2111,209 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
+static uint64_t ggml_backend_sched_memory_hash_u64(uint64_t hash, uint64_t value) {
+    // FNV-1a is not a security boundary; it is a stable audit guard against a
+    // quote being committed for a different scheduler plan.
+    for (unsigned i = 0; i < 8; ++i) {
+        hash ^= (uint8_t) (value >> (i * 8));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t ggml_backend_sched_memory_graph_fingerprint(const struct ggml_cgraph * graph) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) graph->n_nodes);
+    hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) graph->n_leafs);
+    const auto hash_tensor = [&hash](const struct ggml_tensor * tensor) {
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->type);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->op);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->data);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->view_src);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->view_offs);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->ne[d]);
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->nb[d]);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->src[s]);
+        }
+    };
+    for (int i = 0; i < graph->n_leafs; ++i) hash_tensor(graph->leafs[i]);
+    for (int i = 0; i < graph->n_nodes; ++i) hash_tensor(graph->nodes[i]);
+    return hash;
+}
+
+enum ggml_status ggml_backend_sched_memory_plan_create_v1(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_backend_sched_memory_plan_t * out_plan) {
+    if (sched == NULL || graph == NULL || out_plan == NULL || sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
+    *out_plan = NULL;
+    if ((int) sched->hash_set.size < graph->n_nodes + graph->n_leafs) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_sched_reset(sched);
+    const enum ggml_status synchronized = ggml_backend_sched_synchronize(sched);
+    if (synchronized != GGML_STATUS_SUCCESS) {
+        return synchronized;
+    }
+
+    ggml_backend_sched_memory_plan * plan = new (std::nothrow) ggml_backend_sched_memory_plan();
+    if (plan == NULL) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    plan->sched = sched;
+    plan->source_graph = graph;
+    plan->source_graph_fingerprint = ggml_backend_sched_memory_graph_fingerprint(graph);
+    plan->previous_cur_copy = sched->cur_copy;
+    plan->committed = false;
+    sched->cur_copy = sched->next_copy;
+
+    ggml_backend_sched_split_graph(sched, graph);
+    if (!ggml_gallocr_measure_n_v1(
+                sched->galloc, &sched->graph,
+                sched->node_backend_ids, sched->leaf_backend_ids)) {
+        sched->cur_copy = plan->previous_cur_copy;
+        ggml_backend_sched_reset(sched);
+        delete plan;
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    try {
+        uint64_t request_id = 1;
+        const uint32_t n_chunks = ggml_gallocr_measure_get_chunk_count_v1(sched->galloc);
+        plan->items.reserve((size_t) n_chunks + (size_t) sched->n_splits * 2);
+        for (uint32_t i = 0; i < n_chunks; ++i) {
+            ggml_backend_buffer_type_t buft = NULL;
+            uint64_t requested = 0;
+            uint64_t current = 0;
+            if (!ggml_gallocr_measure_get_chunk_v1(sched->galloc, i, &buft, &requested, &current)) {
+                sched->cur_copy = plan->previous_cur_copy;
+                ggml_backend_sched_reset(sched);
+                delete plan;
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_t backend = NULL;
+            for (int b = 0; b < sched->n_backends; ++b) {
+                if (sched->bufts[b] == buft) {
+                    backend = sched->backends[b];
+                    break;
+                }
+            }
+            if (backend == NULL) {
+                sched->cur_copy = plan->previous_cur_copy;
+                ggml_backend_sched_reset(sched);
+                delete plan;
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_memory_request_v1 item = {};
+            item.struct_size = sizeof(item);
+            item.kind = GGML_BACKEND_MEMORY_REQUEST_BUFFER;
+            item.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+            item.request_id = request_id++;
+            item.backend = backend;
+            item.buft = buft;
+            item.requested_bytes = requested;
+            item.currently_allocated_bytes = current;
+            plan->items.push_back(item);
+        }
+
+        for (int i = 0; i < sched->n_splits; ++i) {
+            ggml_backend_sched_split * split = &sched->splits[i];
+            ggml_backend_memory_request_v1 graph_item = {};
+            graph_item.struct_size = sizeof(graph_item);
+            graph_item.kind = GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE;
+            graph_item.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+            graph_item.request_id = request_id++;
+            graph_item.backend = sched->backends[split->backend_id];
+            graph_item.graph = &split->graph;
+            plan->items.push_back(graph_item);
+
+            for (int j = 0; j < split->n_inputs; ++j) {
+                ggml_backend_memory_request_v1 transfer = {};
+                transfer.struct_size = sizeof(transfer);
+                transfer.kind = GGML_BACKEND_MEMORY_REQUEST_TRANSFER;
+                transfer.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+                transfer.request_id = request_id++;
+                transfer.backend = graph_item.backend;
+                transfer.peer_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
+                transfer.requested_bytes = ggml_nbytes(split->inputs[j]);
+                plan->items.push_back(transfer);
+            }
+        }
+
+        plan->fingerprint = ggml_backend_memory_request_fingerprint_v1(
+            plan->items.data(), (uint32_t) plan->items.size());
+    } catch (const std::bad_alloc &) {
+        sched->cur_copy = plan->previous_cur_copy;
+        ggml_backend_sched_reset(sched);
+        delete plan;
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    sched->memory_plan_active = true;
+    sched->active_memory_plan = plan;
+    *out_plan = plan;
+    return GGML_STATUS_SUCCESS;
+}
+
+uint32_t ggml_backend_sched_memory_plan_get_item_count_v1(ggml_backend_sched_memory_plan_t plan) {
+    return plan == NULL ? 0 : (uint32_t) plan->items.size();
+}
+
+bool ggml_backend_sched_memory_plan_get_item_v1(
+        ggml_backend_sched_memory_plan_t plan, uint32_t index,
+        struct ggml_backend_memory_request_v1 * out_item) {
+    if (plan == NULL || out_item == NULL || out_item->struct_size < sizeof(*out_item) || index >= plan->items.size()) {
+        return false;
+    }
+    *out_item = plan->items[index];
+    return true;
+}
+
+enum ggml_status ggml_backend_sched_memory_plan_commit_v1(ggml_backend_sched_memory_plan_t plan) {
+    if (plan == NULL || plan->committed || plan->sched == NULL || !plan->sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
+    if (ggml_backend_sched_memory_graph_fingerprint(plan->source_graph) != plan->source_graph_fingerprint) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_sched_t sched = plan->sched;
+    if (!ggml_gallocr_measure_commit_v1(sched->galloc)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    sched->is_alloc = true;
+    sched->next_copy = (sched->cur_copy + 1) % sched->n_copies;
+    sched->memory_plan_active = false;
+    sched->active_memory_plan = NULL;
+    plan->committed = true;
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_sched_memory_plan_free_v1(ggml_backend_sched_memory_plan_t plan) {
+    if (plan == NULL) {
+        return;
+    }
+    if (!plan->committed && plan->sched != NULL) {
+        plan->sched->cur_copy = plan->previous_cur_copy;
+        plan->sched->memory_plan_active = false;
+        plan->sched->active_memory_plan = NULL;
+        ggml_backend_sched_reset(plan->sched);
+    }
+    delete plan;
+}
+
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
@@ -2006,6 +2338,9 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

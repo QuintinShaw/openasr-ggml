@@ -169,9 +169,15 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
 static enum ggml_status ggml_vk_status(vk::Result result) {
-    return result == vk::Result::eErrorDeviceLost
-        ? GGML_STATUS_DEVICE_LOST
-        : GGML_STATUS_EXECUTION_FAILED;
+    switch (result) {
+        case vk::Result::eErrorOutOfDeviceMemory:
+        case vk::Result::eErrorOutOfHostMemory:
+            return GGML_STATUS_ALLOC_FAILED;
+        case vk::Result::eErrorDeviceLost:
+            return GGML_STATUS_DEVICE_LOST;
+        default:
+            return GGML_STATUS_EXECUTION_FAILED;
+    }
 }
 
 #define VK_CHECK(err, msg)                                          \
@@ -15949,12 +15955,12 @@ static enum ggml_status ggml_backend_vk_synchronize(ggml_backend_t backend) {
         ggml_vk_graph_cleanup(ctx);
         return GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
-        if (error.code() == vk::Result::eErrorDeviceLost) {
+        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
+        if (status == GGML_STATUS_DEVICE_LOST) {
             ctx->poisoned = true;
             ctx->device->poisoned.store(true);
-            return GGML_STATUS_DEVICE_LOST;
         }
-        return GGML_STATUS_EXECUTION_FAILED;
+        return status;
     }
 }
 
@@ -17242,12 +17248,12 @@ static enum ggml_status ggml_backend_vk_event_record_status(ggml_backend_t backe
             ctx->compute_ctx.reset();
         }
         ctx->submit_pending = false;
-        if (error.code() == vk::Result::eErrorDeviceLost) {
+        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
+        if (status == GGML_STATUS_DEVICE_LOST) {
             ctx->poisoned = true;
             ctx->device->poisoned.store(true);
-            return GGML_STATUS_DEVICE_LOST;
         }
-        return GGML_STATUS_EXECUTION_FAILED;
+        return status;
     }
 }
 
@@ -17260,12 +17266,12 @@ static enum ggml_status ggml_backend_vk_event_wait_status(ggml_backend_t backend
         ggml_backend_vk_event_wait_impl(backend, event);
         return GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
-        if (error.code() == vk::Result::eErrorDeviceLost) {
+        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
+        if (status == GGML_STATUS_DEVICE_LOST) {
             ctx->poisoned = true;
             ctx->device->poisoned.store(true);
-            return GGML_STATUS_DEVICE_LOST;
         }
-        return GGML_STATUS_EXECUTION_FAILED;
+        return status;
     }
 }
 
@@ -18162,11 +18168,11 @@ static enum ggml_status ggml_backend_vk_device_event_synchronize(ggml_backend_de
         }
         return GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
-        if (error.code() == vk::Result::eErrorDeviceLost) {
+        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
+        if (status == GGML_STATUS_DEVICE_LOST) {
             device->poisoned.store(true);
-            return GGML_STATUS_DEVICE_LOST;
         }
-        return GGML_STATUS_EXECUTION_FAILED;
+        return status;
     }
 }
 
@@ -18277,11 +18283,353 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static ggml_backend_memory_domain_id_v1 ggml_backend_vk_memory_domain(
+        const vk_device & device, uint32_t heap_index, uint32_t kind) {
+    ggml_backend_memory_domain_id_v1 id = {};
+    const std::string pci_bus_id = ggml_backend_vk_get_device_pci_id((int) device->idx);
+    (void) ggml_backend_memory_encode_pci_bdf_v1(
+        pci_bus_id.empty() ? NULL : pci_bus_id.c_str(), id.physical_device_uuid);
+    id.heap_index = heap_index;
+    id.kind = kind;
+    return id;
+}
+
+static bool ggml_backend_vk_memory_type_for_buffer(
+        const vk_device & device, const vk::MemoryRequirements & requirements,
+        uint32_t * memory_type_index, uint32_t * heap_index, uint32_t * kind) {
+    const vk::PhysicalDeviceMemoryProperties props = device->physical_device.getMemoryProperties();
+    std::vector<vk::MemoryPropertyFlags> preferences;
+    const auto host = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    const auto local = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    if (device->prefer_host_memory) {
+        preferences = { host, local };
+    } else if (device->uma) {
+        preferences = { local | host, local, host };
+    } else if (device->disable_host_visible_vidmem) {
+        preferences = device->allow_sysmem_fallback ? std::vector<vk::MemoryPropertyFlags>{ local, host }
+                                                     : std::vector<vk::MemoryPropertyFlags>{ local };
+    } else {
+        preferences = device->allow_sysmem_fallback ? std::vector<vk::MemoryPropertyFlags>{ local | host, local, host }
+                                                     : std::vector<vk::MemoryPropertyFlags>{ local | host, local };
+    }
+    for (vk::MemoryPropertyFlags wanted : preferences) {
+        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            if ((requirements.memoryTypeBits & (1u << i)) == 0 ||
+                    (props.memoryTypes[i].propertyFlags & wanted) != wanted) continue;
+            *memory_type_index = i;
+            *heap_index = props.memoryTypes[i].heapIndex;
+            *kind = (props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)
+                ? (device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED : GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL)
+                : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED;
+            return true;
+        }
+    }
+    return false;
+}
+
+static enum ggml_status ggml_backend_vk_memory_buffer_commitment(
+        const vk_device & device, uint64_t requested_bytes,
+        uint64_t * committed_bytes, uint32_t * heap_index, uint32_t * kind) {
+    if (committed_bytes == NULL || heap_index == NULL || kind == NULL) return GGML_STATUS_FAILED;
+    if (requested_bytes == 0) {
+        *committed_bytes = 0;
+        *heap_index = 0;
+        *kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED : GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL;
+        return GGML_STATUS_SUCCESS;
+    }
+    vk::Buffer buffer;
+    try {
+        const vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer |
+            vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+            (device->buffer_device_address ? vk::BufferUsageFlagBits::eShaderDeviceAddress : vk::BufferUsageFlags{});
+        buffer = device->device.createBuffer(vk::BufferCreateInfo({}, requested_bytes, usage, vk::SharingMode::eExclusive));
+        const vk::MemoryRequirements memory = device->device.getBufferMemoryRequirements(buffer);
+        uint32_t memory_type = 0;
+        if (!ggml_backend_vk_memory_type_for_buffer(device, memory, &memory_type, heap_index, kind)) {
+            device->device.destroyBuffer(buffer);
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        *committed_bytes = memory.size;
+        device->device.destroyBuffer(buffer);
+        return GGML_STATUS_SUCCESS;
+    } catch (const vk::SystemError & error) {
+        if (buffer) device->device.destroyBuffer(buffer);
+        return ggml_vk_status((vk::Result) error.code().value());
+    }
+}
+
+static enum ggml_status ggml_backend_vk_memory_get_domains(
+        ggml_backend_dev_t dev, ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count) {
+    if (dev == NULL || inout_count == NULL) return GGML_STATUS_FAILED;
+    ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *) dev->context;
+    vk_device device = ggml_vk_get_device(dev_ctx->device);
+    const vk::PhysicalDeviceMemoryProperties props = device->physical_device.getMemoryProperties();
+    const uint32_t required = props.memoryHeapCount;
+    const uint32_t capacity = *inout_count;
+    *inout_count = required;
+    if (domains == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < required) return GGML_STATUS_FAILED;
+    for (uint32_t i = 0; i < required; ++i) {
+        if (domains[i].struct_size < sizeof(domains[i])) return GGML_STATUS_FAILED;
+        ggml_backend_memory_domain_v1 domain = {};
+        domain.struct_size = sizeof(domain);
+        const uint32_t kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED
+            : ((props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+                ? GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED);
+        domain.id = ggml_backend_vk_memory_domain(device, i, kind);
+        snprintf(domain.name, sizeof(domain.name), "vulkan/heap-%u", i);
+        domains[i] = domain;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static bool ggml_backend_vk_memory_generation(const vk_device & device, uint64_t * generation) {
+    if (generation == NULL || device->idx >= vk_instance.device_supports_membudget.size() ||
+            !vk_instance.device_supports_membudget[device->idx]) return false;
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgets;
+    vk::PhysicalDeviceMemoryProperties2 props;
+    props.pNext = &budgets;
+    device->physical_device.getMemoryProperties2(&props);
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        const uint64_t values[] = { budgets.heapBudget[i], budgets.heapUsage[i] };
+        for (uint64_t value : values) for (unsigned b = 0; b < 8; ++b) {
+            hash ^= (uint8_t) (value >> (8 * b));
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    *generation = hash;
+    return true;
+}
+
+static enum ggml_status ggml_backend_vk_memory_quote(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * claims,
+        uint32_t * inout_claim_count) {
+    if ((request_count && requests == NULL) || quote == NULL || quote->struct_size < sizeof(*quote) || inout_claim_count == NULL) return GGML_STATUS_FAILED;
+    uint32_t required = 0;
+    uint32_t residual_count = 0;
+    vk_device quote_device;
+    ggml_backend_t primary_backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i])) return GGML_STATUS_FAILED;
+        if (requests[i].backend != NULL && !ggml_backend_is_vk(requests[i].backend)) return GGML_STATUS_FAILED;
+        if (requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_BUFFER && requests[i].backend == NULL) return GGML_STATUS_FAILED;
+        if (primary_backend != NULL && requests[i].backend != NULL && requests[i].backend != primary_backend) return GGML_STATUS_FAILED;
+        primary_backend = primary_backend ? primary_backend : requests[i].backend;
+        if (!quote_device) {
+            if (requests[i].buft != NULL && requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER) {
+                if (requests[i].buft->iface.get_name != ggml_backend_vk_buffer_type_name) return GGML_STATUS_FAILED;
+                quote_device = ((ggml_backend_vk_buffer_type_context *) requests[i].buft->context)->device;
+            } else if (requests[i].backend != NULL) {
+                quote_device = ((ggml_backend_vk_context *) requests[i].backend->context)->device;
+            }
+        }
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER ||
+                requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT ||
+                requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER) ++required;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE) ++residual_count;
+    }
+    uint64_t generation = 0;
+    if (!quote_device) return GGML_STATUS_FAILED;
+    const bool has_live_generation = ggml_backend_vk_memory_generation(quote_device, &generation);
+    quote->flags = residual_count || !has_live_generation
+        ? GGML_BACKEND_MEMORY_QUOTE_PROVISIONAL | GGML_BACKEND_MEMORY_QUOTE_HAS_RESIDUAL_UNCERTAINTY
+        : 0;
+    quote->residual_flags = (residual_count ? GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE : 0) |
+        (!has_live_generation ? GGML_BACKEND_MEMORY_RESIDUAL_DRIVER_ACCOUNTING : 0);
+    quote->residual_request_count = residual_count;
+    quote->provisional_requested_upper_bytes = 0;
+    quote->stats_generation = generation;
+    quote->request_fingerprint = ggml_backend_memory_request_fingerprint_v1(requests, request_count);
+    quote->quote_token = quote->request_fingerprint ^ generation;
+    const uint32_t capacity = *inout_claim_count;
+    *inout_claim_count = required;
+    if (claims == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < required) return GGML_STATUS_FAILED;
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_BUFFER &&
+                requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT &&
+                requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_TRANSFER) continue;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER &&
+                (requests[i].buft == NULL || requests[i].buft->iface.get_name != ggml_backend_vk_buffer_type_name)) {
+            return GGML_STATUS_FAILED;
+        }
+        ggml_backend_vk_buffer_type_context * buft_ctx = requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER
+            ? (ggml_backend_vk_buffer_type_context *) requests[i].buft->context : NULL;
+        vk_device device = buft_ctx ? buft_ctx->device
+            : ((ggml_backend_vk_context *) requests[i].backend->context)->device;
+        uint64_t committed = requests[i].requested_bytes;
+        uint32_t heap_index = 0;
+        uint32_t kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED : GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL;
+        uint64_t before = requests[i].currently_allocated_bytes;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER) {
+            const enum ggml_status requested_status = ggml_backend_vk_memory_buffer_commitment(
+                device, requests[i].requested_bytes, &committed, &heap_index, &kind);
+            if (requested_status != GGML_STATUS_SUCCESS) return requested_status;
+            uint32_t before_heap = heap_index;
+            uint32_t before_kind = kind;
+            const enum ggml_status before_status = ggml_backend_vk_memory_buffer_commitment(
+                device, requests[i].currently_allocated_bytes, &before, &before_heap, &before_kind);
+            if (before_status != GGML_STATUS_SUCCESS) return before_status;
+            if (before > 0 && (before_heap != heap_index || before_kind != kind)) return GGML_STATUS_FAILED;
+        } else {
+            kind = requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT
+                ? GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED;
+        }
+        const bool reuse = requests[i].currently_allocated_bytes >= requests[i].requested_bytes;
+        const uint64_t after = reuse ? before : committed;
+        ggml_backend_memory_claim_v1 claim = {};
+        claim.struct_size = sizeof(claim);
+        claim.flags = requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER
+            ? GGML_BACKEND_MEMORY_CLAIM_EXACT : GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER) claim.flags |= GGML_BACKEND_MEMORY_CLAIM_TRANSIENT;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT) claim.flags |= GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED;
+        claim.request_id = requests[i].request_id;
+        claim.domain = ggml_backend_vk_memory_domain(device, heap_index, kind);
+        claim.payload_requested_bytes = requests[i].requested_bytes;
+        claim.committed_before_bytes = before;
+        claim.committed_after_upper_bytes = after;
+        claim.commit_peak_extra_upper_bytes = reuse ? 0 : committed;
+        claim.resident_after_upper_bytes = after;
+        claim.retained_after_use_upper_bytes = requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER ? 0 : after;
+        claims[out++] = claim;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_vk_memory_reserve_private(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        const ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * actual,
+        uint32_t * inout_actual_count) {
+    GGML_UNUSED(actual);
+    if (quote == NULL || inout_actual_count == NULL ||
+            quote->request_fingerprint != ggml_backend_memory_request_fingerprint_v1(requests, request_count)) return GGML_STATUS_FAILED;
+    *inout_actual_count = 0;
+    vk_device reserve_device;
+    ggml_backend_t primary_backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i]) ||
+                (requests[i].backend != NULL && !ggml_backend_is_vk(requests[i].backend))) return GGML_STATUS_FAILED;
+        if (primary_backend != NULL && requests[i].backend != NULL && requests[i].backend != primary_backend) return GGML_STATUS_FAILED;
+        primary_backend = primary_backend ? primary_backend : requests[i].backend;
+        if (requests[i].backend != NULL) {
+            ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) requests[i].backend->context;
+            reserve_device = reserve_device ? reserve_device : ctx->device;
+            if (ctx->poisoned || ctx->device->poisoned.load()) return GGML_STATUS_BACKEND_POISONED;
+        } else if (!reserve_device && requests[i].buft != NULL && requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER) {
+            if (requests[i].buft->iface.get_name != ggml_backend_vk_buffer_type_name) return GGML_STATUS_FAILED;
+            reserve_device = ((ggml_backend_vk_buffer_type_context *) requests[i].buft->context)->device;
+        }
+    }
+    uint64_t generation = 0;
+    if (!reserve_device) return GGML_STATUS_FAILED;
+    const bool has_live_generation = ggml_backend_vk_memory_generation(reserve_device, &generation);
+    if (has_live_generation != ((quote->residual_flags & GGML_BACKEND_MEMORY_RESIDUAL_DRIVER_ACCOUNTING) == 0) ||
+            generation != quote->stats_generation || quote->quote_token != (quote->request_fingerprint ^ generation)) {
+        return GGML_STATUS_FAILED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_vk_memory_get_stats(
+        ggml_backend_dev_t dev, ggml_backend_t backend,
+        ggml_backend_memory_stats_v1 * stats, uint32_t * inout_count) {
+    if (dev == NULL || inout_count == NULL) return GGML_STATUS_FAILED;
+    ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *) dev->context;
+    vk_device device = ggml_vk_get_device(dev_ctx->device);
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgets;
+    vk::PhysicalDeviceMemoryProperties2 props;
+    const bool has_budget = vk_instance.device_supports_membudget[dev_ctx->device];
+    if (has_budget) props.pNext = &budgets;
+    device->physical_device.getMemoryProperties2(&props);
+    uint64_t stats_generation = 0;
+    if (has_budget && !ggml_backend_vk_memory_generation(device, &stats_generation)) return GGML_STATUS_EXECUTION_FAILED;
+    const uint32_t required = props.memoryProperties.memoryHeapCount;
+    const uint32_t capacity = *inout_count;
+    *inout_count = required;
+    if (stats == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < required) return GGML_STATUS_FAILED;
+    for (uint32_t i = 0; i < required; ++i) {
+        if (stats[i].struct_size < sizeof(stats[i])) return GGML_STATUS_FAILED;
+        ggml_backend_memory_stats_v1 value = {};
+        value.struct_size = sizeof(value);
+        const uint32_t kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED
+            : ((props.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+                ? GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED);
+        value.domain = ggml_backend_vk_memory_domain(device, i, kind);
+        value.total_bytes = props.memoryProperties.memoryHeaps[i].size;
+        value.budget_bytes = has_budget ? budgets.heapBudget[i] : value.total_bytes;
+        value.device_used_bytes = has_budget ? budgets.heapUsage[i] : 0;
+        value.device_free_bytes = value.budget_bytes > value.device_used_bytes ? value.budget_bytes - value.device_used_bytes : 0;
+        value.generation = stats_generation;
+        if (!has_budget) value.flags |= GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE;
+        value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
+        value.health = device->poisoned.load() ? GGML_BACKEND_MEMORY_DEVICE_LOST : GGML_BACKEND_MEMORY_HEALTHY;
+        if (backend != NULL && ((ggml_backend_vk_context *) backend->context)->poisoned) value.health = GGML_BACKEND_MEMORY_QUARANTINED;
+        stats[i] = value;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_vk_memory_trim(ggml_backend_t backend, uint64_t flags) {
+    GGML_UNUSED(flags);
+    if (backend == NULL) return GGML_STATUS_FAILED;
+    const enum ggml_status status = ggml_backend_vk_synchronize(backend);
+    if (status != GGML_STATUS_SUCCESS) return status;
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_vk_destroy_buffer(ctx->prealloc_x);
+    ggml_vk_destroy_buffer(ctx->prealloc_y);
+    ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+    ggml_vk_destroy_buffer(ctx->sync_staging);
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_vk_memory_quarantine(
+        ggml_backend_t backend, const ggml_backend_memory_quarantine_v1 * request) {
+    if (backend == NULL || request == NULL || request->struct_size < sizeof(*request)) return GGML_STATUS_FAILED;
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ctx->poisoned = true;
+    ctx->device->poisoned.store(true);
+    return GGML_STATUS_SUCCESS;
+}
+
+static const ggml_backend_memory_api_v1 * ggml_backend_vk_memory_get_api_v1(void) {
+    static const ggml_backend_memory_api_v1 api = {
+        sizeof(ggml_backend_memory_api_v1), GGML_BACKEND_MEMORY_ABI_V1, 0,
+        ggml_backend_vk_memory_get_domains, ggml_backend_vk_memory_quote,
+        ggml_backend_vk_memory_reserve_private, ggml_backend_vk_memory_get_stats,
+        ggml_backend_vk_memory_trim, ggml_backend_vk_memory_quarantine,
+    };
+    return &api;
+}
+
+static uint32_t ggml_backend_vk_device_pci_vendor_id(ggml_backend_dev_t dev) {
+    if (dev == NULL || dev->context == NULL) {
+        return 0;
+    }
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    return ggml_vk_get_device(ctx->device)->vendor_id;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, GGML_BACKEND_MEMORY_API_V1_PROC) == 0) {
+        return (void *) ggml_backend_vk_memory_get_api_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_DEVICE_PCI_VENDOR_ID_PROC) == 0) {
+        return (void *) ggml_backend_vk_device_pci_vendor_id;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

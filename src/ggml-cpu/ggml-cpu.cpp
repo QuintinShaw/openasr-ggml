@@ -6,7 +6,11 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -33,8 +37,11 @@
 #endif
 
 #if defined(__APPLE__)
+#    include <mach/mach.h>
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
+#elif defined(__linux__)
+#    include <sys/sysinfo.h>
 #endif
 
 // ggml-backend interface
@@ -107,6 +114,13 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    uint64_t            memory_generation;
+    uint64_t            memory_high_water;
+    uint64_t            allocation_failures;
+    uint64_t            quarantine_generation;
+    uint32_t            memory_health;
+    int64_t             last_native_error;
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -130,14 +144,19 @@ struct ggml_backend_plan_cpu {
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
+    struct ggml_backend_plan_cpu * cpu_plan = new (std::nothrow) ggml_backend_plan_cpu;
+    if (cpu_plan == NULL) {
+        cpu_ctx->allocation_failures++;
+        return NULL;
+    }
 
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 
     if (cpu_plan->cplan.work_size > 0) {
-        cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
+        cpu_plan->cplan.work_data = new (std::nothrow) uint8_t[cpu_plan->cplan.work_size];
         if (cpu_plan->cplan.work_data == NULL) {
+            cpu_ctx->allocation_failures++;
             delete cpu_plan;
             return NULL;
         }
@@ -160,6 +179,10 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 }
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *) backend->context;
+    if (cpu_ctx->memory_health == GGML_BACKEND_MEMORY_QUARANTINED) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
@@ -170,16 +193,23 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    if (cpu_ctx->memory_health == GGML_BACKEND_MEMORY_QUARANTINED) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
-        delete[] cpu_ctx->work_data;
-        cpu_ctx->work_data = new uint8_t[cplan.work_size];
-        if (cpu_ctx->work_data == NULL) {
-            cpu_ctx->work_size = 0;
+        uint8_t * replacement = new (std::nothrow) uint8_t[cplan.work_size];
+        if (replacement == NULL) {
+            cpu_ctx->allocation_failures++;
             return GGML_STATUS_ALLOC_FAILED;
         }
+        delete[] cpu_ctx->work_data;
+        cpu_ctx->work_data = replacement;
         cpu_ctx->work_size = cplan.work_size;
+        cpu_ctx->memory_high_water = std::max(cpu_ctx->memory_high_water, (uint64_t) cpu_ctx->work_size);
+        cpu_ctx->memory_generation++;
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
 
@@ -218,7 +248,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
 
-    struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
+    struct ggml_backend_cpu_context * ctx = new (std::nothrow) ggml_backend_cpu_context;
     if (ctx == NULL) {
         return NULL;
     }
@@ -230,8 +260,14 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
+    ctx->memory_generation   = 1;
+    ctx->memory_high_water   = 0;
+    ctx->allocation_failures = 0;
+    ctx->quarantine_generation = 0;
+    ctx->memory_health       = GGML_BACKEND_MEMORY_HEALTHY;
+    ctx->last_native_error   = 0;
 
-    ggml_backend_t cpu_backend = new ggml_backend {
+    ggml_backend_t cpu_backend = new (std::nothrow) ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
         /* .iface   = */ ggml_backend_cpu_i,
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
@@ -369,13 +405,39 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     GlobalMemoryStatusEx(&status);
     *total = status.ullTotalPhys;
     *free = status.ullAvailPhys;
+#elif defined(__APPLE__)
+    int64_t memory_size = 0;
+    size_t memory_size_len = sizeof(memory_size);
+    if (sysctlbyname("hw.memsize", &memory_size, &memory_size_len, NULL, 0) != 0) {
+        *free = 0;
+        *total = 0;
+        return;
+    }
+    vm_statistics64_data_t vm = {};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
+        *free = 0;
+        *total = (size_t) memory_size;
+        return;
+    }
+    const uint64_t page = (uint64_t) vm_kernel_page_size;
+    *total = (size_t) memory_size;
+    *free = (size_t) ((vm.free_count + vm.inactive_count + vm.speculative_count) * page);
+#elif defined(__linux__)
+    struct sysinfo status = {};
+    if (sysinfo(&status) != 0) {
+        *free = 0;
+        *total = 0;
+        return;
+    }
+    *total = (size_t) status.totalram * status.mem_unit;
+    *free = (size_t) (status.freeram + status.bufferram) * status.mem_unit;
 #else
     long pages = sysconf(_SC_PHYS_PAGES);
+    long available_pages = sysconf(_SC_AVPHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total = pages * page_size;
-
-    // "free" system memory is ill-defined, for practical purposes assume that all of it is free:
-    *free = *total;
+    *free = available_pages * page_size;
 #endif // _WIN32
 
     GGML_UNUSED(dev);
@@ -643,6 +705,330 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static uint64_t ggml_backend_cpu_memory_round_page(uint64_t size) {
+#if defined(_WIN32)
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    const uint64_t page = system_info.dwPageSize;
+#else
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+#endif
+    if (page == 0 || size > UINT64_MAX - (page - 1)) {
+        return size;
+    }
+    return ((size + page - 1) / page) * page;
+}
+
+static ggml_backend_memory_domain_id_v1 ggml_backend_cpu_memory_domain(uint32_t kind) {
+    ggml_backend_memory_domain_id_v1 id = {};
+    id.kind = kind;
+    return id;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_get_domains(
+        ggml_backend_dev_t dev, ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count) {
+    GGML_UNUSED(dev);
+    if (inout_count == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    const uint32_t capacity = *inout_count;
+    *inout_count = 1;
+    if (domains == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (capacity < 1 || domains[0].struct_size < sizeof(domains[0])) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_memory_domain_v1 domain = {};
+    domain.struct_size = sizeof(domain);
+    domain.id = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE);
+    snprintf(domain.name, sizeof(domain.name), "host/pageable");
+    domains[0] = domain;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_quote(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * claims,
+        uint32_t * inout_claim_count) {
+    if ((request_count > 0 && requests == NULL) || quote == NULL ||
+            quote->struct_size < sizeof(*quote) || inout_claim_count == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+
+    uint32_t individual = 0;
+    uint64_t max_workspace = 0;
+    ggml_backend_t workspace_backend = NULL;
+    ggml_backend_t any_backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i])) {
+            return GGML_STATUS_FAILED;
+        }
+        if (requests[i].backend != NULL && !ggml_backend_is_cpu(requests[i].backend)) {
+            return GGML_STATUS_FAILED;
+        }
+        if (any_backend != NULL && requests[i].backend != NULL && requests[i].backend != any_backend) {
+            return GGML_STATUS_FAILED;
+        }
+        any_backend = any_backend ? any_backend : requests[i].backend;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER ||
+                requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT) {
+            ++individual;
+        } else if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE) {
+            if (requests[i].backend == NULL || requests[i].graph == NULL) {
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) requests[i].backend->context;
+            const ggml_cplan plan = ggml_graph_plan(requests[i].graph, ctx->n_threads, ctx->threadpool);
+            if (plan.work_size > max_workspace) {
+                max_workspace = plan.work_size;
+                workspace_backend = requests[i].backend;
+            }
+        }
+    }
+
+    const uint32_t required = individual + (max_workspace > 0 ? 1u : 0u);
+    const uint32_t capacity = *inout_claim_count;
+    *inout_claim_count = required;
+
+    uint64_t generation = 1;
+    if (any_backend != NULL) {
+        ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) any_backend->context;
+        // get_stats() reports the same generation. External RAM pressure is
+        // represented by its live free/budget fields, while this generation
+        // changes only when this backend mutates retained memory. Binding a
+        // token to raw free-page counts would make a quote spuriously stale on
+        // every unrelated system allocation.
+        generation = ctx->memory_generation;
+    }
+    quote->flags = 0;
+    quote->residual_flags = 0;
+    quote->residual_request_count = 0;
+    quote->provisional_requested_upper_bytes = 0;
+    quote->stats_generation = generation;
+    quote->request_fingerprint = ggml_backend_memory_request_fingerprint_v1(requests, request_count);
+    quote->quote_token = quote->request_fingerprint ^ generation;
+
+    if (claims == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (capacity < required) {
+        return GGML_STATUS_FAILED;
+    }
+
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_BUFFER &&
+                requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT) {
+            continue;
+        }
+        const uint64_t requested_committed = ggml_backend_cpu_memory_round_page(requests[i].requested_bytes);
+        const uint64_t before = ggml_backend_cpu_memory_round_page(requests[i].currently_allocated_bytes);
+        const bool reuse = requests[i].currently_allocated_bytes >= requests[i].requested_bytes;
+        const uint64_t after = reuse ? before : requested_committed;
+        ggml_backend_memory_claim_v1 claim = {};
+        claim.struct_size = sizeof(claim);
+        claim.flags = GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT) {
+            claim.flags |= GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED;
+            claim.domain = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED);
+        } else {
+            claim.domain = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE);
+        }
+        claim.request_id = requests[i].request_id;
+        claim.payload_requested_bytes = requests[i].requested_bytes;
+        claim.committed_before_bytes = before;
+        claim.committed_after_upper_bytes = after;
+        // Gallocr replacement is transactional: the complete replacement is
+        // allocated before the old arena is released.
+        claim.commit_peak_extra_upper_bytes = reuse ? 0 : requested_committed;
+        claim.resident_after_upper_bytes = after;
+        claim.retained_after_use_upper_bytes = after;
+        claims[out++] = claim;
+    }
+    if (max_workspace > 0) {
+        ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) workspace_backend->context;
+        ggml_backend_memory_claim_v1 claim = {};
+        claim.struct_size = sizeof(claim);
+        claim.flags = GGML_BACKEND_MEMORY_CLAIM_EXACT |
+            GGML_BACKEND_MEMORY_CLAIM_REUSABLE_WORKSPACE;
+        claim.domain = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE);
+        claim.payload_requested_bytes = max_workspace;
+        claim.committed_before_bytes = ctx->work_size;
+        const uint64_t after = std::max((uint64_t) ctx->work_size, max_workspace);
+        claim.committed_after_upper_bytes = after;
+        claim.commit_peak_extra_upper_bytes = max_workspace > ctx->work_size ? max_workspace : 0;
+        claim.resident_after_upper_bytes = after;
+        claim.retained_after_use_upper_bytes = after;
+        claim.releasable_after_use_upper_bytes = after;
+        claims[out++] = claim;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_reserve_private(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        const ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * actual,
+        uint32_t * inout_actual_count) {
+    if ((request_count > 0 && requests == NULL) || quote == NULL ||
+            quote->struct_size < sizeof(*quote) || inout_actual_count == NULL ||
+            quote->request_fingerprint != ggml_backend_memory_request_fingerprint_v1(requests, request_count)) {
+        return GGML_STATUS_FAILED;
+    }
+    uint64_t max_workspace = 0;
+    ggml_backend_t backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i]) ||
+                (requests[i].backend != NULL && !ggml_backend_is_cpu(requests[i].backend))) {
+            return GGML_STATUS_FAILED;
+        }
+        if (backend != NULL && requests[i].backend != NULL && requests[i].backend != backend) {
+            return GGML_STATUS_FAILED;
+        }
+        backend = backend ? backend : requests[i].backend;
+        if (requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE) {
+            continue;
+        }
+        ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) requests[i].backend->context;
+        const ggml_cplan plan = ggml_graph_plan(requests[i].graph, ctx->n_threads, ctx->threadpool);
+        if (plan.work_size > max_workspace) {
+            max_workspace = plan.work_size;
+            backend = requests[i].backend;
+        }
+    }
+    const uint32_t required = max_workspace > 0 ? 1u : 0u;
+    const uint32_t capacity = *inout_actual_count;
+    *inout_actual_count = required;
+    if (actual == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (capacity < required) {
+        return GGML_STATUS_FAILED;
+    }
+    if (backend == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) backend->context;
+    if (ctx->memory_health == GGML_BACKEND_MEMORY_QUARANTINED) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    const uint64_t generation = ctx->memory_generation;
+    if (quote->stats_generation != generation || quote->quote_token != (quote->request_fingerprint ^ generation)) {
+        return GGML_STATUS_FAILED;
+    }
+    const uint64_t before = ctx->work_size;
+    if (ctx->work_size < max_workspace) {
+        uint8_t * replacement = new (std::nothrow) uint8_t[max_workspace];
+        if (replacement == NULL) {
+            ctx->allocation_failures++;
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        delete[] ctx->work_data;
+        ctx->work_data = replacement;
+        ctx->work_size = max_workspace;
+        ctx->memory_high_water = std::max(ctx->memory_high_water, (uint64_t) ctx->work_size);
+        ctx->memory_generation++;
+    }
+    if (actual != NULL) {
+        ggml_backend_memory_claim_v1 claim = {};
+        claim.struct_size = sizeof(claim);
+        claim.flags = GGML_BACKEND_MEMORY_CLAIM_EXACT |
+            GGML_BACKEND_MEMORY_CLAIM_REUSABLE_WORKSPACE;
+        claim.domain = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE);
+        claim.payload_requested_bytes = max_workspace;
+        claim.committed_before_bytes = before;
+        claim.committed_after_upper_bytes = ctx->work_size;
+        claim.commit_peak_extra_upper_bytes = ctx->work_size > before ? ctx->work_size : 0;
+        claim.resident_after_upper_bytes = ctx->work_size;
+        claim.retained_after_use_upper_bytes = ctx->work_size;
+        claim.releasable_after_use_upper_bytes = ctx->work_size;
+        actual[0] = claim;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_get_stats(
+        ggml_backend_dev_t dev, ggml_backend_t backend,
+        ggml_backend_memory_stats_v1 * stats, uint32_t * inout_count) {
+    if (dev == NULL || inout_count == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    const uint32_t capacity = *inout_count;
+    *inout_count = 1;
+    if (stats == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (capacity < 1 || stats[0].struct_size < sizeof(stats[0])) {
+        return GGML_STATUS_FAILED;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+    ggml_backend_memory_stats_v1 value = {};
+    value.struct_size = sizeof(value);
+    value.domain = ggml_backend_cpu_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE);
+    value.total_bytes = total_bytes;
+    value.budget_bytes = total_bytes;
+    value.device_free_bytes = free_bytes;
+    value.device_used_bytes = total_bytes >= free_bytes ? total_bytes - free_bytes : 0;
+    value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
+    value.health = GGML_BACKEND_MEMORY_HEALTHY;
+    if (backend != NULL) {
+        ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) backend->context;
+        value.generation = ctx->memory_generation;
+        value.backend_owned_workspace_bytes = ctx->work_size;
+        value.backend_owned_live_bytes = ctx->work_size;
+        value.backend_owned_high_water_bytes = ctx->memory_high_water;
+        value.allocation_failure_count = ctx->allocation_failures;
+        value.health = ctx->memory_health;
+        value.quarantine_generation = ctx->quarantine_generation;
+        value.last_native_error = ctx->last_native_error;
+    }
+    stats[0] = value;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_trim(ggml_backend_t backend, uint64_t flags) {
+    GGML_UNUSED(flags);
+    if (backend == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) backend->context;
+    delete[] ctx->work_data;
+    ctx->work_data = NULL;
+    ctx->work_size = 0;
+    ctx->memory_generation++;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cpu_memory_quarantine(
+        ggml_backend_t backend, const ggml_backend_memory_quarantine_v1 * request) {
+    if (backend == NULL || request == NULL || request->struct_size < sizeof(*request)) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) backend->context;
+    ctx->memory_health = GGML_BACKEND_MEMORY_QUARANTINED;
+    ctx->last_native_error = request->native_error;
+    ctx->quarantine_generation++;
+    ctx->memory_generation++;
+    return GGML_STATUS_SUCCESS;
+}
+
+static const ggml_backend_memory_api_v1 * ggml_backend_cpu_memory_get_api_v1(void) {
+    static const ggml_backend_memory_api_v1 api = {
+        sizeof(ggml_backend_memory_api_v1),
+        GGML_BACKEND_MEMORY_ABI_V1,
+        0,
+        ggml_backend_cpu_memory_get_domains,
+        ggml_backend_cpu_memory_quote,
+        ggml_backend_cpu_memory_reserve_private,
+        ggml_backend_cpu_memory_get_stats,
+        ggml_backend_cpu_memory_trim,
+        ggml_backend_cpu_memory_quarantine,
+    };
+    return &api;
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -666,6 +1052,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, GGML_BACKEND_MEMORY_API_V1_PROC) == 0) {
+        return (void *) ggml_backend_cpu_memory_get_api_v1;
     }
 
     // threadpool - TODO:  move to ggml-base

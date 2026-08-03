@@ -52,6 +52,197 @@ extern "C" {
         GGML_BACKEND_BUFFER_USAGE_COMPUTE = 2,
     };
 
+    // Optional, versioned physical-memory accounting extension. Backends expose
+    // the entry point through ggml_backend_reg_get_proc_address() under
+    // GGML_BACKEND_MEMORY_API_V1_PROC. Byte counts are fixed-width so quotes
+    // can be persisted in audit records across C/Rust ABI boundaries.
+    #define GGML_BACKEND_MEMORY_API_V1_PROC "ggml_backend_memory_get_api_v1"
+    #define GGML_BACKEND_MEMORY_ABI_V1 1u
+
+    enum ggml_backend_memory_domain_kind_v1 {
+        GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL = 1,
+        GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE = 2,
+        GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED = 3,
+        GGML_BACKEND_MEMORY_DOMAIN_UNIFIED = 4,
+        GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED = 5,
+    };
+
+    enum ggml_backend_memory_request_kind_v1 {
+        GGML_BACKEND_MEMORY_REQUEST_BUFFER = 1,
+        GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT = 2,
+        GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE = 3,
+        GGML_BACKEND_MEMORY_REQUEST_TRANSFER = 4,
+    };
+
+    enum ggml_backend_memory_claim_flags_v1 {
+        GGML_BACKEND_MEMORY_CLAIM_EXACT = 1u << 0,
+        GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER = 1u << 1,
+        GGML_BACKEND_MEMORY_CLAIM_DRIVER_ESTIMATE = 1u << 2,
+        GGML_BACKEND_MEMORY_CLAIM_REUSABLE_WORKSPACE = 1u << 3,
+        GGML_BACKEND_MEMORY_CLAIM_TRANSIENT = 1u << 4,
+        GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED = 1u << 5,
+        // Physical commitment is reconciled from post-allocation stats. The
+        // numeric claim is an admission estimate, never an exact/upper claim.
+        GGML_BACKEND_MEMORY_CLAIM_PROVISIONAL = 1u << 6,
+    };
+
+    enum ggml_backend_memory_quote_flags_v1 {
+        GGML_BACKEND_MEMORY_QUOTE_PROVISIONAL = 1u << 0,
+        GGML_BACKEND_MEMORY_QUOTE_HAS_RESIDUAL_UNCERTAINTY = 1u << 1,
+        // Engine-visible graph-private payload is fully priced, but opaque
+        // command-buffer/driver costs are intentionally outside the claim.
+        // Admission must cover those costs with the physical domain's policy
+        // headroom; this flag does not make the quote provisional.
+        GGML_BACKEND_MEMORY_QUOTE_OPAQUE_DRIVER_COSTS_REQUIRE_DOMAIN_HEADROOM = 1u << 2,
+    };
+
+    enum ggml_backend_memory_residual_flags_v1 {
+        GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE = 1u << 0,
+        GGML_BACKEND_MEMORY_RESIDUAL_DRIVER_ACCOUNTING = 1u << 1,
+    };
+
+    enum ggml_backend_memory_health_v1 {
+        GGML_BACKEND_MEMORY_HEALTHY = 0,
+        GGML_BACKEND_MEMORY_DEGRADED = 1,
+        GGML_BACKEND_MEMORY_QUARANTINED = 2,
+        GGML_BACKEND_MEMORY_DEVICE_LOST = 3,
+    };
+
+    enum ggml_backend_memory_stats_flags_v1 {
+        GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE = 1u << 0,
+    };
+
+    struct ggml_backend_memory_domain_id_v1 {
+        // Provider-neutral physical identity token. GPU PCI providers use the
+        // canonical BDF encoding below; all zero means unknown and must remain
+        // provider/logical-device scoped in the caller.
+        uint8_t physical_device_uuid[16];
+        uint32_t heap_index;
+        uint32_t kind;
+    };
+
+    struct ggml_backend_memory_domain_v1 {
+        uint32_t struct_size;
+        uint32_t flags;
+        struct ggml_backend_memory_domain_id_v1 id;
+        char name[48];
+    };
+
+    struct ggml_backend_memory_request_v1 {
+        uint32_t struct_size;
+        uint32_t kind;
+        uint32_t flags;
+        uint32_t usage;
+        uint64_t request_id;
+        ggml_backend_t backend;
+        ggml_backend_t peer_backend;
+        ggml_backend_buffer_type_t buft;
+        const struct ggml_cgraph * graph;
+        const void * host_ptr;
+        uint64_t requested_bytes;
+        // Logical payload already owned by this reusable allocation. This is
+        // zero for a new owner and non-zero for an arena replacement/reuse.
+        uint64_t currently_allocated_bytes;
+        uint64_t max_tensor_bytes;
+    };
+
+    struct ggml_backend_memory_claim_v1 {
+        uint32_t struct_size;
+        uint32_t flags;
+        uint64_t request_id; // zero denotes a batch-wide shared cost
+        struct ggml_backend_memory_domain_id_v1 domain;
+        uint64_t payload_requested_bytes;
+        uint64_t committed_before_bytes;
+        uint64_t committed_after_upper_bytes;
+        uint64_t commit_peak_extra_upper_bytes;
+        uint64_t resident_after_upper_bytes;
+        uint64_t retained_after_use_upper_bytes;
+        uint64_t releasable_after_use_upper_bytes;
+    };
+
+    struct ggml_backend_memory_quote_v1 {
+        uint32_t struct_size;
+        uint32_t flags;
+        uint32_t residual_flags;
+        uint32_t residual_request_count;
+        uint64_t provisional_requested_upper_bytes;
+        uint64_t stats_generation;
+        uint64_t quote_token;
+        uint64_t request_fingerprint;
+    };
+
+    // Produces the canonical ABI-v1 transaction fingerprint. The hash binds
+    // the ABI version, request count and order, and every semantic request
+    // field. Providers must use this helper for both quote and reserve checks.
+    GGML_API uint64_t ggml_backend_memory_request_fingerprint_v1(
+        const struct ggml_backend_memory_request_v1 * requests,
+        uint32_t request_count);
+
+    // Encodes canonical PCI BDF text ("dddd:bb:dd.f") into the 16-byte
+    // physical identity token shared by CUDA/HIP and Vulkan:
+    //   [0..4)  = {'P', 'C', 'I', 1}
+    //   [4..6)  = PCI domain, big endian
+    //   [6]     = bus
+    //   [7]     = device
+    //   [8]     = function
+    //   [9..16) = zero
+    // The output is zeroed and false is returned when the BDF is unavailable
+    // or non-canonical. Provider ordinals must never enter this token.
+    GGML_API bool ggml_backend_memory_encode_pci_bdf_v1(
+        const char * pci_bus_id,
+        uint8_t physical_device_uuid[16]);
+
+    struct ggml_backend_memory_stats_v1 {
+        uint32_t struct_size;
+        uint32_t flags;
+        struct ggml_backend_memory_domain_id_v1 domain;
+        uint64_t generation;
+        uint64_t timestamp_monotonic_ns;
+        uint64_t total_bytes;
+        uint64_t budget_bytes;
+        uint64_t device_used_bytes;
+        uint64_t device_free_bytes;
+        uint64_t backend_owned_live_bytes;
+        uint64_t backend_owned_cached_bytes;
+        uint64_t backend_owned_workspace_bytes;
+        uint64_t backend_owned_high_water_bytes;
+        uint64_t allocation_count;
+        uint64_t allocation_failure_count;
+        uint32_t health;
+        int32_t last_ggml_status;
+        int64_t last_native_error;
+        uint64_t quarantine_generation;
+    };
+
+    struct ggml_backend_memory_quarantine_v1 {
+        uint32_t struct_size;
+        uint32_t flags;
+        uint32_t reason;
+        int32_t ggml_status;
+        int64_t native_error;
+        char message[96];
+    };
+
+    struct ggml_backend_memory_api_v1 {
+        uint32_t struct_size;
+        uint32_t abi_version;
+        uint64_t capabilities;
+        enum ggml_status (*get_domains)(ggml_backend_dev_t dev, struct ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count);
+        enum ggml_status (*quote)(const struct ggml_backend_memory_request_v1 * requests, uint32_t request_count, struct ggml_backend_memory_quote_v1 * quote, struct ggml_backend_memory_claim_v1 * claims, uint32_t * inout_claim_count);
+        // Failure-atomic transactional hook. A non-success return must leave
+        // native allocation state unchanged and must not retain replacement
+        // buffers, caches, workspaces, or command resources. A size query
+        // (actual == NULL) is side-effect free. Providers that cannot prove
+        // this contract in ABI v1 must keep this hook validation-only/no-op;
+        // the caller then holds its provisional domain gate through first use.
+        enum ggml_status (*reserve_private)(const struct ggml_backend_memory_request_v1 * requests, uint32_t request_count, const struct ggml_backend_memory_quote_v1 * quote, struct ggml_backend_memory_claim_v1 * actual, uint32_t * inout_actual_count);
+        enum ggml_status (*get_stats)(ggml_backend_dev_t dev, ggml_backend_t backend, struct ggml_backend_memory_stats_v1 * stats, uint32_t * inout_count);
+        enum ggml_status (*trim)(ggml_backend_t backend, uint64_t flags);
+        enum ggml_status (*quarantine)(ggml_backend_t backend, const struct ggml_backend_memory_quarantine_v1 * request);
+    };
+
+    typedef const struct ggml_backend_memory_api_v1 * (*ggml_backend_memory_get_api_v1_t)(void);
+
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
     GGML_API void *                         ggml_backend_buffer_get_base      (ggml_backend_buffer_t buffer);
@@ -252,6 +443,13 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // Optional, stable hardware-vendor fact for one device. Backends that can
+    // prove a PCI vendor id expose this through get_proc_address using the name
+    // below; absence/zero means unknown and callers must not infer it from a
+    // human-readable device name.
+    #define GGML_BACKEND_DEVICE_PCI_VENDOR_ID_PROC "ggml_backend_device_pci_vendor_id"
+    typedef uint32_t (*ggml_backend_device_pci_vendor_id_t)(ggml_backend_dev_t device);
+
     //
     // Backend registry
     //
@@ -333,6 +531,7 @@ extern "C" {
     */
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
+    typedef struct ggml_backend_sched_memory_plan * ggml_backend_sched_memory_plan_t;
 
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
@@ -350,6 +549,22 @@ extern "C" {
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+
+    // Freeze the exact scheduler split/gallocr measurement used for admission.
+    // A plan owns the scheduler until commit/free; the graph and its tensors
+    // must remain alive and immutable for that lifetime.
+    GGML_API enum ggml_status ggml_backend_sched_memory_plan_create_v1(
+            ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+            ggml_backend_sched_memory_plan_t * out_plan);
+    GGML_API uint32_t ggml_backend_sched_memory_plan_get_item_count_v1(
+            ggml_backend_sched_memory_plan_t plan);
+    GGML_API bool ggml_backend_sched_memory_plan_get_item_v1(
+            ggml_backend_sched_memory_plan_t plan, uint32_t index,
+            struct ggml_backend_memory_request_v1 * out_item);
+    GGML_API enum ggml_status ggml_backend_sched_memory_plan_commit_v1(
+            ggml_backend_sched_memory_plan_t plan);
+    GGML_API void ggml_backend_sched_memory_plan_free_v1(
+            ggml_backend_sched_memory_plan_t plan);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);

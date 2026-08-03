@@ -1277,11 +1277,18 @@ enum ggml_status ggml_metal_device_event_synchronize(ggml_metal_device_t dev, gg
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        const size_t allocated = dev->mtl_device.currentAllocatedSize;
+        *free  = allocated < *total ? *total - allocated : 0;
     } else {
         *free = 0;
         *total = 0;
     }
+}
+
+size_t ggml_metal_device_get_buffer_allocation_size(ggml_metal_device_t dev, size_t size, bool shared) {
+    const MTLResourceOptions options = shared ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+    const MTLSizeAndAlign requirement = [dev->mtl_device heapBufferSizeAndAlignWithLength:size options:options];
+    return requirement.size;
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
@@ -1749,6 +1756,9 @@ static void * ggml_metal_host_malloc(size_t n) {
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (res == NULL) {
+        return NULL;
+    }
 
     res->dev = dev;
 

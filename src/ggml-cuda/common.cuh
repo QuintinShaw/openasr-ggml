@@ -1149,6 +1149,10 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual size_t committed_size() const = 0;
+    virtual size_t used_size() const = 0;
+    virtual size_t cached_size() const = 0;
+    virtual enum ggml_status trim() = 0;
 };
 
 template<typename T>
@@ -1395,6 +1399,7 @@ struct ggml_cuda_stream_context {
 struct ggml_backend_cuda_context {
     int device;
     enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
+    bool memory_quarantined = false;
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
@@ -1647,4 +1652,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

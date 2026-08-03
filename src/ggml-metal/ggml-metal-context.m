@@ -279,6 +279,19 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+static enum ggml_status ggml_metal_command_buffer_failure(id<MTLCommandBuffer> cmd_buf) {
+    NSError * error = [cmd_buf error];
+    if (error != nil && error.code == MTLCommandBufferErrorOutOfMemory) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+#if defined(__MAC_12_0) || defined(__IPHONE_15_0)
+    if (error != nil && error.code == MTLCommandBufferErrorDeviceRemoved) {
+        return GGML_STATUS_DEVICE_LOST;
+    }
+#endif
+    return GGML_STATUS_EXECUTION_FAILED;
+}
+
 enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->has_error) {
         ggml_metal_abort_monitor_stop(ctx);
@@ -309,8 +322,9 @@ enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                 }
-                ctx->has_error = true;
-                return GGML_STATUS_EXECUTION_FAILED;
+                const enum ggml_status failure = ggml_metal_command_buffer_failure(cmd_buf);
+                ctx->has_error = failure == GGML_STATUS_DEVICE_LOST;
+                return failure;
             }
         }
     }
@@ -333,8 +347,9 @@ enum ggml_status ggml_metal_synchronize(ggml_metal_t ctx) {
                 }
                 [ctx->cmd_bufs_ext removeAllObjects];
 
-                ctx->has_error = true;
-                return GGML_STATUS_EXECUTION_FAILED;
+                const enum ggml_status failure = ggml_metal_command_buffer_failure(cmd_buf);
+                ctx->has_error = failure == GGML_STATUS_DEVICE_LOST;
+                return failure;
             }
 
             [cmd_buf release];
@@ -370,7 +385,8 @@ enum ggml_status ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tenso
     @autoreleasepool {
         id<MTLBuffer> src = [(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
         struct ggml_metal_buffer_id dst = ggml_metal_get_buffer_id(tensor);
-        if (src == nil || dst.metal == nil) { [src release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        if (src == nil) { return GGML_STATUS_ALLOC_FAILED; }
+        if (dst.metal == nil) { [src release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
         id<MTLCommandBuffer> cmd = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx->dev) commandBuffer];
         id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
         if (enc == nil) { [src release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
@@ -384,7 +400,8 @@ enum ggml_status ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml
     @autoreleasepool {
         id<MTLBuffer> dst = [(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) newBufferWithBytesNoCopy:data length:size options:MTLResourceStorageModeShared deallocator:nil];
         struct ggml_metal_buffer_id src = ggml_metal_get_buffer_id(tensor);
-        if (dst == nil || src.metal == nil) { [dst release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
+        if (dst == nil) { return GGML_STATUS_ALLOC_FAILED; }
+        if (src.metal == nil) { [dst release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
         id<MTLCommandBuffer> cmd = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx->dev) commandBuffer]; id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
         if (enc == nil) { [dst release]; ctx->has_error = true; return GGML_STATUS_EXECUTION_FAILED; }
         [enc copyFromBuffer:src.metal sourceOffset:src.offs + offset toBuffer:dst destinationOffset:0 size:size];
@@ -631,6 +648,16 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
+}
+
+void ggml_metal_quarantine(ggml_metal_t ctx) {
+    if (ctx != NULL) {
+        ctx->has_error = true;
+    }
+}
+
+bool ggml_metal_is_quarantined(ggml_metal_t ctx) {
+    return ctx == NULL || ctx->has_error;
 }
 
 void ggml_metal_set_abort_callback(
