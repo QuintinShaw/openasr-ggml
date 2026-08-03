@@ -2,6 +2,7 @@
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
+#import "ggml-metal-impl.h"
 
 #include <Foundation/Foundation.h>
 
@@ -93,6 +94,9 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
+
+static id<MTLBinaryArchive> openasr_metal_device_archive(ggml_metal_device_t dev);
+static void openasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev);
 
 struct ggml_metal_library {
     id<MTLLibrary> obj;
@@ -411,8 +415,29 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
-        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        id<MTLComputePipelineState> obj = nil;
+        MTLComputePipelineDescriptor * pdesc = [MTLComputePipelineDescriptor new];
+        pdesc.computeFunction = mtl_function;
+        id<MTLBinaryArchive> archive = openasr_metal_device_archive(lib->dev);
+        if (archive) {
+            pdesc.binaryArchives = @[archive];
+        }
+        obj = [device newComputePipelineStateWithDescriptor:pdesc
+                                                    options:MTLPipelineOptionNone
+                                                 reflection:nil
+                                                      error:&error];
 
+        if (obj && archive) {
+            NSError * add_err = nil;
+            if ([archive addComputePipelineFunctionsWithDescriptor:pdesc error:&add_err]) {
+                openasr_metal_device_mark_archive_dirty(lib->dev);
+            } else if (add_err) {
+                GGML_LOG_DEBUG("%s: add-to-archive skipped for '%s': %s\n",
+                        __func__, name, [[add_err description] UTF8String]);
+            }
+        }
+
+        [pdesc release];
         [mtl_function release];
 
         if (!obj) {
@@ -458,6 +483,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    bool concurrent;
+    id<MTLComputePipelineState> current_pipeline;
+    id<MTLComputePipelineState> cancel_gate_pipeline;
+    id<MTLBuffer> cancel_abort_flag;
+    NSUInteger cancel_abort_flag_offset;
+    id<MTLBuffer> cancel_indirect_args;
+    NSUInteger cancel_indirect_args_offset;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -470,6 +502,8 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     } else {
         res->obj = [cmd_buf computeCommandEncoder];
     }
+
+    res->concurrent = concurrent;
 
     [res->obj retain];
 
@@ -490,7 +524,24 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    encoder->current_pipeline = pipeline.pipeline->obj;
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+}
+
+void ggml_metal_encoder_set_cancel_buffers(
+        ggml_metal_encoder_t encoder,
+        struct ggml_metal_pipeline_with_params gate_pipeline,
+        struct ggml_metal_buffer_id abort_flag,
+        struct ggml_metal_buffer_id indirect_args) {
+    GGML_ASSERT(!encoder->concurrent);
+    GGML_ASSERT(gate_pipeline.pipeline != NULL);
+    GGML_ASSERT(abort_flag.metal != NULL);
+    GGML_ASSERT(indirect_args.metal != NULL);
+    encoder->cancel_gate_pipeline = gate_pipeline.pipeline->obj;
+    encoder->cancel_abort_flag = (id<MTLBuffer>) abort_flag.metal;
+    encoder->cancel_abort_flag_offset = abort_flag.offs;
+    encoder->cancel_indirect_args = (id<MTLBuffer>) indirect_args.metal;
+    encoder->cancel_indirect_args_offset = indirect_args.offs;
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
@@ -506,6 +557,32 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (encoder->cancel_gate_pipeline != nil) {
+        GGML_ASSERT(encoder->current_pipeline != nil);
+        struct ggml_metal_cancel_dispatch_args desired = {
+            (uint32_t) tg0,
+            (uint32_t) tg1,
+            (uint32_t) tg2,
+            0,
+        };
+        [encoder->obj setComputePipelineState:encoder->cancel_gate_pipeline];
+        [encoder->obj setBuffer:encoder->cancel_abort_flag
+                         offset:encoder->cancel_abort_flag_offset
+                        atIndex:GGML_METAL_CANCEL_ABORT_BUFFER_INDEX];
+        [encoder->obj setBytes:&desired
+                        length:sizeof(desired)
+                       atIndex:GGML_METAL_CANCEL_DESIRED_BUFFER_INDEX];
+        [encoder->obj setBuffer:encoder->cancel_indirect_args
+                         offset:encoder->cancel_indirect_args_offset
+                        atIndex:GGML_METAL_CANCEL_INDIRECT_BUFFER_INDEX];
+        [encoder->obj dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [encoder->obj setComputePipelineState:encoder->current_pipeline];
+        [encoder->obj dispatchThreadgroupsWithIndirectBuffer:encoder->cancel_indirect_args
+                                      indirectBufferOffset:encoder->cancel_indirect_args_offset
+                                     threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        return;
+    }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
@@ -531,9 +608,135 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
+    id<MTLBinaryArchive> binary_archive;
+    NSURL * binary_archive_url;
+    bool binary_archive_dirty;
+
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 };
+
+static NSURL * openasr_metal_pipeline_cache_url(NSString * device_name) {
+    NSFileManager * fm = [NSFileManager defaultManager];
+
+    NSURL * cache_dir = nil;
+    const char * env_dir = getenv("GGML_METAL_PIPELINE_CACHE");
+    if (env_dir && env_dir[0] != '\0') {
+        cache_dir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:env_dir]];
+    } else {
+        NSURL * libcache = [fm URLForDirectory:NSCachesDirectory
+                                     inDomain:NSUserDomainMask
+                            appropriateForURL:nil
+                                       create:YES
+                                        error:nil];
+        if (!libcache) {
+            return nil;
+        }
+        // Keep OpenASR's Metal binary archive separate from other ggml-based apps so
+        // benchmark and runtime startup are not perturbed by a shared global cache file.
+        NSURL * app_cache = [libcache URLByAppendingPathComponent:@"openasr" isDirectory:YES];
+        cache_dir = [app_cache URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
+    }
+
+    NSError * mkdir_err = nil;
+    if (![fm createDirectoryAtURL:cache_dir
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:&mkdir_err]) {
+        GGML_LOG_WARN("%s: pipeline-cache dir %s unwritable (%s) - caching disabled\n",
+                __func__,
+                [[cache_dir path] UTF8String],
+                mkdir_err ? [[mkdir_err description] UTF8String] : "unknown");
+        return nil;
+    }
+
+    NSMutableCharacterSet * unsafe = [NSMutableCharacterSet whitespaceCharacterSet];
+    [unsafe addCharactersInString:@"/\\:*?\"|<>"];
+    NSArray<NSString *> * parts = [device_name componentsSeparatedByCharactersInSet:unsafe];
+    NSString * safe = [parts componentsJoinedByString:@"_"];
+    if (safe.length == 0) {
+        safe = @"unknown-device";
+    }
+
+    NSString * filename = [NSString stringWithFormat:@"%@.archive", safe];
+    return [cache_dir URLByAppendingPathComponent:filename];
+}
+
+static void openasr_metal_pipeline_cache_open(ggml_metal_device_t dev) {
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+        // continue
+    } else {
+        return;
+    }
+
+    const char * disable = getenv("GGML_METAL_PIPELINE_CACHE_DISABLE");
+    if (disable && disable[0] != '\0' && disable[0] != '0') {
+        GGML_LOG_INFO("%s: GGML_METAL_PIPELINE_CACHE_DISABLE set - skipping pipeline cache\n", __func__);
+        return;
+    }
+
+    NSURL * url = openasr_metal_pipeline_cache_url([dev->mtl_device name]);
+    if (!url) {
+        return;
+    }
+
+    MTLBinaryArchiveDescriptor * desc = [MTLBinaryArchiveDescriptor new];
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[url path]];
+    if (exists) {
+        desc.url = url;
+    }
+
+    NSError * err = nil;
+    id<MTLBinaryArchive> archive = [dev->mtl_device newBinaryArchiveWithDescriptor:desc error:&err];
+    [desc release];
+
+    if (!archive) {
+        if (exists) {
+            GGML_LOG_WARN("%s: cached archive %s rejected by Metal (%s) - discarding and starting fresh\n",
+                    __func__,
+                    [[url path] UTF8String],
+                    err ? [[err description] UTF8String] : "unknown");
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            err = nil;
+            MTLBinaryArchiveDescriptor * fresh = [MTLBinaryArchiveDescriptor new];
+            archive = [dev->mtl_device newBinaryArchiveWithDescriptor:fresh error:&err];
+            [fresh release];
+        }
+        if (!archive) {
+            GGML_LOG_WARN("%s: pipeline-cache init failed (%s) - caching disabled\n",
+                    __func__,
+                    err ? [[err description] UTF8String] : "unknown");
+            return;
+        }
+    }
+
+    dev->binary_archive = archive;
+    dev->binary_archive_url = [url retain];
+    dev->binary_archive_dirty = false;
+    GGML_LOG_INFO("%s: pipeline cache %s - %s\n",
+            __func__,
+            exists ? "loaded" : "created",
+            [[url path] UTF8String]);
+}
+
+static void openasr_metal_pipeline_cache_flush(ggml_metal_device_t dev) {
+    if (!dev->binary_archive || !dev->binary_archive_url || !dev->binary_archive_dirty) {
+        return;
+    }
+
+    NSError * err = nil;
+    if ([dev->binary_archive serializeToURL:dev->binary_archive_url error:&err]) {
+        GGML_LOG_INFO("%s: pipeline cache serialised -> %s\n",
+                __func__,
+                [[dev->binary_archive_url path] UTF8String]);
+        dev->binary_archive_dirty = false;
+    } else {
+        GGML_LOG_WARN("%s: pipeline cache serialise failed for %s (%s)\n",
+                __func__,
+                [[dev->binary_archive_url path] UTF8String],
+                err ? [[err description] UTF8String] : "unknown");
+    }
+}
 
 //
 // MTLResidenceSet wrapper
@@ -824,9 +1027,22 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
-            dev->props.use_residency_sets = true;
+            dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+#if TARGET_OS_OSX
+            // Apple-Silicon Macs before the Tensor API still benefit materially
+            // from wiring model buffers across warm graph submissions. Keep the
+            // conservative non-Tensor default on mobile, where the memory budget
+            // is tighter, and on Intel/eGPU devices without an Apple GPU family.
+            dev->props.use_residency_sets = dev->props.has_tensor || dev->props.supports_gpu_family_apple7;
+#else
+            dev->props.use_residency_sets = dev->props.has_tensor;
+#endif
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-            dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+            if (getenv("GGML_METAL_RESIDENCY_ENABLE") != NULL) {
+                dev->props.use_residency_sets = true;
+            } else if (getenv("GGML_METAL_NO_RESIDENCY") != NULL) {
+                dev->props.use_residency_sets = false;
+            }
 #endif
 
             dev->props.use_shared_buffers = dev->props.has_unified_memory;
@@ -840,8 +1056,6 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             if (getenv("GGML_METAL_SHARED_BUFFERS_ENABLE") != NULL) {
                 dev->props.use_shared_buffers = true;
             }
-
-            dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
 
@@ -857,6 +1071,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             snprintf(dev->props.name, sizeof(dev->props.name), "%s%d", "MTL", device);
             snprintf(dev->props.desc, sizeof(dev->props.desc), "%s", [[dev->mtl_device name] UTF8String]);
+
+            openasr_metal_pipeline_cache_open(dev);
 
             dev->library = ggml_metal_library_init(dev);
             if (!dev->library) {
@@ -922,8 +1138,20 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
 
     ggml_metal_rsets_free(dev->rsets);
 
+    openasr_metal_pipeline_cache_flush(dev);
+
     ggml_metal_library_free(dev->library);
     dev->library = NULL;
+
+    if (dev->binary_archive) {
+        [dev->binary_archive release];
+        dev->binary_archive = nil;
+    }
+
+    if (dev->binary_archive_url) {
+        [dev->binary_archive_url release];
+        dev->binary_archive_url = nil;
+    }
 
     if (dev->mtl_queue) {
         [dev->mtl_queue release];
@@ -948,6 +1176,16 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
+}
+
+static id<MTLBinaryArchive> openasr_metal_device_archive(ggml_metal_device_t dev) {
+    return dev ? dev->binary_archive : nil;
+}
+
+static void openasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev) {
+    if (dev) {
+        dev->binary_archive_dirty = true;
+    }
 }
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
@@ -1028,24 +1266,29 @@ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev
     GGML_UNUSED(dev);
 }
 
-void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+enum ggml_status ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = ev->obj;
     const bool res = [event waitUntilSignaledValue:atomic_load_explicit(&ev->value, memory_order_relaxed) timeoutMS:60000];
-    if (!res) {
-        GGML_ABORT("%s: failed to wait for event\n", __func__);
-    }
 
     GGML_UNUSED(dev);
+    return res ? GGML_STATUS_SUCCESS : GGML_STATUS_EXECUTION_FAILED;
 }
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        const size_t allocated = dev->mtl_device.currentAllocatedSize;
+        *free  = allocated < *total ? *total - allocated : 0;
     } else {
         *free = 0;
         *total = 0;
     }
+}
+
+size_t ggml_metal_device_get_buffer_allocation_size(ggml_metal_device_t dev, size_t size, bool shared) {
+    const MTLResourceOptions options = shared ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+    const MTLSizeAndAlign requirement = [dev->mtl_device heapBufferSizeAndAlignWithLength:size options:options];
+    return requirement.size;
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
@@ -1513,6 +1756,9 @@ static void * ggml_metal_host_malloc(size_t n) {
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (res == NULL) {
+        return NULL;
+    }
 
     res->dev = dev;
 

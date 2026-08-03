@@ -27,7 +27,7 @@
         const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
         if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
             ggml_sycl_flash_attn_ext_vec_case<D, type_K, type_V>(ctx, dst);                                      \
-            return;                                                                                              \
+            return true;                                                                                         \
         }                                                                                                        \
     }                                                                    \
 
@@ -37,8 +37,25 @@
     FATTN_VEC_CASE(256, type_K, type_V)       \
     FATTN_VEC_CASE(512, type_K, type_V)       \
 
-static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+// Keep vector-kernel eligibility and dispatch aligned with the explicit
+// template instantiations in FATTN_VEC_CASES_ALL_D.
+static bool ggml_sycl_fattn_vec_head_dim_supported(int64_t head_dim) {
+    switch (head_dim) {
+        case 64:
+        case 128:
+        case 256:
+        case 512:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
+    if (!ggml_sycl_fattn_vec_head_dim_supported(Q->ne[0])) {
+        return false;
+    }
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
@@ -90,7 +107,9 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
-    GGML_ABORT("Not match KV type in vec");
+    // A direct caller can bypass supports_op. Let graph dispatch convert this
+    // unsupported specialization to its typed execution failure.
+    return false;
 }
 
 // Best FlashAttention kernel for a specific GPU:
@@ -189,7 +208,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = ggml_sycl_fattn_vec_head_dim_supported(Q->ne[0]) &&
+                                       K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
@@ -214,11 +234,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+bool ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
     switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
-            GGML_ABORT("Not support Flash-Attention");
+            return false;
         case BEST_FATTN_KERNEL_ONEDNN:
             // guarded: ggml_sycl_flash_attn_ext_onednn() is only defined under GGML_SYCL_DNNL;
             // the reference must be compiled out here or the GGML_SYCL_DNNL=0 build fails to link.
@@ -230,9 +250,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
-            ggml_sycl_flash_attn_ext_vec(ctx, dst);
-            break;
+            return ggml_sycl_flash_attn_ext_vec(ctx, dst);
+        default:
+            return false;
     }
+    return true;
 }
 
 bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

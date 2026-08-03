@@ -6657,36 +6657,46 @@ static void ggml_backend_opencl_free(ggml_backend_t backend) {
     ggml_cl_free(backend);
 }
 
-static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_UNUSED(backend);
     GGML_UNUSED(tensor);
     GGML_UNUSED(data);
     GGML_UNUSED(offset);
     GGML_UNUSED(size);
+    return GGML_STATUS_FAILED;
 }
 
-static void ggml_backend_opencl_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_opencl_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_UNUSED(backend);
     GGML_UNUSED(tensor);
     GGML_UNUSED(data);
     GGML_UNUSED(offset);
     GGML_UNUSED(size);
+    return GGML_STATUS_FAILED;
 }
 
-static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+static enum ggml_status ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
     GGML_UNUSED(backend);
     GGML_UNUSED(src);
     GGML_UNUSED(dst);
-    return false;
+    return GGML_STATUS_FAILED;
 }
 
-static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
 
-    cl_event evt;
-    CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
-    CL_CHECK(clWaitForEvents(1, &evt));
-    CL_CHECK(clReleaseEvent(evt));
+    cl_event evt = nullptr;
+    cl_int status = clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt);
+    if (status == CL_SUCCESS) {
+        status = clWaitForEvents(1, &evt);
+    }
+    if (evt != nullptr) {
+        const cl_int release_status = clReleaseEvent(evt);
+        if (status == CL_SUCCESS) {
+            status = release_status;
+        }
+    }
+    return status == CL_SUCCESS ? GGML_STATUS_SUCCESS : GGML_STATUS_EXECUTION_FAILED;
 }
 
 // Synchronizes the 'backend_ctx's device with others so that commands
@@ -7458,8 +7468,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_opencl_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record_status     = */ NULL,
+    /* .event_wait_status       = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

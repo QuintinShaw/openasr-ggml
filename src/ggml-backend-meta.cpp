@@ -964,6 +964,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
             } break;
+            case GGML_OP_FLASH_ATTN_REL_POS: {
+                // CPU-only local op: treat as generic scalar-split unavailable.
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1680,7 +1684,7 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
@@ -1707,25 +1711,28 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+                const enum ggml_status status = ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (status != GGML_STATUS_SUCCESS) return status;
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_tensor_set_async(
+                const enum ggml_status status = ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+                if (status != GGML_STATUS_SUCCESS) return status;
             }
         } break;
         default: {
-            GGML_ABORT("fatal error");
+            return GGML_STATUS_FAILED;
         }
     }
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
@@ -1752,8 +1759,9 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
+                const enum ggml_status status = ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (status != GGML_STATUS_SUCCESS) return status;
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
@@ -1762,19 +1770,26 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             // TODO other simple backend may be better
             ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
-            ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+            const enum ggml_status status = ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+            if (status != GGML_STATUS_SUCCESS) return status;
         } break;
         default: {
-            GGML_ABORT("fatal error");
+            return GGML_STATUS_FAILED;
         }
     }
+    return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    enum ggml_status status = GGML_STATUS_SUCCESS;
     for (size_t i = 0; i < n_backends; i++) {
-        ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+        enum ggml_status completed = ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+        if (completed != GGML_STATUS_SUCCESS) {
+            status = completed;
+        }
     }
+    return status;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2116,7 +2131,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            const enum ggml_status copy_status = ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            if (copy_status != GGML_STATUS_SUCCESS) return copy_status;
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -2131,6 +2147,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             cgraph_aux->nodes[0] = node_red;
             cgraph_aux->n_nodes = 1;
             step_cgraphs[j_dst] = cgraph_aux;
+            return GGML_STATUS_SUCCESS;
         };
 
         size_t offset_j = n_backends/2;
@@ -2143,7 +2160,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
+            const ggml_status copy_status = push_data(j_src, j_dst, i_buf);
+            if (copy_status != GGML_STATUS_SUCCESS) return copy_status;
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
@@ -2160,7 +2178,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (j_other >= n_backends) {
                     continue;
                 }
-                push_data(j, j_other, i_buf);
+                const ggml_status copy_status = push_data(j, j_other, i_buf);
+                if (copy_status != GGML_STATUS_SUCCESS) return copy_status;
             }
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
@@ -2184,7 +2203,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            const enum ggml_status copy_status = ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            if (copy_status != GGML_STATUS_SUCCESS) return copy_status;
         }
 
         return GGML_STATUS_SUCCESS;
@@ -2238,8 +2258,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record_status     = */ nullptr,
+    /* .event_wait_status       = */ nullptr,
     /* .graph_optimize          = */ nullptr,
 };
 

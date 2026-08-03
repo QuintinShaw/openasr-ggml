@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -108,14 +108,15 @@ extern "C" {
         void (*free)(ggml_backend_t backend);
 
         // (optional) asynchronous tensor data access
-        void (*set_tensor_async)   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
-        void (*get_tensor_async)   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
-        void (*set_tensor_2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
-        void (*get_tensor_2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
-        bool (*cpy_tensor_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+        enum ggml_status (*set_tensor_async)   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        enum ggml_status (*get_tensor_async)   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+        enum ggml_status (*set_tensor_2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+        enum ggml_status (*get_tensor_2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+        enum ggml_status (*cpy_tensor_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
-        // (optional) complete all pending operations (required if the backend supports async operations)
-        void (*synchronize)(ggml_backend_t backend);
+        // (optional) complete all pending operations. A successful return means
+        // the operation's terminal status was observed and no work remains pending.
+        enum ggml_status (*synchronize)(ggml_backend_t backend);
 
         // (optional) graph plans (not used currently)
         // compute graph with a plan
@@ -129,11 +130,10 @@ extern "C" {
         // compute graph (always async if supported by the backend)
         enum ggml_status          (*graph_compute)     (ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
-        // (optional) event synchronization
-        // record an event on this stream
-        void (*event_record)(ggml_backend_t backend, ggml_backend_event_t event);
-        // wait for an event on on a different stream
-        void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
+        // Event submission is typed so scheduler boundaries can preserve a
+        // backend error instead of converting it to a process-wide failure.
+        enum ggml_status (*event_record_status) (ggml_backend_t backend, ggml_backend_event_t event);
+        enum ggml_status (*event_wait_status)   (ggml_backend_t backend, ggml_backend_event_t event);
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
@@ -198,7 +198,7 @@ extern "C" {
         // (optional) event synchronization
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
-        void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        enum ggml_status     (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {

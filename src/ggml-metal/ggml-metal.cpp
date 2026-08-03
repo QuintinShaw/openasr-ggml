@@ -7,8 +7,12 @@
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 
+#include <algorithm>
 #include <mutex>
+#include <cstdio>
+#include <cstring>
 #include <string>
+#include <unistd.h>
 
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
@@ -72,7 +76,7 @@ static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t bu
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
 
     if (!ggml_backend_buffer_is_metal(src->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     return ggml_metal_buffer_cpy_tensor(ctx, src, dst);
@@ -148,7 +152,7 @@ static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t b
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
 
     if (!ggml_backend_buffer_is_metal(src->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     return ggml_metal_buffer_cpy_tensor(ctx, src, dst);
@@ -492,31 +496,31 @@ static void ggml_backend_metal_free(ggml_backend_t backend) {
     free(backend);
 }
 
-static void ggml_backend_metal_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_metal_synchronize(ggml_backend_t backend) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_synchronize(ctx);
+    return ggml_metal_synchronize(ctx);
 }
 
-static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
+    return ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
 }
 
-static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static enum ggml_status ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
+    return ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
 }
 
-static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static enum ggml_status ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
-        return false;
+        return GGML_STATUS_FAILED;
     }
 
     ggml_metal_t ctx_src = (ggml_metal_t)backend_src->context;
@@ -537,18 +541,18 @@ static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend,
     return ggml_metal_graph_compute(ctx, cgraph);
 }
 
-static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
 
-    ggml_metal_event_record(ctx, ev);
+    return ggml_metal_event_record(ctx, ev);
 }
 
-static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
 
-    ggml_metal_event_wait(ctx, ev);
+    return ggml_metal_event_wait(ctx, ev);
 }
 
 static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -565,6 +569,13 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+static void ggml_backend_metal_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+    ggml_metal_set_abort_callback(ctx, abort_callback, abort_callback_data);
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -579,8 +590,8 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_metal_graph_compute,
-    /* .event_record            = */ ggml_backend_metal_event_record,
-    /* .event_wait              = */ ggml_backend_metal_event_wait,
+    /* .event_record_status     = */ ggml_backend_metal_event_record_status,
+    /* .event_wait_status       = */ ggml_backend_metal_event_wait_status,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
 };
 
@@ -615,14 +626,6 @@ ggml_backend_t ggml_backend_metal_init(void) {
 
 bool ggml_backend_is_metal(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
-}
-
-void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
 }
 
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
@@ -786,12 +789,12 @@ static void ggml_backend_metal_device_event_free(ggml_backend_dev_t dev, ggml_ba
     delete event;
 }
 
-static void ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+static enum ggml_status ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_event_t evt = (ggml_metal_event_t)event->context;
 
-    ggml_metal_device_event_synchronize(ctx_dev, evt);
+    return ggml_metal_device_event_synchronize(ctx_dev, evt);
 }
 
 static ggml_backend_device_i ggml_backend_metal_device_i = {
@@ -868,9 +871,223 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static ggml_backend_memory_domain_id_v1 ggml_backend_metal_memory_domain(uint32_t kind) {
+    ggml_backend_memory_domain_id_v1 id = {};
+    id.kind = kind;
+    return id;
+}
+
+static uint64_t ggml_backend_metal_memory_round_page(uint64_t size) {
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    return page == 0 || size > UINT64_MAX - (page - 1) ? size : ((size + page - 1) / page) * page;
+}
+
+static enum ggml_status ggml_backend_metal_memory_get_domains(
+        ggml_backend_dev_t dev, ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count) {
+    GGML_UNUSED(dev);
+    if (inout_count == NULL) return GGML_STATUS_FAILED;
+    const uint32_t capacity = *inout_count;
+    *inout_count = 1;
+    if (domains == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < 1 || domains[0].struct_size < sizeof(domains[0])) return GGML_STATUS_FAILED;
+    ggml_backend_memory_domain_v1 domain = {};
+    domain.struct_size = sizeof(domain);
+    domain.id = ggml_backend_metal_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_UNIFIED);
+    snprintf(domain.name, sizeof(domain.name), "metal/unified-working-set");
+    domains[0] = domain;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_metal_memory_quote(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * claims,
+        uint32_t * inout_claim_count) {
+    if ((request_count && requests == NULL) || quote == NULL || quote->struct_size < sizeof(*quote) || inout_claim_count == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    uint32_t required = 0;
+    uint32_t graph_private_count = 0;
+    ggml_backend_t backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i])) return GGML_STATUS_FAILED;
+        if (requests[i].backend != NULL && !ggml_backend_is_metal(requests[i].backend)) return GGML_STATUS_FAILED;
+        if (backend != NULL && requests[i].backend != NULL && requests[i].backend != backend) return GGML_STATUS_FAILED;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE) {
+            if (requests[i].backend == NULL || requests[i].graph == NULL) return GGML_STATUS_FAILED;
+            ++graph_private_count;
+            ++required;
+        }
+        backend = backend ? backend : requests[i].backend;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER ||
+                requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT ||
+                requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER) {
+            ++required;
+        }
+    }
+    // The Metal quote depends only on immutable request shapes and buffer-type
+    // allocation-size queries. Live working-set pressure is carried by the
+    // immediately-fetched stats, not by the quote epoch.
+    const uint64_t generation = 1;
+    quote->flags = graph_private_count
+        ? GGML_BACKEND_MEMORY_QUOTE_OPAQUE_DRIVER_COSTS_REQUIRE_DOMAIN_HEADROOM
+        : 0;
+    quote->residual_flags = 0;
+    quote->residual_request_count = 0;
+    quote->provisional_requested_upper_bytes = 0;
+    quote->stats_generation = generation;
+    quote->request_fingerprint = ggml_backend_memory_request_fingerprint_v1(requests, request_count);
+    quote->quote_token = quote->request_fingerprint ^ generation;
+    const uint32_t capacity = *inout_claim_count;
+    *inout_claim_count = required;
+    if (claims == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < required) return GGML_STATUS_FAILED;
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE) {
+            // Metal does not retain an engine-visible per-graph workspace.
+            // Command-buffer and driver-internal allocations are opaque and
+            // covered by domain headroom, as declared by the quote flag.
+            ggml_backend_memory_claim_v1 claim = {};
+            claim.struct_size = sizeof(claim);
+            claim.flags = GGML_BACKEND_MEMORY_CLAIM_EXACT;
+            claim.request_id = requests[i].request_id;
+            claim.domain = ggml_backend_metal_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_UNIFIED);
+            claims[out++] = claim;
+            continue;
+        }
+        if (requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_BUFFER &&
+                requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT &&
+                requests[i].kind != GGML_BACKEND_MEMORY_REQUEST_TRANSFER) continue;
+        uint64_t committed = ggml_backend_metal_memory_round_page(requests[i].requested_bytes);
+        uint64_t before = ggml_backend_metal_memory_round_page(requests[i].currently_allocated_bytes);
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER && requests[i].buft != NULL) {
+            if (requests[i].buft->iface.get_name != ggml_backend_metal_buffer_type_private_get_name &&
+                    requests[i].buft->iface.get_name != ggml_backend_metal_buffer_type_shared_get_name &&
+                    requests[i].buft->iface.get_name != ggml_backend_metal_buffer_type_mapped_get_name) {
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_metal_buffer_type * buft_ctx =
+                (ggml_backend_metal_buffer_type *) requests[i].buft->context;
+            const bool shared = requests[i].buft->iface.get_name !=
+                ggml_backend_metal_buffer_type_private_get_name;
+            committed = ggml_metal_device_get_buffer_allocation_size(
+                ggml_metal_device_get(buft_ctx->device), requests[i].requested_bytes, shared);
+            before = ggml_metal_device_get_buffer_allocation_size(
+                ggml_metal_device_get(buft_ctx->device), requests[i].currently_allocated_bytes, shared);
+        }
+        const bool reuse = requests[i].currently_allocated_bytes >= requests[i].requested_bytes;
+        const uint64_t after = reuse ? before : committed;
+        ggml_backend_memory_claim_v1 claim = {};
+        claim.struct_size = sizeof(claim);
+        claim.flags = GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER;
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT) {
+            claim.flags |= GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED;
+            claim.domain = ggml_backend_metal_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED);
+        } else {
+            claim.domain = ggml_backend_metal_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_UNIFIED);
+        }
+        if (requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER) claim.flags |= GGML_BACKEND_MEMORY_CLAIM_TRANSIENT;
+        claim.request_id = requests[i].request_id;
+        claim.payload_requested_bytes = requests[i].requested_bytes;
+        claim.committed_before_bytes = before;
+        claim.committed_after_upper_bytes = after;
+        claim.commit_peak_extra_upper_bytes = reuse ? 0 : committed;
+        claim.resident_after_upper_bytes = after;
+        claim.retained_after_use_upper_bytes = requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_TRANSFER ? 0 : after;
+        claims[out++] = claim;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_metal_memory_reserve_private(
+        const ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        const ggml_backend_memory_quote_v1 * quote, ggml_backend_memory_claim_v1 * actual,
+        uint32_t * inout_actual_count) {
+    GGML_UNUSED(actual);
+    if ((request_count && requests == NULL) || quote == NULL || inout_actual_count == NULL ||
+            quote->request_fingerprint != ggml_backend_memory_request_fingerprint_v1(requests, request_count)) return GGML_STATUS_FAILED;
+    *inout_actual_count = 0;
+    ggml_backend_t backend = NULL;
+    for (uint32_t i = 0; i < request_count; ++i) {
+        if (requests[i].struct_size < sizeof(requests[i]) ||
+                (requests[i].backend != NULL && !ggml_backend_is_metal(requests[i].backend))) return GGML_STATUS_FAILED;
+        if (backend != NULL && requests[i].backend != NULL && requests[i].backend != backend) return GGML_STATUS_FAILED;
+        backend = backend ? backend : requests[i].backend;
+        if (requests[i].backend != NULL && ggml_metal_is_quarantined((ggml_metal_t) requests[i].backend->context)) {
+            return GGML_STATUS_BACKEND_POISONED;
+        }
+    }
+    if (backend != NULL) {
+        const uint64_t generation = 1;
+        if (generation != quote->stats_generation || quote->quote_token != (quote->request_fingerprint ^ generation)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+    // ABI v1 exposes no engine-visible Metal graph-private allocation. This
+    // validation-only hook is failure-atomic; opaque driver costs remain under
+    // the domain-headroom contract declared by the quote.
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_metal_memory_get_stats(
+        ggml_backend_dev_t dev, ggml_backend_t backend,
+        ggml_backend_memory_stats_v1 * stats, uint32_t * inout_count) {
+    if (dev == NULL || inout_count == NULL) return GGML_STATUS_FAILED;
+    const uint32_t capacity = *inout_count;
+    *inout_count = 1;
+    if (stats == NULL) return GGML_STATUS_SUCCESS;
+    if (capacity < 1 || stats[0].struct_size < sizeof(stats[0])) return GGML_STATUS_FAILED;
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+    ggml_backend_memory_stats_v1 value = {};
+    value.struct_size = sizeof(value);
+    value.domain = ggml_backend_metal_memory_domain(GGML_BACKEND_MEMORY_DOMAIN_UNIFIED);
+    value.total_bytes = total_bytes;
+    value.budget_bytes = total_bytes;
+    value.device_free_bytes = std::min(free_bytes, total_bytes);
+    value.device_used_bytes = total_bytes - value.device_free_bytes;
+    value.generation = 1;
+    value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
+    value.health = backend != NULL && ggml_metal_is_quarantined((ggml_metal_t) backend->context)
+        ? GGML_BACKEND_MEMORY_QUARANTINED : GGML_BACKEND_MEMORY_HEALTHY;
+    stats[0] = value;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_metal_memory_trim(ggml_backend_t backend, uint64_t flags) {
+    GGML_UNUSED(flags);
+    return backend == NULL ? GGML_STATUS_FAILED : ggml_backend_metal_synchronize(backend);
+}
+
+static enum ggml_status ggml_backend_metal_memory_quarantine(
+        ggml_backend_t backend, const ggml_backend_memory_quarantine_v1 * request) {
+    if (backend == NULL || request == NULL || request->struct_size < sizeof(*request)) return GGML_STATUS_FAILED;
+    ggml_metal_quarantine((ggml_metal_t) backend->context);
+    return GGML_STATUS_SUCCESS;
+}
+
+static const ggml_backend_memory_api_v1 * ggml_backend_metal_memory_get_api_v1(void) {
+    static const ggml_backend_memory_api_v1 api = {
+        sizeof(ggml_backend_memory_api_v1), GGML_BACKEND_MEMORY_ABI_V1, 0,
+        ggml_backend_metal_memory_get_domains,
+        ggml_backend_metal_memory_quote,
+        ggml_backend_metal_memory_reserve_private,
+        ggml_backend_metal_memory_get_stats,
+        ggml_backend_metal_memory_trim,
+        ggml_backend_metal_memory_quarantine,
+    };
+    return &api;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_metal_set_abort_callback;
+    }
+    if (strcmp(name, GGML_BACKEND_MEMORY_API_V1_PROC) == 0) {
+        return (void *) ggml_backend_metal_memory_get_api_v1;
     }
 
     return NULL;

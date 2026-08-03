@@ -20,12 +20,120 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <new>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+static uint64_t ggml_backend_memory_hash_u64_v1(uint64_t hash, uint64_t value) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+        hash ^= (uint8_t) (value >> (byte * 8));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t ggml_backend_memory_request_fingerprint_v1(
+        const ggml_backend_memory_request_v1 * requests,
+        uint32_t request_count) {
+    if (request_count > 0 && requests == NULL) {
+        return 0;
+    }
+
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = ggml_backend_memory_hash_u64_v1(hash, GGML_BACKEND_MEMORY_ABI_V1);
+    hash = ggml_backend_memory_hash_u64_v1(hash, request_count);
+    for (uint32_t index = 0; index < request_count; ++index) {
+        const ggml_backend_memory_request_v1 & request = requests[index];
+        const uint64_t values[] = {
+            index,
+            request.kind,
+            request.flags,
+            request.usage,
+            request.request_id,
+            (uint64_t) (uintptr_t) request.backend,
+            (uint64_t) (uintptr_t) request.peer_backend,
+            (uint64_t) (uintptr_t) request.buft,
+            (uint64_t) (uintptr_t) request.graph,
+            (uint64_t) (uintptr_t) request.host_ptr,
+            request.requested_bytes,
+            request.currently_allocated_bytes,
+            request.max_tensor_bytes,
+        };
+        for (uint64_t value : values) {
+            hash = ggml_backend_memory_hash_u64_v1(hash, value);
+        }
+    }
+    return hash;
+}
+
+static int ggml_backend_memory_hex_nibble_v1(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static bool ggml_backend_memory_parse_hex_byte_v1(
+        const char * text,
+        size_t digits,
+        uint32_t * value) {
+    uint32_t parsed = 0;
+    for (size_t index = 0; index < digits; ++index) {
+        const int nibble = ggml_backend_memory_hex_nibble_v1(text[index]);
+        if (nibble < 0) {
+            return false;
+        }
+        parsed = (parsed << 4) | (uint32_t) nibble;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool ggml_backend_memory_encode_pci_bdf_v1(
+        const char * pci_bus_id,
+        uint8_t physical_device_uuid[16]) {
+    if (physical_device_uuid == NULL) {
+        return false;
+    }
+    memset(physical_device_uuid, 0, 16);
+    if (pci_bus_id == NULL || strlen(pci_bus_id) != 12 ||
+            pci_bus_id[4] != ':' || pci_bus_id[7] != ':' || pci_bus_id[10] != '.') {
+        return false;
+    }
+
+    uint32_t domain = 0;
+    uint32_t bus = 0;
+    uint32_t device = 0;
+    uint32_t function = 0;
+    if (!ggml_backend_memory_parse_hex_byte_v1(pci_bus_id, 4, &domain) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 5, 2, &bus) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 8, 2, &device) ||
+            !ggml_backend_memory_parse_hex_byte_v1(pci_bus_id + 11, 1, &function) ||
+            device > 0x1f || function > 0x07) {
+        return false;
+    }
+
+    physical_device_uuid[0] = 'P';
+    physical_device_uuid[1] = 'C';
+    physical_device_uuid[2] = 'I';
+    physical_device_uuid[3] = 1;
+    physical_device_uuid[4] = (uint8_t) (domain >> 8);
+    physical_device_uuid[5] = (uint8_t) domain;
+    physical_device_uuid[6] = (uint8_t) bus;
+    physical_device_uuid[7] = (uint8_t) device;
+    physical_device_uuid[8] = (uint8_t) function;
+    return true;
+}
 
 
 // backend buffer type
@@ -251,148 +359,111 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
 
-void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    GGML_ASSERT(backend);
-    GGML_ASSERT(tensor);
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+static enum ggml_status ggml_backend_status_prefer(
+        enum ggml_status first, enum ggml_status second) {
+    if (first == GGML_STATUS_DEVICE_LOST || second == GGML_STATUS_DEVICE_LOST) return GGML_STATUS_DEVICE_LOST;
+    if (first == GGML_STATUS_BACKEND_POISONED || second == GGML_STATUS_BACKEND_POISONED) return GGML_STATUS_BACKEND_POISONED;
+    if (first == GGML_STATUS_EXECUTION_FAILED || second == GGML_STATUS_EXECUTION_FAILED) return GGML_STATUS_EXECUTION_FAILED;
+    if (first == GGML_STATUS_ABORTED || second == GGML_STATUS_ABORTED) return GGML_STATUS_ABORTED;
+    return first != GGML_STATUS_SUCCESS ? first : second;
+}
+
+enum ggml_status ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(backend && tensor && tensor->data != NULL);
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
-
-    if (backend->iface.set_tensor_async == NULL) {
-        ggml_backend_synchronize(backend);
-        ggml_backend_tensor_set(tensor, data, offset, size);
-    } else {
-        backend->iface.set_tensor_async(backend, tensor, data, offset, size);
-    }
+    if (backend->iface.set_tensor_async != NULL) return backend->iface.set_tensor_async(backend, tensor, data, offset, size);
+    const enum ggml_status status = ggml_backend_synchronize(backend);
+    return status == GGML_STATUS_SUCCESS ? ggml_backend_tensor_set(tensor, data, offset, size) : status;
 }
 
-void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    GGML_ASSERT(backend);
-    GGML_ASSERT(tensor);
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+enum ggml_status ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_ASSERT(backend && tensor && tensor->data != NULL);
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
-
-    if (backend->iface.get_tensor_async == NULL) {
-        ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(tensor, data, offset, size);
-    } else {
-        backend->iface.get_tensor_async(backend, tensor, data, offset, size);
-    }
+    if (backend->iface.get_tensor_async != NULL) return backend->iface.get_tensor_async(backend, tensor, data, offset, size);
+    const enum ggml_status status = ggml_backend_synchronize(backend);
+    return status == GGML_STATUS_SUCCESS ? ggml_backend_tensor_get(tensor, data, offset, size) : status;
 }
 
-void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
-            size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    GGML_ASSERT(backend);
-    GGML_ASSERT(tensor);
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-
+enum ggml_status ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    GGML_ASSERT(backend && tensor && tensor->data != NULL);
     if (n_copies <= 1 || backend->iface.set_tensor_2d_async == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
-            ggml_backend_tensor_set_async(backend, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+            const enum ggml_status status = ggml_backend_tensor_set_async(backend, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+            if (status != GGML_STATUS_SUCCESS) return status;
         }
-        return;
+        return GGML_STATUS_SUCCESS;
     }
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
-    backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    return backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
-void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
-            size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    GGML_ASSERT(backend);
-    GGML_ASSERT(tensor);
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-
+enum ggml_status ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    GGML_ASSERT(backend && tensor && tensor->data != NULL);
     if (n_copies <= 1 || backend->iface.get_tensor_2d_async == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
-            ggml_backend_tensor_get_async(backend, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
+            const enum ggml_status status = ggml_backend_tensor_get_async(backend, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
+            if (status != GGML_STATUS_SUCCESS) return status;
         }
-        return;
+        return GGML_STATUS_SUCCESS;
     }
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
-    backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    return backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
-void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+enum ggml_status ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    GGML_ASSERT(buf != NULL && "tensor buffer not set");
-
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    GGML_ASSERT(buf != NULL && tensor->data != NULL);
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
-
     buf->iface.set_tensor(buf, tensor, data, offset, size);
+    return GGML_STATUS_SUCCESS;
 }
 
-void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+enum ggml_status ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    GGML_ASSERT(buf != NULL && "tensor buffer not set");
-
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    GGML_ASSERT(buf != NULL && tensor->data != NULL);
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
-
     buf->iface.get_tensor(buf, tensor, data, offset, size);
+    return GGML_STATUS_SUCCESS;
 }
 
-void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
-            size_t n_copies, size_t stride_tensor, size_t stride_data) {
+enum ggml_status ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    GGML_ASSERT(buf != NULL && "tensor buffer not set");
-
+    GGML_ASSERT(buf != NULL && tensor->data != NULL);
     if (n_copies <= 1 || buf->iface.set_tensor_2d == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
-            ggml_backend_tensor_set(tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+            const enum ggml_status status = ggml_backend_tensor_set(tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+            if (status != GGML_STATUS_SUCCESS) return status;
         }
-        return;
+        return GGML_STATUS_SUCCESS;
     }
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
-
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    return GGML_STATUS_SUCCESS;
 }
 
-void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
-            size_t n_copies, size_t stride_tensor, size_t stride_data) {
+enum ggml_status ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    GGML_ASSERT(buf != NULL && "tensor buffer not set");
-
+    GGML_ASSERT(buf != NULL && tensor->data != NULL);
     if (n_copies <= 1 || buf->iface.get_tensor_2d == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
-            ggml_backend_tensor_get(tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
+            const enum ggml_status status = ggml_backend_tensor_get(tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
+            if (status != GGML_STATUS_SUCCESS) return status;
         }
-        return;
+        return GGML_STATUS_SUCCESS;
     }
-    if (size == 0) {
-        return;
-    }
-
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (size == 0) return GGML_STATUS_SUCCESS;
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
-
     buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    return GGML_STATUS_SUCCESS;
 }
 
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
@@ -411,13 +482,20 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
-void ggml_backend_synchronize(ggml_backend_t backend) {
+static enum ggml_status ggml_backend_terminal_status(
+        enum ggml_status submitted, enum ggml_status completed) {
+    // Completion errors describe the operation that actually reached a terminal
+    // state and must not be hidden by a concurrent cancellation or submit error.
+    return completed == GGML_STATUS_SUCCESS ? submitted : completed;
+}
+
+enum ggml_status ggml_backend_synchronize(ggml_backend_t backend) {
     GGML_ASSERT(backend);
     if (backend->iface.synchronize == NULL) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
-    backend->iface.synchronize(backend);
+    return backend->iface.synchronize(backend);
 }
 
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -438,17 +516,80 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.graph_plan_compute != NULL);
 
-    return backend->iface.graph_plan_compute(backend, plan);
+    enum ggml_status submitted = backend->iface.graph_plan_compute(backend, plan);
+    return ggml_backend_terminal_status(submitted, ggml_backend_synchronize(backend));
 }
 
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
-    ggml_backend_synchronize(backend);
-    return err;
+    enum ggml_status submitted = ggml_backend_graph_compute_async(backend, cgraph);
+    return ggml_backend_terminal_status(submitted, ggml_backend_synchronize(backend));
+}
+
+static ggml_backend_set_abort_callback_t ggml_backend_native_abort_callback(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
+    if (reg == NULL) {
+        return NULL;
+    }
+    return (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_set_abort_callback");
+}
+
+enum ggml_status ggml_backend_graph_compute_with_abort(
+        ggml_backend_t backend, struct ggml_cgraph * cgraph,
+        ggml_abort_callback abort_callback, void * abort_callback_data,
+        enum ggml_backend_graph_cancel_mode * cancel_mode) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(cgraph);
+    GGML_ASSERT(cancel_mode);
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    if (abort_callback == NULL) {
+        return ggml_backend_graph_compute(backend, cgraph);
+    }
+
+    ggml_backend_set_abort_callback_t native = ggml_backend_native_abort_callback(backend);
+    *cancel_mode = native != NULL
+        ? GGML_BACKEND_GRAPH_CANCEL_NATIVE
+        : GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+
+    // A pre-start cancellation still honors the synchronous return contract:
+    // no work previously queued on this backend remains in flight.
+    if (abort_callback(abort_callback_data)) {
+        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_synchronize(backend));
+    }
+
+    if (native != NULL) {
+        native(backend, abort_callback, abort_callback_data);
+        enum ggml_status status = ggml_backend_graph_compute(backend, cgraph);
+        native(backend, NULL, NULL);
+        return status;
+    }
+
+    // A backend without a native abort hook still receives a real, typed
+    // mid-graph cancellation contract. Graph views are already the scheduler's
+    // portable unit of partial execution; synchronizing each bounded view makes
+    // it safe to stop without leaving queued work that can touch reused buffers.
+    // The callback-free path remains exactly the backend's original async path.
+    for (int i = 0; i < cgraph->n_nodes; i += GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES) {
+        const int i_end = std::min(i + GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES, cgraph->n_nodes);
+        struct ggml_cgraph view = ggml_graph_view(cgraph, i, i_end);
+        enum ggml_status submitted = backend->iface.graph_compute(backend, &view);
+        enum ggml_status completed = ggml_backend_synchronize(backend);
+        enum ggml_status status = ggml_backend_terminal_status(submitted, completed);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        if (abort_callback(abort_callback_data)) {
+            return GGML_STATUS_ABORTED;
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+
     return backend->iface.graph_compute(backend, cgraph);
 }
 
@@ -474,48 +615,33 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 
 // backend copy
 
-void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+enum ggml_status ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
-
-    if (src == dst) {
-        return;
-    }
-
-    if (ggml_backend_buffer_is_host(src->buffer)) {
-        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
-        ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
-    } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
+    if (src == dst) return GGML_STATUS_SUCCESS;
+    if (ggml_backend_buffer_is_host(src->buffer)) return ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+    if (ggml_backend_buffer_is_host(dst->buffer)) return ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
+    if (ggml_backend_buffer_copy_tensor(src, dst)) return GGML_STATUS_SUCCESS;
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
-#endif // NDEBUG
-        size_t nbytes = ggml_nbytes(src);
-        void * data = malloc(nbytes);
-        ggml_backend_tensor_get(src, data, 0, nbytes);
-        ggml_backend_tensor_set(dst, data, 0, nbytes);
-        free(data);
-    }
+    GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
+#endif
+    const size_t nbytes = ggml_nbytes(src);
+    void * data = malloc(nbytes);
+    if (data == NULL) return GGML_STATUS_ALLOC_FAILED;
+    const enum ggml_status get_status = ggml_backend_tensor_get(src, data, 0, nbytes);
+    const enum ggml_status set_status = get_status == GGML_STATUS_SUCCESS ? ggml_backend_tensor_set(dst, data, 0, nbytes) : GGML_STATUS_SUCCESS;
+    free(data);
+    return ggml_backend_status_prefer(get_status, set_status);
 }
 
-void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+enum ggml_status ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
-
-    if (src == dst) {
-        return;
-    }
-
-    GGML_ASSERT(backend_dst);
-    if (backend_dst->iface.cpy_tensor_async != NULL) {
-        if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
-            return;
-        }
-    }
-
-    // an async copy would normally happen after all the queued operations on both backends are completed
-    // to simulate the same behavior, we need to synchronize both backends first, and do a blocking copy
-    ggml_backend_synchronize(backend_src);
-    ggml_backend_synchronize(backend_dst);
-    ggml_backend_tensor_copy(src, dst);
+    GGML_ASSERT(backend_src && backend_dst);
+    if (src == dst) return GGML_STATUS_SUCCESS;
+    if (backend_dst->iface.cpy_tensor_async != NULL) return backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst);
+    const enum ggml_status src_status = ggml_backend_synchronize(backend_src);
+    const enum ggml_status dst_status = ggml_backend_synchronize(backend_dst);
+    const enum ggml_status status = ggml_backend_status_prefer(src_status, dst_status);
+    return status == GGML_STATUS_SUCCESS ? ggml_backend_tensor_copy(src, dst) : status;
 }
 
 // events
@@ -535,25 +661,27 @@ void ggml_backend_event_free(ggml_backend_event_t event) {
     event->device->iface.event_free(event->device, event);
 }
 
-void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend) {
+enum ggml_status ggml_backend_event_record_status(ggml_backend_event_t event, ggml_backend_t backend) {
     GGML_ASSERT(backend);
-    GGML_ASSERT(backend->iface.event_record != NULL);
-
-    backend->iface.event_record(backend, event);
+    if (backend->iface.event_record_status == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    return backend->iface.event_record_status(backend, event);
 }
 
-void ggml_backend_event_synchronize(ggml_backend_event_t event) {
+enum ggml_status ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event);
     GGML_ASSERT(event->device->iface.event_synchronize);
 
-    event->device->iface.event_synchronize(event->device, event);
+    return event->device->iface.event_synchronize(event->device, event);
 }
 
-void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+enum ggml_status ggml_backend_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
-    GGML_ASSERT(backend->iface.event_wait != NULL);
-
-    backend->iface.event_wait(backend, event);
+    if (backend->iface.event_wait_status == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    return backend->iface.event_wait_status(backend, event);
 }
 
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -771,9 +899,21 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_memory_plan {
+    ggml_backend_sched_t sched;
+    struct ggml_cgraph * source_graph;
+    std::vector<ggml_backend_memory_request_v1> items;
+    uint64_t fingerprint;
+    uint64_t source_graph_fingerprint;
+    int previous_cur_copy;
+    bool committed;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool memory_plan_active;
+    ggml_backend_sched_memory_plan * active_memory_plan;
 
     int n_backends;
 
@@ -1538,7 +1678,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(
+        ggml_backend_sched_t sched, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1546,31 +1687,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    const auto abort_requested = [&]() {
+        return abort_callback != NULL && abort_callback(abort_callback_data);
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        // A scheduler split may first wait for or copy inputs owned by another
+        // backend. Poll at every scheduler-controlled boundary so cancellation
+        // cannot silently traverse the rest of the transfer phase. An already
+        // entered backend wait/copy remains indivisible; the public synchronous
+        // wrapper drains every backend before returning ABORTED.
+        if (abort_requested()) {
+            return GGML_STATUS_ABORTED;
+        }
+
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (abort_requested()) {
+                return GGML_STATUS_ABORTED;
+            }
+
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                enum ggml_status boundary_status;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    boundary_status = ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    boundary_status = ggml_backend_synchronize(split_backend);
+                }
+                if (boundary_status != GGML_STATUS_SUCCESS) {
+                    return boundary_status;
+                }
+                if (abort_requested()) {
+                    return GGML_STATUS_ABORTED;
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                enum ggml_status boundary_status;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    boundary_status = ggml_backend_event_wait_status(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    boundary_status = ggml_backend_synchronize(split_backend);
+                }
+                if (boundary_status != GGML_STATUS_SUCCESS) {
+                    return boundary_status;
+                }
+                if (abort_requested()) {
+                    return GGML_STATUS_ABORTED;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1585,7 +1757,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    ggml_backend_synchronize(input_backend);
+                    enum ggml_status input_status = ggml_backend_synchronize(input_backend);
+                    if (input_status != GGML_STATUS_SUCCESS) {
+                        return input_status;
+                    }
+                    if (abort_requested()) {
+                        return GGML_STATUS_ABORTED;
+                    }
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1603,8 +1781,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        enum ggml_status ids_status = ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        if (ids_status == GGML_STATUS_SUCCESS) ids_status = ggml_backend_synchronize(ids_backend);
+                        if (ids_status != GGML_STATUS_SUCCESS) {
+                            return ids_status;
+                        }
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1622,17 +1806,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (abort_requested()) {
+                            return false;
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
+                        const enum ggml_status copy_status = ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        return copy_status == GGML_STATUS_SUCCESS && !abort_requested();
                     };
 
                     int id = 0;
@@ -1652,30 +1840,66 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             continue;
                         }
 
-                        copy_experts(first_id, last_id);
+                        if (!copy_experts(first_id, last_id)) {
+                            return GGML_STATUS_ABORTED;
+                        }
 
                         first_id = id;
                         last_id = id;
                     }
-                    copy_experts(first_id, last_id);
+                    if (!copy_experts(first_id, last_id)) {
+                        return GGML_STATUS_ABORTED;
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
+                    const enum ggml_status async_copy_status = split_backend->iface.cpy_tensor_async != NULL
+                        ? split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)
+                        : GGML_STATUS_FAILED;
+                    if (async_copy_status != GGML_STATUS_SUCCESS) {
+                        enum ggml_status copy_source_status = ggml_backend_synchronize(input_backend);
+                        if (copy_source_status != GGML_STATUS_SUCCESS) {
+                            return copy_source_status;
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
+                        enum ggml_status copy_destination_status;
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            copy_destination_status = ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        } else {
+                            copy_destination_status = ggml_backend_synchronize(split_backend);
+                        }
+                        if (copy_destination_status != GGML_STATUS_SUCCESS) {
+                            return copy_destination_status;
+                        }
+                        if (abort_requested()) {
+                            return GGML_STATUS_ABORTED;
+                        }
+                        const enum ggml_status copy_status = ggml_backend_tensor_copy(input, input_cpy);
+                        if (copy_status != GGML_STATUS_SUCCESS) return copy_status;
                     }
                 }
             }
+
+            if (abort_requested()) {
+                return GGML_STATUS_ABORTED;
+            }
+        }
+
+        if (abort_requested()) {
+            return GGML_STATUS_ABORTED;
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec;
+            if (abort_callback == NULL) {
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            } else {
+                enum ggml_backend_graph_cancel_mode unused_mode;
+                ec = ggml_backend_graph_compute_with_abort(
+                    split_backend, &split->graph, abort_callback, abort_callback_data, &unused_mode);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1697,13 +1921,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec;
+                if (abort_callback == NULL) {
+                    ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                } else {
+                    enum ggml_backend_graph_cancel_mode unused_mode;
+                    ec = ggml_backend_graph_compute_with_abort(
+                        split_backend, &gv, abort_callback, abort_callback_data, &unused_mode);
+                }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                // Callback consumers observe materialized tensor data, so this
+                // completion is a terminal boundary rather than a best-effort wait.
+                enum ggml_status completed = ggml_backend_synchronize(split_backend);
+                if (completed != GGML_STATUS_SUCCESS) {
+                    return completed;
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -1716,7 +1951,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+                enum ggml_status event_status = ggml_backend_event_record_status(
+                    sched->events[split_backend_id][sched->cur_copy], split_backend);
+                if (event_status != GGML_STATUS_SUCCESS) {
+                    return event_status;
+                }
             }
         }
     }
@@ -1797,6 +2036,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->active_memory_plan != NULL) {
+        // The plan may outlive an accidentally-early scheduler free. Detach it
+        // so later commit/free is a clean failure rather than a use-after-free.
+        sched->active_memory_plan->sched = NULL;
+        sched->active_memory_plan = NULL;
+        sched->memory_plan_active = false;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -1820,6 +2066,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        GGML_LOG_ERROR("%s: scheduler is owned by an uncommitted memory plan\n", __func__);
+        return;
+    }
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1861,8 +2111,209 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
+static uint64_t ggml_backend_sched_memory_hash_u64(uint64_t hash, uint64_t value) {
+    // FNV-1a is not a security boundary; it is a stable audit guard against a
+    // quote being committed for a different scheduler plan.
+    for (unsigned i = 0; i < 8; ++i) {
+        hash ^= (uint8_t) (value >> (i * 8));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t ggml_backend_sched_memory_graph_fingerprint(const struct ggml_cgraph * graph) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) graph->n_nodes);
+    hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) graph->n_leafs);
+    const auto hash_tensor = [&hash](const struct ggml_tensor * tensor) {
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->type);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->op);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->data);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->view_src);
+        hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->view_offs);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->ne[d]);
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uint64_t) tensor->nb[d]);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            hash = ggml_backend_sched_memory_hash_u64(hash, (uintptr_t) tensor->src[s]);
+        }
+    };
+    for (int i = 0; i < graph->n_leafs; ++i) hash_tensor(graph->leafs[i]);
+    for (int i = 0; i < graph->n_nodes; ++i) hash_tensor(graph->nodes[i]);
+    return hash;
+}
+
+enum ggml_status ggml_backend_sched_memory_plan_create_v1(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_backend_sched_memory_plan_t * out_plan) {
+    if (sched == NULL || graph == NULL || out_plan == NULL || sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
+    *out_plan = NULL;
+    if ((int) sched->hash_set.size < graph->n_nodes + graph->n_leafs) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_sched_reset(sched);
+    const enum ggml_status synchronized = ggml_backend_sched_synchronize(sched);
+    if (synchronized != GGML_STATUS_SUCCESS) {
+        return synchronized;
+    }
+
+    ggml_backend_sched_memory_plan * plan = new (std::nothrow) ggml_backend_sched_memory_plan();
+    if (plan == NULL) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    plan->sched = sched;
+    plan->source_graph = graph;
+    plan->source_graph_fingerprint = ggml_backend_sched_memory_graph_fingerprint(graph);
+    plan->previous_cur_copy = sched->cur_copy;
+    plan->committed = false;
+    sched->cur_copy = sched->next_copy;
+
+    ggml_backend_sched_split_graph(sched, graph);
+    if (!ggml_gallocr_measure_n_v1(
+                sched->galloc, &sched->graph,
+                sched->node_backend_ids, sched->leaf_backend_ids)) {
+        sched->cur_copy = plan->previous_cur_copy;
+        ggml_backend_sched_reset(sched);
+        delete plan;
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    try {
+        uint64_t request_id = 1;
+        const uint32_t n_chunks = ggml_gallocr_measure_get_chunk_count_v1(sched->galloc);
+        plan->items.reserve((size_t) n_chunks + (size_t) sched->n_splits * 2);
+        for (uint32_t i = 0; i < n_chunks; ++i) {
+            ggml_backend_buffer_type_t buft = NULL;
+            uint64_t requested = 0;
+            uint64_t current = 0;
+            if (!ggml_gallocr_measure_get_chunk_v1(sched->galloc, i, &buft, &requested, &current)) {
+                sched->cur_copy = plan->previous_cur_copy;
+                ggml_backend_sched_reset(sched);
+                delete plan;
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_t backend = NULL;
+            for (int b = 0; b < sched->n_backends; ++b) {
+                if (sched->bufts[b] == buft) {
+                    backend = sched->backends[b];
+                    break;
+                }
+            }
+            if (backend == NULL) {
+                sched->cur_copy = plan->previous_cur_copy;
+                ggml_backend_sched_reset(sched);
+                delete plan;
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_memory_request_v1 item = {};
+            item.struct_size = sizeof(item);
+            item.kind = GGML_BACKEND_MEMORY_REQUEST_BUFFER;
+            item.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+            item.request_id = request_id++;
+            item.backend = backend;
+            item.buft = buft;
+            item.requested_bytes = requested;
+            item.currently_allocated_bytes = current;
+            plan->items.push_back(item);
+        }
+
+        for (int i = 0; i < sched->n_splits; ++i) {
+            ggml_backend_sched_split * split = &sched->splits[i];
+            ggml_backend_memory_request_v1 graph_item = {};
+            graph_item.struct_size = sizeof(graph_item);
+            graph_item.kind = GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE;
+            graph_item.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+            graph_item.request_id = request_id++;
+            graph_item.backend = sched->backends[split->backend_id];
+            graph_item.graph = &split->graph;
+            plan->items.push_back(graph_item);
+
+            for (int j = 0; j < split->n_inputs; ++j) {
+                ggml_backend_memory_request_v1 transfer = {};
+                transfer.struct_size = sizeof(transfer);
+                transfer.kind = GGML_BACKEND_MEMORY_REQUEST_TRANSFER;
+                transfer.usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+                transfer.request_id = request_id++;
+                transfer.backend = graph_item.backend;
+                transfer.peer_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
+                transfer.requested_bytes = ggml_nbytes(split->inputs[j]);
+                plan->items.push_back(transfer);
+            }
+        }
+
+        plan->fingerprint = ggml_backend_memory_request_fingerprint_v1(
+            plan->items.data(), (uint32_t) plan->items.size());
+    } catch (const std::bad_alloc &) {
+        sched->cur_copy = plan->previous_cur_copy;
+        ggml_backend_sched_reset(sched);
+        delete plan;
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    sched->memory_plan_active = true;
+    sched->active_memory_plan = plan;
+    *out_plan = plan;
+    return GGML_STATUS_SUCCESS;
+}
+
+uint32_t ggml_backend_sched_memory_plan_get_item_count_v1(ggml_backend_sched_memory_plan_t plan) {
+    return plan == NULL ? 0 : (uint32_t) plan->items.size();
+}
+
+bool ggml_backend_sched_memory_plan_get_item_v1(
+        ggml_backend_sched_memory_plan_t plan, uint32_t index,
+        struct ggml_backend_memory_request_v1 * out_item) {
+    if (plan == NULL || out_item == NULL || out_item->struct_size < sizeof(*out_item) || index >= plan->items.size()) {
+        return false;
+    }
+    *out_item = plan->items[index];
+    return true;
+}
+
+enum ggml_status ggml_backend_sched_memory_plan_commit_v1(ggml_backend_sched_memory_plan_t plan) {
+    if (plan == NULL || plan->committed || plan->sched == NULL || !plan->sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
+    if (ggml_backend_sched_memory_graph_fingerprint(plan->source_graph) != plan->source_graph_fingerprint) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_sched_t sched = plan->sched;
+    if (!ggml_gallocr_measure_commit_v1(sched->galloc)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    sched->is_alloc = true;
+    sched->next_copy = (sched->cur_copy + 1) % sched->n_copies;
+    sched->memory_plan_active = false;
+    sched->active_memory_plan = NULL;
+    plan->committed = true;
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_sched_memory_plan_free_v1(ggml_backend_sched_memory_plan_t plan) {
+    if (plan == NULL) {
+        return;
+    }
+    if (!plan->committed && plan->sched != NULL) {
+        plan->sched->cur_copy = plan->previous_cur_copy;
+        plan->sched->memory_plan_active = false;
+        plan->sched->active_memory_plan = NULL;
+        ggml_backend_sched_reset(plan->sched);
+    }
+    delete plan;
+}
+
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
@@ -1881,13 +2332,15 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
-    ggml_backend_sched_synchronize(sched);
-    return err;
+    enum ggml_status submitted = ggml_backend_sched_graph_compute_async(sched, graph);
+    return ggml_backend_terminal_status(submitted, ggml_backend_sched_synchronize(sched));
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->memory_plan_active) {
+        return GGML_STATUS_FAILED;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -1898,13 +2351,55 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    return ggml_backend_sched_compute_splits(sched, NULL, NULL);
 }
 
-void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+enum ggml_status ggml_backend_sched_graph_compute_with_abort(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_abort_callback abort_callback, void * abort_callback_data,
+        enum ggml_backend_graph_cancel_mode * cancel_mode) {
     GGML_ASSERT(sched);
+    GGML_ASSERT(graph);
+    GGML_ASSERT(cancel_mode);
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    if (abort_callback == NULL) {
+        return ggml_backend_sched_graph_compute(sched, graph);
+    }
+
+    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (ggml_backend_native_abort_callback(sched->backends[i]) == NULL) {
+            *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+        }
+    }
+
+    // Avoid graph splitting/allocation and its possible backend synchronization
+    // when the request was already cancelled before this compute began.
+    if (abort_callback(abort_callback_data)) {
+        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
+    }
+
+    if (!sched->is_reset && !sched->is_alloc) {
+        ggml_backend_sched_reset(sched);
+    }
+    if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    if (abort_callback(abort_callback_data)) {
+        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
+    }
+
+    enum ggml_status submitted = ggml_backend_sched_compute_splits(sched, abort_callback, abort_callback_data);
+    return ggml_backend_terminal_status(submitted, ggml_backend_sched_synchronize(sched));
+}
+
+enum ggml_status ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    enum ggml_status status = GGML_STATUS_SUCCESS;
     for (int i = 0; i < sched->n_backends; i++) {
-        ggml_backend_synchronize(sched->backends[i]);
+        status = ggml_backend_terminal_status(status, ggml_backend_synchronize(sched->backends[i]));
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -1912,6 +2407,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+    return status;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

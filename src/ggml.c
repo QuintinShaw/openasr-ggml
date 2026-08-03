@@ -311,8 +311,15 @@ void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
 }
 
 void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
     (void) user_data;
+#ifndef OPENASR_GGML_DEBUG
+    if (level == GGML_LOG_LEVEL_DEBUG) {
+        const char * ggml_debug = getenv("GGML_DEBUG");
+        if (ggml_debug == NULL || ggml_debug[0] == '\0' || ggml_debug[0] == '0') {
+            return;
+        }
+    }
+#endif
     fputs(text, stderr);
     fflush(stderr);
 }
@@ -438,8 +445,11 @@ const char * ggml_status_to_string(enum ggml_status status) {
     switch (status) {
         case GGML_STATUS_ALLOC_FAILED: return "GGML status: error (failed to allocate memory)";
         case GGML_STATUS_FAILED:       return "GGML status: error (operation failed)";
-        case GGML_STATUS_SUCCESS:      return "GGML status: success";
-        case GGML_STATUS_ABORTED:      return "GGML status: warning (operation aborted)";
+        case GGML_STATUS_SUCCESS:          return "GGML status: success";
+        case GGML_STATUS_ABORTED:          return "GGML status: warning (operation aborted)";
+        case GGML_STATUS_EXECUTION_FAILED: return "GGML status: error (execution failed)";
+        case GGML_STATUS_DEVICE_LOST:      return "GGML status: error (device lost)";
+        case GGML_STATUS_BACKEND_POISONED: return "GGML status: error (backend poisoned)";
     }
 
     return "GGML status: unknown";
@@ -1068,6 +1078,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
+    "FLASH_ATTN_REL_POS",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1100,7 +1111,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1183,6 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
+    "flash_attn_rel_pos(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1215,7 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5477,6 +5489,80 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// ggml_flash_attn_rel_pos
+//
+// OpenASR local: CPU fused Transformer-XL relative-position attention.
+// See ggml.h for tensor layouts and the score formula.
+
+struct ggml_tensor * ggml_flash_attn_rel_pos(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_u,
+        struct ggml_tensor  * q_v,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale) {
+    GGML_ASSERT(q_u);
+    GGML_ASSERT(q_v);
+    GGML_ASSERT(k);
+    GGML_ASSERT(r);
+    GGML_ASSERT(v);
+
+    GGML_ASSERT(q_u->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_v->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type   == GGML_TYPE_F32);
+    GGML_ASSERT(r->type   == GGML_TYPE_F32);
+    GGML_ASSERT(v->type   == GGML_TYPE_F32);
+
+    // Head dim and sequence geometry.
+    GGML_ASSERT(q_u->ne[0] == k->ne[0]);
+    GGML_ASSERT(q_v->ne[0] == k->ne[0]);
+    GGML_ASSERT(q_u->ne[1] == q_v->ne[1]); // Nq
+    GGML_ASSERT(q_u->ne[2] == q_v->ne[2]); // H
+    GGML_ASSERT(q_u->ne[3] == q_v->ne[3]); // B
+    GGML_ASSERT(k->ne[1]   == v->ne[1]);   // Nk
+    GGML_ASSERT(k->ne[2]   == v->ne[2]);   // Hkv
+    GGML_ASSERT(k->ne[3]   == v->ne[3]);
+    GGML_ASSERT(r->ne[0]   == k->ne[0]);   // D
+    GGML_ASSERT(r->ne[2]   == k->ne[2]);   // Hkv
+    GGML_ASSERT(r->ne[3]   == k->ne[3]);
+    GGML_ASSERT(q_u->ne[3] == k->ne[3]);   // B
+
+    // GQA broadcast: H % Hkv == 0
+    GGML_ASSERT(q_u->ne[2] % k->ne[2] == 0);
+
+    // Relative table covers offsets in [-(Nq-1), +(Nk-1)].
+    const int64_t nq = q_u->ne[1];
+    const int64_t nk = k->ne[1];
+    GGML_ASSERT(r->ne[1] == nq + nk - 1);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        // mask ne0 must cover keys; remaining dims broadcast over queries/heads/batch.
+        GGML_ASSERT(mask->ne[0] >= nk);
+        GGML_ASSERT(q_u->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q_u->ne[3] % mask->ne[3] == 0);
+    }
+
+    // Same output layout as ggml_flash_attn_ext: [Dv, H, Nq, B]
+    int64_t ne[4] = { v->ne[0], q_u->ne[2], q_u->ne[1], q_u->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_REL_POS;
+    result->src[0] = q_u;
+    result->src[1] = q_v;
+    result->src[2] = k;
+    result->src[3] = r;
+    result->src[4] = v;
+    result->src[5] = mask;
+
+    return result;
 }
 
 // ggml_flash_attn_back

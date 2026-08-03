@@ -233,12 +233,16 @@ struct gguf_reader {
             void * userdata,
             size_t max_chunk_read,
             uint64_t data_offset = 0,
-            uint64_t nbytes_remain = 0)
+            uint64_t nbytes_remain = 0,
+            uint64_t max_string_bytes = GGUF_MAX_STRING_LENGTH,
+            uint64_t max_array_elements = GGUF_MAX_ARRAY_ELEMENTS)
         : callback(callback),
           userdata(userdata),
           max_chunk_read(max_chunk_read),
           data_offset(data_offset),
-          nbytes_remain(nbytes_remain) {
+          nbytes_remain(nbytes_remain),
+          max_string_bytes(max_string_bytes),
+          max_array_elements(max_array_elements) {
         GGML_ASSERT(max_chunk_read > 0);
     }
 
@@ -274,7 +278,7 @@ struct gguf_reader {
 
     template <typename T>
     bool read(std::vector<T> & dst, const size_t n) const {
-        if (n > GGUF_MAX_ARRAY_ELEMENTS) {
+        if (uint64_t(n) > max_array_elements) {
             return false;
         }
         if constexpr (std::is_same<T, std::string>::value) {
@@ -342,8 +346,8 @@ struct gguf_reader {
         if (!read(size)) {
             return false;
         }
-        if (size > GGUF_MAX_STRING_LENGTH) {
-            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds maximum %" PRIu64 "\n", __func__, size, (uint64_t) GGUF_MAX_STRING_LENGTH);
+        if (size > max_string_bytes) {
+            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds maximum %" PRIu64 "\n", __func__, size, max_string_bytes);
             return false;
         }
         if (size > nbytes_remain) {
@@ -416,6 +420,8 @@ private:
     size_t max_chunk_read = 0;
     mutable uint64_t data_offset = 0;
     mutable uint64_t nbytes_remain = 0;
+    uint64_t max_string_bytes = GGUF_MAX_STRING_LENGTH;
+    uint64_t max_array_elements = GGUF_MAX_ARRAY_ELEMENTS;
 };
 
 struct gguf_context * gguf_init_empty(void) {
@@ -423,7 +429,13 @@ struct gguf_context * gguf_init_empty(void) {
 }
 
 template<typename T>
-bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct gguf_kv> & kv, const std::string & key, const bool is_array, const size_t n) {
+bool gguf_read_emplace_helper(
+        const struct gguf_reader & gr,
+        std::vector<struct gguf_kv> & kv,
+        const std::string & key,
+        const bool is_array,
+        const size_t n,
+        enum gguf_parse_error * parse_error) {
     if (is_array) {
         std::vector<T> value;
         try {
@@ -431,9 +443,15 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
                 return false;
             }
         } catch (std::length_error &) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+            }
             GGML_LOG_ERROR("%s: encountered length_error while reading value for key '%s'\n", __func__, key.c_str());
             return false;
         } catch (std::bad_alloc &) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+            }
             GGML_LOG_ERROR("%s: encountered bad_alloc error while reading value for key '%s'\n", __func__, key.c_str());
             return false;
         }
@@ -448,8 +466,20 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
     return true;
 }
 
-static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr, struct gguf_init_params params) {
-    struct gguf_context * ctx = new gguf_context;
+static struct gguf_context * gguf_init_from_reader(
+        const struct gguf_reader & gr,
+        struct gguf_init_params params,
+        const struct gguf_parse_limits * limits,
+        enum gguf_parse_error * parse_error) noexcept {
+    if (parse_error != nullptr) {
+        *parse_error = GGUF_PARSE_ERROR_NONE;
+    }
+    if (params.ctx != nullptr) {
+        *params.ctx = nullptr;
+    }
+    struct gguf_context * ctx = nullptr;
+    try {
+    ctx = new gguf_context;
 
     bool ok = true;
 
@@ -540,6 +570,51 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         return nullptr;
     }
 
+    if (limits != nullptr) {
+        if (uint64_t(n_tensors) > limits->max_tensors ||
+            uint64_t(n_kv) > limits->max_kv ||
+            gr.tell() > limits->max_header_bytes) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_INVALID_DATA;
+            }
+            GGML_LOG_ERROR(
+                "%s: bounded parser limits exceeded: tensors=%" PRIi64 "/%" PRIu64 ", kv=%" PRIi64 "/%" PRIu64 ", header=%" PRIu64 "/%" PRIu64 "\n",
+                __func__, n_tensors, limits->max_tensors, n_kv, limits->max_kv, gr.tell(), limits->max_header_bytes);
+            gguf_free(ctx);
+            return nullptr;
+        }
+        try {
+            ctx->kv.reserve(size_t(n_kv));
+            ctx->info.reserve(size_t(n_tensors));
+        } catch (const std::length_error &) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+            }
+            GGML_LOG_ERROR("%s: bounded parser vector length exceeds the platform limit\n", __func__);
+            gguf_free(ctx);
+            return nullptr;
+        } catch (const std::bad_alloc &) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+            }
+            GGML_LOG_ERROR("%s: bounded parser vector allocation failed\n", __func__);
+            gguf_free(ctx);
+            return nullptr;
+        }
+        // Exact capacity is an admission contract of the supported runtimes,
+        // not a guarantee made by the C++ standard. Fail closed on an
+        // over-reserving implementation instead of silently exceeding the
+        // declared-element storage quote.
+        if (ctx->kv.capacity() != size_t(n_kv) || ctx->info.capacity() != size_t(n_tensors)) {
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+            }
+            GGML_LOG_ERROR("%s: bounded parser vector reserve was not exact\n", __func__);
+            gguf_free(ctx);
+            return nullptr;
+        }
+    }
+
     // KV pairs
     {
         for (int64_t i = 0; ok && i < n_kv; ++i) {
@@ -551,9 +626,15 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             try {
                 ok = ok && gr.read(key);
             } catch (std::length_error &) {
+                if (parse_error != nullptr) {
+                    *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+                }
                 GGML_LOG_ERROR("%s: encountered length_error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             } catch (std::bad_alloc &) {
+                if (parse_error != nullptr) {
+                    *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+                }
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
@@ -582,24 +663,33 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             }
 
             switch (type) {
-                case GGUF_TYPE_UINT8:   ok = ok && gguf_read_emplace_helper<uint8_t>    (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_INT8:    ok = ok && gguf_read_emplace_helper<int8_t>     (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_UINT16:  ok = ok && gguf_read_emplace_helper<uint16_t>   (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_INT16:   ok = ok && gguf_read_emplace_helper<int16_t>    (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_UINT32:  ok = ok && gguf_read_emplace_helper<uint32_t>   (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_INT32:   ok = ok && gguf_read_emplace_helper<int32_t>    (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_FLOAT32: ok = ok && gguf_read_emplace_helper<float>      (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_BOOL:    ok = ok && gguf_read_emplace_helper<bool>       (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_STRING:  ok = ok && gguf_read_emplace_helper<std::string>(gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_UINT64:  ok = ok && gguf_read_emplace_helper<uint64_t>   (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_INT64:   ok = ok && gguf_read_emplace_helper<int64_t>    (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_FLOAT64: ok = ok && gguf_read_emplace_helper<double>     (gr, ctx->kv, key, is_array, n); break;
+                case GGUF_TYPE_UINT8:   ok = ok && gguf_read_emplace_helper<uint8_t>    (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_INT8:    ok = ok && gguf_read_emplace_helper<int8_t>     (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_UINT16:  ok = ok && gguf_read_emplace_helper<uint16_t>   (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_INT16:   ok = ok && gguf_read_emplace_helper<int16_t>    (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_UINT32:  ok = ok && gguf_read_emplace_helper<uint32_t>   (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_INT32:   ok = ok && gguf_read_emplace_helper<int32_t>    (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_FLOAT32: ok = ok && gguf_read_emplace_helper<float>      (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_BOOL:    ok = ok && gguf_read_emplace_helper<bool>       (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_STRING:  ok = ok && gguf_read_emplace_helper<std::string>(gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_UINT64:  ok = ok && gguf_read_emplace_helper<uint64_t>   (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_INT64:   ok = ok && gguf_read_emplace_helper<int64_t>    (gr, ctx->kv, key, is_array, n, parse_error); break;
+                case GGUF_TYPE_FLOAT64: ok = ok && gguf_read_emplace_helper<double>     (gr, ctx->kv, key, is_array, n, parse_error); break;
                 case GGUF_TYPE_ARRAY:
                 default:
                     {
                         GGML_LOG_ERROR("%s: key '%s' has invalid GGUF type %d\n", __func__, key.c_str(), type);
                         ok = false;
                     } break;
+            }
+            if (limits != nullptr && gr.tell() > limits->max_header_bytes) {
+                GGML_LOG_ERROR(
+                    "%s: bounded parser header exceeds maximum: offset=%" PRIu64 "/%" PRIu64 "\n",
+                    __func__, gr.tell(), limits->max_header_bytes);
+                if (parse_error != nullptr) {
+                    *parse_error = GGUF_PARSE_ERROR_INVALID_DATA;
+                }
+                ok = false;
             }
         }
 
@@ -611,7 +701,17 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         GGML_ASSERT(int64_t(ctx->kv.size()) == n_kv);
 
         const int alignment_idx = gguf_find_key(ctx, GGUF_KEY_GENERAL_ALIGNMENT);
-        ctx->alignment = alignment_idx == -1 ? GGUF_DEFAULT_ALIGNMENT : gguf_get_val_u32(ctx, alignment_idx);
+        if (alignment_idx == -1) {
+            ctx->alignment = GGUF_DEFAULT_ALIGNMENT;
+        } else {
+            const gguf_kv & alignment = ctx->kv[alignment_idx];
+            if (alignment.is_array || alignment.type != GGUF_TYPE_UINT32) {
+                GGML_LOG_ERROR("%s: general.alignment must be a scalar uint32\n", __func__);
+                gguf_free(ctx);
+                return nullptr;
+            }
+            ctx->alignment = alignment.get_val<uint32_t>();
+        }
 
         if (ctx->alignment == 0 || (ctx->alignment & (ctx->alignment - 1)) != 0) {
             GGML_LOG_ERROR("%s: alignment %zu is not a power of 2\n", __func__, ctx->alignment);
@@ -630,9 +730,15 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             try {
                 ok = ok && gr.read(name);
             } catch (std::length_error &) {
+                if (parse_error != nullptr) {
+                    *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+                }
                 GGML_LOG_ERROR("%s: encountered length_error while reading tensor name %" PRIi64 "\n", __func__, i);
                 ok = false;
             } catch (std::bad_alloc &) {
+                if (parse_error != nullptr) {
+                    *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+                }
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading tensor name %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
@@ -672,9 +778,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                     ok = ok && gr.read(info.t.ne[j]);
                 }
 
-                // check that all ne are non-negative
-                if (info.t.ne[j] < 0) {
-                    GGML_LOG_ERROR("%s: tensor '%s' dimension %" PRIu32 " has invalid number of elements: %" PRIi64 " < 0\n",
+                // Zero-sized GGUF tensors are invalid, and rejecting them here
+                // also keeps the overflow checks below from dividing by zero.
+                if (info.t.ne[j] <= 0) {
+                    GGML_LOG_ERROR("%s: tensor '%s' dimension %" PRIu32 " has invalid number of elements: %" PRIi64 " <= 0\n",
                         __func__, info.t.name, j, info.t.ne[j]);
                     ok = false;
                     break;
@@ -743,6 +850,15 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         ok = ok && gr.read(info.offset);
 
         ctx->info.push_back(info);
+        if (limits != nullptr && gr.tell() > limits->max_header_bytes) {
+            GGML_LOG_ERROR(
+                "%s: bounded parser header exceeds maximum: offset=%" PRIu64 "/%" PRIu64 "\n",
+                __func__, gr.tell(), limits->max_header_bytes);
+            if (parse_error != nullptr) {
+                *parse_error = GGUF_PARSE_ERROR_INVALID_DATA;
+            }
+            ok = false;
+        }
     }
 
     if (!ok) {
@@ -895,6 +1011,28 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
     }
 
     return ctx;
+    } catch (const std::length_error &) {
+        GGML_LOG_ERROR("%s: allocation length exceeded platform limits\n", __func__);
+        if (parse_error != nullptr) {
+            *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+        }
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("%s: allocation failed\n", __func__);
+        if (parse_error != nullptr) {
+            *parse_error = GGUF_PARSE_ERROR_ALLOCATION;
+        }
+    } catch (...) {
+        GGML_LOG_ERROR("%s: unexpected C++ exception while parsing GGUF\n", __func__);
+        if (parse_error != nullptr) {
+            *parse_error = GGUF_PARSE_ERROR_INVALID_DATA;
+        }
+    }
+    if (params.ctx != nullptr && *params.ctx != nullptr) {
+        ggml_free(*params.ctx);
+        *params.ctx = nullptr;
+    }
+    gguf_free(ctx);
+    return nullptr;
 }
 
 struct gguf_context * gguf_init_from_callback(gguf_reader_callback_t callback, void * userdata, size_t max_chunk_read, uint64_t max_expected_size, struct gguf_init_params params) {
@@ -903,7 +1041,7 @@ struct gguf_context * gguf_init_from_callback(gguf_reader_callback_t callback, v
     }
 
     const struct gguf_reader gr(callback, userdata, max_chunk_read == 0 ? SIZE_MAX : max_chunk_read, 0, max_expected_size);
-    return gguf_init_from_reader(gr, params);
+    return gguf_init_from_reader(gr, params, nullptr, nullptr);
 }
 
 struct gguf_file_reader {
@@ -944,7 +1082,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         /*.offset = */ static_cast<uint64_t>(cur),
     };
     const struct gguf_reader gr(gguf_file_reader_callback, &reader, SIZE_MAX, reader.offset, gguf_reader::file_remain(file));
-    return gguf_init_from_reader(gr, params);
+    return gguf_init_from_reader(gr, params, nullptr, nullptr);
 }
 
 struct gguf_buffer_reader {
@@ -977,7 +1115,75 @@ struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, stru
         /*.size = */ size,
     };
     const struct gguf_reader gr(gguf_buffer_reader_callback, &reader, SIZE_MAX, 0, size);
-    return gguf_init_from_reader(gr, params);
+    return gguf_init_from_reader(gr, params, nullptr, nullptr);
+}
+
+struct gguf_context * gguf_init_from_buffer_with_limits(
+        const void * data,
+        size_t size,
+        struct gguf_init_params params,
+        struct gguf_parse_limits limits,
+        int32_t * error) {
+    if (error != nullptr) {
+        *error = int32_t(GGUF_PARSE_ERROR_NONE);
+    }
+    if (data == nullptr || size == 0) {
+        if (error != nullptr) {
+            *error = int32_t(GGUF_PARSE_ERROR_INVALID_DATA);
+        }
+        return nullptr;
+    }
+
+    gguf_buffer_reader reader = {
+        /*.data = */ static_cast<const uint8_t *>(data),
+        /*.size = */ size,
+    };
+    const struct gguf_reader gr(
+        gguf_buffer_reader_callback,
+        &reader,
+        SIZE_MAX,
+        0,
+        size,
+        limits.max_string_bytes,
+        limits.max_array_elements);
+    enum gguf_parse_error parse_error = GGUF_PARSE_ERROR_NONE;
+    struct gguf_context * result = gguf_init_from_reader(gr, params, &limits, &parse_error);
+    if (result == nullptr && parse_error == GGUF_PARSE_ERROR_NONE) {
+        parse_error = GGUF_PARSE_ERROR_INVALID_DATA;
+    }
+    if (error != nullptr) {
+        *error = int32_t(parse_error);
+    }
+    return result;
+}
+
+bool gguf_bounded_parser_structural_bytes(
+        uint64_t n_kv,
+        uint64_t n_tensors,
+        size_t * result) {
+    if (result == nullptr || n_kv > SIZE_MAX || n_tensors > SIZE_MAX) {
+        return false;
+    }
+    const size_t kv_count = size_t(n_kv);
+    const size_t tensor_count = size_t(n_tensors);
+    if (kv_count > (SIZE_MAX - sizeof(gguf_context))/sizeof(gguf_kv)) {
+        return false;
+    }
+    size_t bytes = sizeof(gguf_context) + kv_count*sizeof(gguf_kv);
+    if (tensor_count > (SIZE_MAX - bytes)/sizeof(gguf_tensor_info)) {
+        return false;
+    }
+    *result = bytes + tensor_count*sizeof(gguf_tensor_info);
+    return true;
+}
+
+size_t gguf_bounded_parser_payload_wire_multiplier(void) {
+    // A serialized GGUF string contributes an eight-byte length slot. During
+    // parsing a string array can hold both the temporary and context-owned
+    // std::string objects. Both the temporary value and the context-owned copy
+    // may coexist, and each can retain the serialized character payload.
+    const size_t object_ratio = (sizeof(std::string) + sizeof(uint64_t) - 1)/sizeof(uint64_t);
+    return 2*(object_ratio + 1);
 }
 
 struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {

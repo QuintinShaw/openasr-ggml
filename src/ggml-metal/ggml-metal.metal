@@ -27,6 +27,30 @@ using namespace metal;
 
 #define N_SIMDWIDTH 32 // assuming SIMD group size is 32
 
+// OpenASR cooperative-cancellation gate. The host-visible flag is sampled on
+// the GPU immediately before each normal kernel dispatch. A cancelled graph
+// writes a zero-sized indirect dispatch, allowing the already-committed command
+// buffer to drain without executing the remaining graph kernels.
+struct openasr_cancel_dispatch_args {
+    uint x;
+    uint y;
+    uint z;
+    uint _padding;
+};
+
+kernel void kernel_openasr_cancel_dispatch(
+        device atomic_uint * abort_flag [[buffer(GGML_METAL_CANCEL_ABORT_BUFFER_INDEX)]],
+        constant openasr_cancel_dispatch_args & desired [[buffer(GGML_METAL_CANCEL_DESIRED_BUFFER_INDEX)]],
+        device openasr_cancel_dispatch_args * indirect [[buffer(GGML_METAL_CANCEL_INDIRECT_BUFFER_INDEX)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid == 0) {
+        const bool aborted = atomic_load_explicit(abort_flag, memory_order_relaxed) != 0;
+        indirect->x = aborted ? 0 : desired.x;
+        indirect->y = aborted ? 0 : desired.y;
+        indirect->z = aborted ? 0 : desired.z;
+    }
+}
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:

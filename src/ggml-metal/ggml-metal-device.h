@@ -11,6 +11,13 @@ struct ggml_metal_buffer_id {
     size_t offs;
 };
 
+struct ggml_metal_cancel_dispatch_args {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+    uint32_t padding;
+};
+
 typedef struct ggml_metal_device * ggml_metal_device_t;
 
 //
@@ -79,6 +86,11 @@ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const cha
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
+void ggml_metal_encoder_set_cancel_buffers(
+        ggml_metal_encoder_t encoder,
+        struct ggml_metal_pipeline_with_params gate_pipeline,
+        struct ggml_metal_buffer_id abort_flag,
+        struct ggml_metal_buffer_id indirect_args);
 
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
@@ -289,9 +301,10 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev);
 
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
-void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
+enum ggml_status ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
+size_t ggml_metal_device_get_buffer_allocation_size(ggml_metal_device_t dev, size_t size, bool shared);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
