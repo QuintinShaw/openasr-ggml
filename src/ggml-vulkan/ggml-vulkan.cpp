@@ -2147,6 +2147,11 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     vk_semaphore compute_completion;
     bool submit_pending {};
+    bool compute_submit_pending {};
+    // Zero means the current compute-queue pending batch is not covered by a
+    // context-owned timeline point. A nonzero value covers every compute
+    // submission in this batch through that value.
+    uint64_t compute_pending_completion_value {};
     bool almost_ready_fence_pending {};
     // A lost Vulkan device cannot be recovered in place. The first caller
     // receives DEVICE_LOST; all later boundaries fail closed.
@@ -3054,6 +3059,8 @@ static void ggml_vk_submit_compute(
         ggml_backend_vk_context * backend_ctx, vk_context & submit_ctx, vk::Fence fence) {
     if (backend_ctx->abort.callback == nullptr) {
         ggml_vk_submit(submit_ctx, fence);
+        backend_ctx->compute_submit_pending = true;
+        backend_ctx->compute_pending_completion_value = 0;
         return;
     }
 
@@ -3069,6 +3076,33 @@ static void ggml_vk_submit_compute(
         throw;
     }
     backend_ctx->compute_completion.value = completion.value;
+    backend_ctx->compute_submit_pending = true;
+    backend_ctx->compute_pending_completion_value = completion.value;
+}
+
+// Cover callback-free work that was already pending when cancellation became
+// armed. Queue order makes this context-owned point complete only after all
+// earlier submissions, while later submissions from other contexts remain
+// outside the wait boundary.
+static void ggml_vk_cover_pending_compute(ggml_backend_vk_context * ctx) {
+    GGML_ASSERT(ctx->compute_submit_pending);
+    GGML_ASSERT(ctx->compute_pending_completion_value == 0);
+
+    const uint64_t completion_value = ctx->compute_completion.value + 1;
+    vk::Semaphore completion = ctx->compute_completion.s;
+    vk::TimelineSemaphoreSubmitInfo timeline_info{ 0, nullptr, 1, &completion_value };
+    vk::SubmitInfo submit_info{
+        0, nullptr, nullptr,
+        0, nullptr,
+        1, &completion,
+    };
+    submit_info.setPNext(&timeline_info);
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({ submit_info }, {});
+    }
+    ctx->compute_completion.value = completion_value;
+    ctx->compute_pending_completion_value = completion_value;
 }
 
 static uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyProperties>& queue_family_props, const vk::QueueFlags& required, const vk::QueueFlags& avoid, int32_t compute_index, uint32_t min_num_queues) {
@@ -16034,8 +16068,11 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     // different backend that happens to share the same VkQueue.
     if (ctx->submit_pending && ctx->abort.callback != nullptr) {
         enum ggml_status wait_status = GGML_STATUS_SUCCESS;
-        if (ctx->compute_completion.value > 0) {
-            wait_status = ggml_vk_wait_for_compute_completion(ctx, ctx->compute_completion.value);
+        if (ctx->compute_submit_pending && ctx->compute_pending_completion_value == 0) {
+            ggml_vk_cover_pending_compute(ctx);
+        }
+        if (ctx->compute_submit_pending) {
+            wait_status = ggml_vk_wait_for_compute_completion(ctx, ctx->compute_pending_completion_value);
         }
         if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::Semaphore sem = ctx->transfer_semaphore.s;
@@ -16068,6 +16105,8 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->almost_ready_fence_pending = false;
         }
         ctx->submit_pending = false;
+        ctx->compute_submit_pending = false;
+        ctx->compute_pending_completion_value = 0;
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
@@ -16102,6 +16141,8 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         enum ggml_status wait_status = ggml_vk_wait_for_fence(ctx);
         ctx->submit_pending = false;
+        ctx->compute_submit_pending = false;
+        ctx->compute_pending_completion_value = 0;
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
@@ -17445,6 +17486,8 @@ static enum ggml_status ggml_backend_vk_event_record_status(ggml_backend_t backe
             ctx->compute_ctx.reset();
         }
         ctx->submit_pending = false;
+        ctx->compute_submit_pending = false;
+        ctx->compute_pending_completion_value = 0;
         const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
         if (status == GGML_STATUS_DEVICE_LOST) {
             ctx->poisoned = true;
@@ -18858,6 +18901,8 @@ static bool ggml_backend_vk_test_gate_enqueue_wait(ggml_backend_t backend, void 
     std::lock_guard<std::mutex> guard(queue_mutex);
     ctx->device->compute_queue.queue.submit({ submit_info }, {});
     ctx->submit_pending = true;
+    ctx->compute_submit_pending = true;
+    ctx->compute_pending_completion_value = 0;
     return true;
 }
 
