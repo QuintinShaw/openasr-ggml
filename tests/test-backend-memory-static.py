@@ -170,6 +170,40 @@ class BackendMemoryStaticContract(unittest.TestCase):
         )
         self.assertIn("GGML_BACKEND_MEMORY_API_V1_PROC", self.vulkan)
 
+    def test_vulkan_quote_rejects_ambiguous_cross_domain_fallback(self) -> None:
+        resolver = self.vulkan[
+            self.vulkan.index("static bool ggml_backend_vk_memory_type_for_buffer") :
+            self.vulkan.index("static enum ggml_status ggml_backend_vk_memory_buffer_commitment")
+        ]
+        self.assertIn("props.memoryHeaps[props.memoryTypes[i].heapIndex].size", resolver)
+        self.assertIn(
+            "candidate_kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED",
+            resolver,
+        )
+        self.assertIn("selected_device_local != candidate_device_local", resolver)
+        self.assertIn("*heap_index != candidate_heap", resolver)
+        self.assertNotIn("return true;\n        }", resolver)
+
+    def test_vulkan_quote_generation_excludes_live_heap_usage(self) -> None:
+        generation = self.vulkan[
+            self.vulkan.index("static bool ggml_backend_vk_memory_generation") :
+            self.vulkan.index("static enum ggml_status ggml_backend_vk_memory_quote")
+        ]
+        self.assertIn("*generation = 1", generation)
+        self.assertNotIn("heapBudget", generation)
+        self.assertNotIn("heapUsage", generation)
+        stats = function_body(
+            self.vulkan,
+            "ggml_backend_vk_memory_get_stats",
+            "ggml_backend_vk_memory_trim",
+        )
+        self.assertIn(
+            "ggml_backend_vk_memory_generation(device, &stats_generation)", stats
+        )
+        self.assertNotIn(
+            "has_budget && !ggml_backend_vk_memory_generation", stats
+        )
+
     def test_vulkan_oom_and_device_loss_are_typed(self) -> None:
         mapper = self.vulkan[
             self.vulkan.index("static enum ggml_status ggml_vk_status") :

@@ -196,6 +196,10 @@ extern "C" {
         uint32_t struct_size;
         uint32_t flags;
         struct ggml_backend_memory_domain_id_v1 domain;
+        // Provider epoch for state that can invalidate a quote's physical
+        // layout/cost derivation. This is deliberately NOT a hash of live
+        // free/used bytes: capacity is carried by the fresh budget fields,
+        // and unrelated allocations must not make a request-shape quote stale.
         uint64_t generation;
         uint64_t timestamp_monotonic_ns;
         uint64_t total_bytes;

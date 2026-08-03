@@ -924,9 +924,10 @@ static enum ggml_status ggml_backend_metal_memory_quote(
             ++required;
         }
     }
-    size_t free_bytes = 0, total_bytes = 0;
-    if (backend != NULL) ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
-    const uint64_t generation = (uint64_t) total_bytes - std::min((uint64_t) total_bytes, (uint64_t) free_bytes);
+    // The Metal quote depends only on immutable request shapes and buffer-type
+    // allocation-size queries. Live working-set pressure is carried by the
+    // immediately-fetched stats, not by the quote epoch.
+    const uint64_t generation = 1;
     quote->flags = graph_private_count
         ? GGML_BACKEND_MEMORY_QUOTE_OPAQUE_DRIVER_COSTS_REQUIRE_DOMAIN_HEADROOM
         : 0;
@@ -1017,9 +1018,7 @@ static enum ggml_status ggml_backend_metal_memory_reserve_private(
         }
     }
     if (backend != NULL) {
-        size_t free_bytes = 0, total_bytes = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
-        const uint64_t generation = (uint64_t) total_bytes - std::min((uint64_t) total_bytes, (uint64_t) free_bytes);
+        const uint64_t generation = 1;
         if (generation != quote->stats_generation || quote->quote_token != (quote->request_fingerprint ^ generation)) {
             return GGML_STATUS_FAILED;
         }
@@ -1047,7 +1046,7 @@ static enum ggml_status ggml_backend_metal_memory_get_stats(
     value.budget_bytes = total_bytes;
     value.device_free_bytes = std::min(free_bytes, total_bytes);
     value.device_used_bytes = total_bytes - value.device_free_bytes;
-    value.generation = value.device_used_bytes;
+    value.generation = 1;
     value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
     value.health = backend != NULL && ggml_metal_is_quarantined((ggml_metal_t) backend->context)
         ? GGML_BACKEND_MEMORY_QUARANTINED : GGML_BACKEND_MEMORY_HEALTHY;

@@ -18312,19 +18312,36 @@ static bool ggml_backend_vk_memory_type_for_buffer(
         preferences = device->allow_sysmem_fallback ? std::vector<vk::MemoryPropertyFlags>{ local | host, local, host }
                                                      : std::vector<vk::MemoryPropertyFlags>{ local | host, local };
     }
+    bool found = false;
     for (vk::MemoryPropertyFlags wanted : preferences) {
         for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) == 0 ||
-                    (props.memoryTypes[i].propertyFlags & wanted) != wanted) continue;
-            *memory_type_index = i;
-            *heap_index = props.memoryTypes[i].heapIndex;
-            *kind = (props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)
-                ? (device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED : GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL)
-                : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED;
-            return true;
+                    (props.memoryTypes[i].propertyFlags & wanted) != wanted ||
+                    props.memoryHeaps[props.memoryTypes[i].heapIndex].size < requirements.size) continue;
+            const uint32_t candidate_heap = props.memoryTypes[i].heapIndex;
+            const uint32_t candidate_kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED
+                : ((props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)
+                    ? GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL : GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED);
+            if (!found) {
+                *memory_type_index = i;
+                *heap_index = candidate_heap;
+                *kind = candidate_kind;
+                found = true;
+                continue;
+            }
+
+            // The real allocator retries every compatible memory type after an
+            // allocation failure. A single-domain quote is sound only when
+            // every retry target maps to the same broker domain. System,
+            // pinned, and unified memory share the process SystemMemory budget;
+            // device-local heaps remain independently budgeted.
+            const bool selected_device_local = *kind == GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL;
+            const bool candidate_device_local = candidate_kind == GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL;
+            if (selected_device_local != candidate_device_local ||
+                    (selected_device_local && *heap_index != candidate_heap)) return false;
         }
     }
-    return false;
+    return found;
 }
 
 static enum ggml_status ggml_backend_vk_memory_buffer_commitment(
@@ -18384,21 +18401,12 @@ static enum ggml_status ggml_backend_vk_memory_get_domains(
 }
 
 static bool ggml_backend_vk_memory_generation(const vk_device & device, uint64_t * generation) {
-    if (generation == NULL || device->idx >= vk_instance.device_supports_membudget.size() ||
-            !vk_instance.device_supports_membudget[device->idx]) return false;
-    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgets;
-    vk::PhysicalDeviceMemoryProperties2 props;
-    props.pNext = &budgets;
-    device->physical_device.getMemoryProperties2(&props);
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
-        const uint64_t values[] = { budgets.heapBudget[i], budgets.heapUsage[i] };
-        for (uint64_t value : values) for (unsigned b = 0; b < 8; ++b) {
-            hash ^= (uint8_t) (value >> (8 * b));
-            hash *= UINT64_C(1099511628211);
-        }
-    }
-    *generation = hash;
+    GGML_UNUSED(device);
+    if (generation == NULL) return false;
+    // Buffer requirements and the compatible memory-type set are immutable for
+    // a live device. Live heap usage belongs to the capacity snapshot, not the
+    // quote identity; folding it into this token creates false-stale quotes.
+    *generation = 1;
     return true;
 }
 
@@ -18432,12 +18440,12 @@ static enum ggml_status ggml_backend_vk_memory_quote(
     }
     uint64_t generation = 0;
     if (!quote_device) return GGML_STATUS_FAILED;
-    const bool has_live_generation = ggml_backend_vk_memory_generation(quote_device, &generation);
-    quote->flags = residual_count || !has_live_generation
+    const bool has_quote_generation = ggml_backend_vk_memory_generation(quote_device, &generation);
+    if (!has_quote_generation) return GGML_STATUS_FAILED;
+    quote->flags = residual_count
         ? GGML_BACKEND_MEMORY_QUOTE_PROVISIONAL | GGML_BACKEND_MEMORY_QUOTE_HAS_RESIDUAL_UNCERTAINTY
         : 0;
-    quote->residual_flags = (residual_count ? GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE : 0) |
-        (!has_live_generation ? GGML_BACKEND_MEMORY_RESIDUAL_DRIVER_ACCOUNTING : 0);
+    quote->residual_flags = residual_count ? GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE : 0;
     quote->residual_request_count = residual_count;
     quote->provisional_requested_upper_bytes = 0;
     quote->stats_generation = generation;
@@ -18525,8 +18533,7 @@ static enum ggml_status ggml_backend_vk_memory_reserve_private(
     }
     uint64_t generation = 0;
     if (!reserve_device) return GGML_STATUS_FAILED;
-    const bool has_live_generation = ggml_backend_vk_memory_generation(reserve_device, &generation);
-    if (has_live_generation != ((quote->residual_flags & GGML_BACKEND_MEMORY_RESIDUAL_DRIVER_ACCOUNTING) == 0) ||
+    if (!ggml_backend_vk_memory_generation(reserve_device, &generation) ||
             generation != quote->stats_generation || quote->quote_token != (quote->request_fingerprint ^ generation)) {
         return GGML_STATUS_FAILED;
     }
@@ -18545,7 +18552,7 @@ static enum ggml_status ggml_backend_vk_memory_get_stats(
     if (has_budget) props.pNext = &budgets;
     device->physical_device.getMemoryProperties2(&props);
     uint64_t stats_generation = 0;
-    if (has_budget && !ggml_backend_vk_memory_generation(device, &stats_generation)) return GGML_STATUS_EXECUTION_FAILED;
+    if (!ggml_backend_vk_memory_generation(device, &stats_generation)) return GGML_STATUS_EXECUTION_FAILED;
     const uint32_t required = props.memoryProperties.memoryHeapCount;
     const uint32_t capacity = *inout_count;
     *inout_count = required;

@@ -5418,14 +5418,13 @@ static ggml_backend_memory_domain_id_v1 ggml_backend_cuda_memory_domain(int devi
 }
 
 static uint64_t ggml_backend_cuda_memory_generation(int device) {
-    ggml_cuda_set_device(device);
-    size_t free_bytes = 0, total_bytes = 0;
-    const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
-    if (status != cudaSuccess) {
-        (void) cudaGetLastError();
-        return UINT64_MAX;
-    }
-    return (uint64_t) total_bytes - std::min((uint64_t) total_bytes, (uint64_t) free_bytes);
+    GGML_UNUSED(device);
+    // CUDA's v1 quote is a pure function of the frozen requests: buffer
+    // claims are provisional page-rounded estimates and GRAPH_PRIVATE remains
+    // residual. Live capacity is sampled separately by get_stats(). Binding
+    // this token to cudaMemGetInfo() made unrelated processes spuriously stale
+    // the quote between quote/stats/reserve without strengthening admission.
+    return 1;
 }
 
 static enum ggml_status ggml_backend_cuda_memory_get_domains(
@@ -5577,7 +5576,7 @@ static enum ggml_status ggml_backend_cuda_memory_get_stats(
     value.budget_bytes = total_bytes;
     value.device_free_bytes = free_bytes;
     value.device_used_bytes = total_bytes - std::min(total_bytes, free_bytes);
-    value.generation = value.device_used_bytes;
+    value.generation = ggml_backend_cuda_memory_generation(dev_ctx->device);
     value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
     value.health = GGML_BACKEND_MEMORY_HEALTHY;
     if (backend != NULL) {
