@@ -76,6 +76,23 @@ extern "C" {
         struct ggml_context ** ctx;
     };
 
+    // Resource contract for parsing an untrusted GGUF header. Tensor payload
+    // bytes are not part of the header budget and are never materialized by a
+    // no-alloc parse.
+    struct gguf_parse_limits {
+        uint64_t max_tensors;
+        uint64_t max_kv;
+        uint64_t max_string_bytes;
+        uint64_t max_array_elements;
+        uint64_t max_header_bytes;
+    };
+
+    enum gguf_parse_error {
+        GGUF_PARSE_ERROR_NONE = 0,
+        GGUF_PARSE_ERROR_INVALID_DATA = 1,
+        GGUF_PARSE_ERROR_ALLOCATION = 2,
+    };
+
     // callback to simulate or wrap a FILE pointer - read up to `len` bytes at `offset` into `output` and return the number of bytes read
     typedef size_t (*gguf_reader_callback_t)(void * userdata, void * output, uint64_t offset, size_t len);
 
@@ -83,6 +100,21 @@ extern "C" {
     GGML_API struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
     GGML_API struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, struct gguf_init_params params);
+    GGML_API struct gguf_context * gguf_init_from_buffer_with_limits(
+            const void * data,
+            size_t size,
+            struct gguf_init_params params,
+            struct gguf_parse_limits limits,
+            int32_t * error);
+
+    // Fixed object and declared-element storage requested by the bounded
+    // parser. Variable-length key/value payload and allocator bookkeeping are
+    // not included; callers derive and admit those separately.
+    GGML_API bool gguf_bounded_parser_structural_bytes(
+            uint64_t n_kv,
+            uint64_t n_tensors,
+            size_t * result);
+    GGML_API size_t gguf_bounded_parser_payload_wire_multiplier(void);
 
     // max_chunk_read is the maximum number of bytes that the GGUF code will read at once from the callback, a value of 0 means no limit
     GGML_API struct gguf_context * gguf_init_from_callback(gguf_reader_callback_t callback, void * userdata, size_t max_chunk_read, uint64_t max_expected_size, struct gguf_init_params params);
