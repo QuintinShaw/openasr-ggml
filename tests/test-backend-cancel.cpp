@@ -1,6 +1,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#ifdef GGML_USE_BLAS
+#include "ggml-blas.h"
+#endif
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -33,6 +36,13 @@ struct fake_backend_state {
     size_t transfer_size = 0;
     bool poisoned = false;
     std::vector<int> graph_sizes;
+    ggml_abort_callback abort_callback = nullptr;
+    void * abort_callback_data = nullptr;
+    struct ggml_backend_graph_cancel_capability * cancel_capability = nullptr;
+    enum ggml_backend_graph_cancel_observation_granularity native_granularity =
+        GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
+    int abort_set_calls = 0;
+    int abort_clear_calls = 0;
 };
 
 static const char * fake_buffer_name(ggml_backend_buffer_type_t buft) {
@@ -156,10 +166,41 @@ static bool fake_device_supports_buft(ggml_backend_dev_t device, ggml_backend_bu
 
 static enum ggml_status fake_graph_compute(ggml_backend_t backend, struct ggml_cgraph * graph) {
     auto * state = static_cast<fake_backend_state *>(backend->context);
+    if (state->abort_callback != nullptr && state->cancel_capability != nullptr) {
+        state->cancel_capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+        state->cancel_capability->observation_granularity = state->native_granularity;
+    }
     assert(!state->pending);
     state->pending = true;
     state->graph_sizes.push_back(graph->n_nodes);
-    return state->submit_status;
+    if (state->submit_status != GGML_STATUS_SUCCESS) {
+        return state->submit_status;
+    }
+    if (state->abort_callback != nullptr && state->abort_callback(state->abort_callback_data)) {
+        return GGML_STATUS_ABORTED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void fake_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
+    auto * state = static_cast<fake_backend_state *>(backend->context);
+    state->abort_callback = abort_callback;
+    state->abort_callback_data = abort_callback != nullptr ? abort_callback_data : nullptr;
+    state->cancel_capability = abort_callback != nullptr ? cancel_capability : nullptr;
+    if (abort_callback != nullptr) {
+        state->abort_set_calls++;
+    } else {
+        state->abort_clear_calls++;
+    }
+}
+
+static void * fake_reg_get_proc_address(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return reinterpret_cast<void *>(fake_set_abort_callback);
+    }
+    return nullptr;
 }
 
 static enum ggml_status fake_event_record_status(ggml_backend_t backend, ggml_backend_event_t) {
@@ -209,6 +250,10 @@ static bool abort_after_polls(void * data) {
     return ++probe->polls >= probe->abort_after;
 }
 
+static bool never_abort(void *) {
+    return false;
+}
+
 static void reset(fake_backend_state & state) {
     state.pending = false;
     state.submit_status = GGML_STATUS_SUCCESS;
@@ -226,6 +271,12 @@ static void reset(fake_backend_state & state) {
     state.transfer_size = 0;
     state.poisoned = false;
     state.graph_sizes.clear();
+    state.abort_callback = nullptr;
+    state.abort_callback_data = nullptr;
+    state.cancel_capability = nullptr;
+    state.native_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
+    state.abort_set_calls = 0;
+    state.abort_clear_calls = 0;
 }
 
 struct scheduler_copy_abort_probe {
@@ -237,6 +288,17 @@ static bool abort_after_first_scheduler_copy(void * data) {
     auto * probe = static_cast<scheduler_copy_abort_probe *>(data);
     probe->polls++;
     return probe->copy_backend->copy_calls > 0;
+}
+
+static bool native_abort_after_polls(void * data) {
+    auto * probe = static_cast<abort_probe *>(data);
+    return ++probe->polls >= probe->abort_after;
+}
+
+static bool native_abort_after_submission(void * data) {
+    auto * probe = static_cast<abort_probe *>(data);
+    probe->polls++;
+    return probe->backend->pending;
 }
 
 struct scheduler_callback_probe {
@@ -340,6 +402,16 @@ int main() {
     assert(graph->n_nodes == 65);
 
     ggml_backend_reg reg = {};
+    ggml_backend_reg native_reg = {
+        /* .api_version = */ GGML_BACKEND_API_VERSION,
+        /* .iface       = */ {
+            /* .get_name         = */ nullptr,
+            /* .get_device_count = */ nullptr,
+            /* .get_device       = */ nullptr,
+            /* .get_proc_address = */ fake_reg_get_proc_address,
+        },
+        /* .context     = */ nullptr,
+    };
     ggml_backend_device device = {};
     device.reg = &reg;
     fake_backend_state state;
@@ -357,11 +429,76 @@ int main() {
 
     // Callback-free compute stays one async submission followed by the public
     // synchronous wrapper's one synchronization.
-    enum ggml_backend_graph_cancel_mode mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    struct ggml_backend_graph_cancel_capability capability = {};
     assert(ggml_backend_graph_compute(&backend, graph) == GGML_STATUS_SUCCESS);
     assert(state.graph_sizes == std::vector<int>({65}));
     assert(state.synchronize_calls == 1);
     assert(!state.pending);
+
+    // A backend that registers the native hook keeps the full graph intact.
+    // Armed-but-false work is one submission plus one terminal drain, and the
+    // callback is scoped to exactly that compute call.
+    device.reg = &native_reg;
+    reset(state);
+    abort_probe native_false_probe = {&state, 0, 100};
+    assert(ggml_backend_graph_compute_with_abort(
+               &backend, graph, native_abort_after_polls, &native_false_probe, &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(state.graph_sizes == std::vector<int>({65}));
+    assert(state.synchronize_calls == 1);
+    assert(native_false_probe.polls == 3);
+    assert(state.abort_set_calls == 1);
+    assert(state.abort_clear_calls == 1);
+    assert(state.abort_callback == nullptr);
+    assert(!state.pending);
+
+    // Capability is reported by the concrete execution path, not inferred
+    // from the backend registration. A warmed monolithic replay therefore
+    // remains native while exposing its graph-completion observation boundary.
+    reset(state);
+    state.native_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION;
+    abort_probe native_completion_probe = {&state, 0, 100};
+    assert(ggml_backend_graph_compute_with_abort(
+               &backend, graph, native_abort_after_polls, &native_completion_probe, &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION);
+    assert(state.graph_sizes == std::vector<int>({65}));
+    assert(state.synchronize_calls == 1);
+    assert(state.abort_callback == nullptr);
+    assert(!state.pending);
+
+    // Native cancellation drains accepted work, clears the borrowed callback,
+    // and leaves the backend reusable by the next compute.
+    reset(state);
+    abort_probe native_cancel_probe = {&state, 0, 2};
+    assert(ggml_backend_graph_compute_with_abort(
+               &backend, graph, native_abort_after_polls, &native_cancel_probe, &capability) == GGML_STATUS_ABORTED);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(state.graph_sizes == std::vector<int>({65}));
+    assert(state.synchronize_calls == 1);
+    assert(native_cancel_probe.polls == 2);
+    assert(state.abort_callback == nullptr);
+    assert(!state.pending);
+
+    reset(state);
+    abort_probe native_reuse_probe = {&state, 0, 100};
+    assert(ggml_backend_graph_compute_with_abort(
+               &backend, graph, native_abort_after_polls, &native_reuse_probe, &capability) == GGML_STATUS_SUCCESS);
+    assert(state.graph_sizes == std::vector<int>({65}));
+    assert(!state.pending);
+
+    // A terminal device failure remains authoritative when cancellation races
+    // the same native submission.
+    reset(state);
+    state.completion_status = GGML_STATUS_DEVICE_LOST;
+    abort_probe native_cancel_vs_device_loss = {&state, 0, 2};
+    assert(ggml_backend_graph_compute_with_abort(
+               &backend, graph, native_abort_after_polls, &native_cancel_vs_device_loss, &capability) == GGML_STATUS_DEVICE_LOST);
+    assert(state.abort_callback == nullptr);
+    assert(!state.pending);
+    device.reg = &reg;
 
     // Submission acknowledges queue acceptance only. Completion determines the
     // terminal status and drains pending work even when submission also failed.
@@ -370,6 +507,172 @@ int main() {
     assert(ggml_backend_graph_compute(&backend, graph) == GGML_STATUS_FAILED);
     assert(state.synchronize_calls == 1);
     assert(!state.pending);
+
+    // A later cancellation result cannot erase a concrete submission failure.
+    // This same merge rule is used while a scheduler drains multiple backends.
+    reset(state);
+    state.submit_status = GGML_STATUS_DEVICE_LOST;
+    state.completion_status = GGML_STATUS_ABORTED;
+    assert(ggml_backend_graph_compute(&backend, graph) == GGML_STATUS_DEVICE_LOST);
+    assert(state.synchronize_calls == 1);
+    assert(!state.pending);
+
+    // Native scheduler cancellation keeps the scheduler's original async split
+    // submission path. A one-backend graph therefore performs one full-graph
+    // submission and one final drain instead of synchronizing inside the split
+    // and then synchronizing the scheduler again.
+    fake_backend_state native_sched_state = {
+        /* .name = */ "fake-native-scheduler",
+        /* .type = */ GGML_BACKEND_DEVICE_TYPE_CPU,
+    };
+    ggml_backend_buffer_type native_sched_buft = make_fake_buffer_type(&native_sched_state);
+    native_sched_state.buft = &native_sched_buft;
+    ggml_backend_device native_sched_device = make_fake_device(&native_sched_state);
+    native_sched_device.reg = &native_reg;
+    native_sched_buft.device = &native_sched_device;
+    ggml_backend native_sched_backend = make_fake_scheduler_backend(&native_sched_state, &native_sched_device);
+    ggml_backend_t native_sched_backends[] = {&native_sched_backend};
+    ggml_backend_buffer_type_t native_sched_bufts[] = {&native_sched_buft};
+    ggml_backend_sched_t native_scheduler = ggml_backend_sched_new(
+        native_sched_backends, native_sched_bufts, 1, 128, false, false);
+    abort_probe native_scheduler_probe = {&native_sched_state, 0, 100};
+    assert(ggml_backend_sched_graph_compute_with_abort(
+               native_scheduler,
+               graph,
+               native_abort_after_polls,
+               &native_scheduler_probe,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(native_sched_state.graph_sizes == std::vector<int>({65}));
+    assert(native_sched_state.synchronize_calls == 1);
+    assert(native_sched_state.abort_set_calls == 1);
+    assert(native_sched_state.abort_clear_calls == 1);
+    assert(native_sched_state.abort_callback == nullptr);
+    assert(!native_sched_state.pending);
+
+    reset(native_sched_state);
+    abort_probe native_scheduler_cancel_probe = {&native_sched_state, 0, 0};
+    assert(ggml_backend_sched_graph_compute_with_abort(
+               native_scheduler,
+               graph,
+               native_abort_after_submission,
+               &native_scheduler_cancel_probe,
+               &capability) == GGML_STATUS_ABORTED);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(native_sched_state.graph_sizes == std::vector<int>({65}));
+    assert(native_sched_state.synchronize_calls == 1);
+    assert(native_sched_state.abort_callback == nullptr);
+    assert(!native_sched_state.pending);
+
+    reset(native_sched_state);
+    abort_probe native_scheduler_reuse_probe = {&native_sched_state, 0, 100};
+    assert(ggml_backend_sched_graph_compute_with_abort(
+               native_scheduler,
+               graph,
+               native_abort_after_polls,
+               &native_scheduler_reuse_probe,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(native_sched_state.graph_sizes == std::vector<int>({65}));
+    assert(native_sched_state.synchronize_calls == 1);
+    assert(!native_sched_state.pending);
+
+    reset(native_sched_state);
+    native_sched_state.native_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION;
+    abort_probe native_scheduler_completion_probe = {&native_sched_state, 0, 100};
+    assert(ggml_backend_sched_graph_compute_with_abort(
+               native_scheduler,
+               graph,
+               native_abort_after_polls,
+               &native_scheduler_completion_probe,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION);
+    assert(native_sched_state.graph_sizes == std::vector<int>({65}));
+    assert(native_sched_state.synchronize_calls == 1);
+    assert(!native_sched_state.pending);
+    ggml_backend_sched_free(native_scheduler);
+
+    // Scheduler drain order must not let a later backend's cancel result hide
+    // an earlier backend's concrete failure.
+    fake_backend_state native_error_state = {
+        /* .name = */ "fake-native-error",
+        /* .type = */ GGML_BACKEND_DEVICE_TYPE_GPU,
+    };
+    ggml_backend_buffer_type native_error_buft = make_fake_buffer_type(&native_error_state);
+    native_error_state.buft = &native_error_buft;
+    ggml_backend_device native_error_device = make_fake_device(&native_error_state);
+    native_error_device.reg = &native_reg;
+    native_error_buft.device = &native_error_device;
+    ggml_backend native_error_backend = make_fake_scheduler_backend(&native_error_state, &native_error_device);
+
+    fake_backend_state native_abort_state = {
+        /* .name = */ "fake-native-abort",
+        /* .type = */ GGML_BACKEND_DEVICE_TYPE_CPU,
+    };
+    ggml_backend_buffer_type native_abort_buft = make_fake_buffer_type(&native_abort_state);
+    native_abort_state.buft = &native_abort_buft;
+    ggml_backend_device native_abort_device = make_fake_device(&native_abort_state);
+    native_abort_device.reg = &native_reg;
+    native_abort_buft.device = &native_abort_device;
+    ggml_backend native_abort_backend = make_fake_scheduler_backend(&native_abort_state, &native_abort_device);
+
+    ggml_backend_t native_terminal_backends[] = {&native_error_backend, &native_abort_backend};
+    ggml_backend_buffer_type_t native_terminal_bufts[] = {&native_error_buft, &native_abort_buft};
+    ggml_backend_sched_t native_terminal_scheduler = ggml_backend_sched_new(
+        native_terminal_backends, native_terminal_bufts, 2, 128, false, false);
+    native_error_state.completion_status = GGML_STATUS_DEVICE_LOST;
+    native_abort_state.completion_status = GGML_STATUS_ABORTED;
+    assert(ggml_backend_sched_synchronize(native_terminal_scheduler) == GGML_STATUS_DEVICE_LOST);
+    assert(native_error_state.synchronize_calls == 1);
+    assert(native_abort_state.synchronize_calls == 1);
+    ggml_backend_sched_free(native_terminal_scheduler);
+
+#ifdef GGML_USE_BLAS
+    // BLAS is an optional scheduler backend in OpenASR. When built, it must
+    // expose the same native contract or merely enabling it would downgrade an
+    // otherwise native GPU+CPU scheduler to segmented synchronization.
+    ggml_backend_t blas_backend = ggml_backend_blas_init();
+    assert(blas_backend != nullptr);
+    ggml_tensor inert_node = *graph->nodes[0];
+    inert_node.flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+    ggml_tensor * inert_nodes[] = {&inert_node};
+    struct ggml_cgraph inert_graph = ggml_graph_view(graph, 0, 0);
+    inert_graph.n_nodes = 1;
+    inert_graph.nodes = inert_nodes;
+    abort_probe blas_false_probe = {&state, 0, 100};
+    assert(ggml_backend_graph_compute_with_abort(
+               blas_backend,
+               &inert_graph,
+               native_abort_after_polls,
+               &blas_false_probe,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(blas_false_probe.polls == 3);
+
+    abort_probe blas_cancel_probe = {&state, 0, 2};
+    assert(ggml_backend_graph_compute_with_abort(
+               blas_backend,
+               &inert_graph,
+               native_abort_after_polls,
+               &blas_cancel_probe,
+               &capability) == GGML_STATUS_ABORTED);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(blas_cancel_probe.polls == 2);
+
+    abort_probe blas_reuse_probe = {&state, 0, 100};
+    assert(ggml_backend_graph_compute_with_abort(
+               blas_backend,
+               &inert_graph,
+               native_abort_after_polls,
+               &blas_reuse_probe,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(blas_reuse_probe.polls == 3);
+    ggml_backend_free(blas_backend);
+#endif
 
     reset(state);
     state.completion_status = GGML_STATUS_EXECUTION_FAILED;
@@ -382,7 +685,9 @@ int main() {
     state.completion_status = GGML_STATUS_DEVICE_LOST;
     abort_probe pre_cancel_failure = {&state, 0, 1};
     assert(ggml_backend_graph_compute_with_abort(
-               &backend, graph, abort_after_polls, &pre_cancel_failure, &mode) == GGML_STATUS_DEVICE_LOST);
+               &backend, graph, abort_after_polls, &pre_cancel_failure, &capability) == GGML_STATUS_DEVICE_LOST);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_DISABLED);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE);
     assert(state.synchronize_calls == 1);
     assert(!state.pending);
 
@@ -401,8 +706,9 @@ int main() {
     reset(state);
     abort_probe false_probe = {&state, 0, 100};
     assert(ggml_backend_graph_compute_with_abort(
-               &backend, graph, abort_after_polls, &false_probe, &mode) == GGML_STATUS_SUCCESS);
-    assert(mode == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+               &backend, graph, abort_after_polls, &false_probe, &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     assert(state.graph_sizes == std::vector<int>({32, 32, 1}));
     assert(std::all_of(state.graph_sizes.begin(), state.graph_sizes.end(), [](int n) {
         return n <= GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES;
@@ -416,8 +722,9 @@ int main() {
     reset(state);
     abort_probe cancel_probe = {&state, 0, 2};
     assert(ggml_backend_graph_compute_with_abort(
-               &backend, graph, abort_after_polls, &cancel_probe, &mode) == GGML_STATUS_ABORTED);
-    assert(mode == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+               &backend, graph, abort_after_polls, &cancel_probe, &capability) == GGML_STATUS_ABORTED);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     assert(state.graph_sizes == std::vector<int>({32}));
     assert(cancel_probe.polls == 2);
     assert(state.synchronize_calls == 1);
@@ -429,7 +736,7 @@ int main() {
     state.completion_status = GGML_STATUS_EXECUTION_FAILED;
     abort_probe segment_failure = {&state, 0, 2};
     assert(ggml_backend_graph_compute_with_abort(
-               &backend, graph, abort_after_polls, &segment_failure, &mode) == GGML_STATUS_EXECUTION_FAILED);
+               &backend, graph, abort_after_polls, &segment_failure, &capability) == GGML_STATUS_EXECUTION_FAILED);
     assert(state.graph_sizes == std::vector<int>({32}));
     assert(!state.pending);
 
@@ -573,7 +880,7 @@ int main() {
     gpu_state.completion_status = GGML_STATUS_DEVICE_LOST;
     abort_probe cancel_vs_device_loss = {&gpu_state, 0, 2};
     assert(ggml_backend_graph_compute_with_abort(
-               &gpu_backend, graph, abort_after_polls, &cancel_vs_device_loss, &mode) == GGML_STATUS_DEVICE_LOST);
+               &gpu_backend, graph, abort_after_polls, &cancel_vs_device_loss, &capability) == GGML_STATUS_DEVICE_LOST);
     assert(!gpu_state.pending);
     reset(gpu_state);
 
@@ -592,14 +899,56 @@ int main() {
     ggml_backend_sched_set_tensor_backend(scheduler, gpu_node, &gpu_backend);
     assert(ggml_backend_sched_alloc_graph(scheduler, scheduler_graph));
 
+    // Use independent roots so this aggregation test does not depend on the
+    // fake backend modeling multiple queued copy/compute operations.
+    ggml_backend_sched_t mixed_scheduler = ggml_backend_sched_new(
+        scheduler_backends, scheduler_bufts, 2, 16, false, false);
+    ggml_tensor * mixed_cpu_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * mixed_gpu_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * mixed_cpu_node = ggml_sqr(ctx, mixed_cpu_input);
+    ggml_tensor * mixed_gpu_node = ggml_sqr(ctx, mixed_gpu_input);
+    ggml_cgraph * mixed_graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(mixed_graph, mixed_cpu_node);
+    ggml_build_forward_expand(mixed_graph, mixed_gpu_node);
+    assert(mixed_graph->n_nodes == 2);
+    ggml_backend_sched_set_tensor_backend(mixed_scheduler, mixed_cpu_input, &cpu_backend);
+    ggml_backend_sched_set_tensor_backend(mixed_scheduler, mixed_cpu_node, &cpu_backend);
+    ggml_backend_sched_set_tensor_backend(mixed_scheduler, mixed_gpu_input, &gpu_backend);
+    ggml_backend_sched_set_tensor_backend(mixed_scheduler, mixed_gpu_node, &gpu_backend);
+    assert(ggml_backend_sched_alloc_graph(mixed_scheduler, mixed_graph));
+
+    // A mixed scheduler remains SEGMENTED when any executed split needs the
+    // fallback, while its orthogonal granularity conservatively reports the
+    // coarsest actual path across all executed splits.
+    reset(cpu_state);
+    reset(gpu_state);
+    gpu_device.reg = &native_reg;
+    gpu_state.native_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION;
+    assert(ggml_backend_sched_graph_compute_with_abort(
+               mixed_scheduler,
+               mixed_graph,
+               never_abort,
+               nullptr,
+               &capability) == GGML_STATUS_SUCCESS);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION);
+    assert(!cpu_state.pending);
+    assert(!gpu_state.pending);
+    ggml_backend_sched_free(mixed_scheduler);
+
+    gpu_device.reg = nullptr;
+    reset(cpu_state);
+    reset(gpu_state);
+
     scheduler_copy_abort_probe scheduler_probe = {&gpu_state};
     assert(ggml_backend_sched_graph_compute_with_abort(
                scheduler,
                scheduler_graph,
                abort_after_first_scheduler_copy,
                &scheduler_probe,
-               &mode) == GGML_STATUS_ABORTED);
-    assert(mode == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+               &capability) == GGML_STATUS_ABORTED);
+    assert(capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+    assert(capability.observation_granularity == GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
     assert(cpu_state.graph_sizes == std::vector<int>({1}));
     assert(gpu_state.copy_calls == 1);
     assert(gpu_state.graph_sizes.empty());

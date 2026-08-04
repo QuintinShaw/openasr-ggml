@@ -482,13 +482,6 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
-static enum ggml_status ggml_backend_terminal_status(
-        enum ggml_status submitted, enum ggml_status completed) {
-    // Completion errors describe the operation that actually reached a terminal
-    // state and must not be hidden by a concurrent cancellation or submit error.
-    return completed == GGML_STATUS_SUCCESS ? submitted : completed;
-}
-
 enum ggml_status ggml_backend_synchronize(ggml_backend_t backend) {
     GGML_ASSERT(backend);
     if (backend->iface.synchronize == NULL) {
@@ -517,12 +510,12 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
     GGML_ASSERT(backend->iface.graph_plan_compute != NULL);
 
     enum ggml_status submitted = backend->iface.graph_plan_compute(backend, plan);
-    return ggml_backend_terminal_status(submitted, ggml_backend_synchronize(backend));
+    return ggml_backend_status_merge(submitted, ggml_backend_synchronize(backend));
 }
 
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     enum ggml_status submitted = ggml_backend_graph_compute_async(backend, cgraph);
-    return ggml_backend_terminal_status(submitted, ggml_backend_synchronize(backend));
+    return ggml_backend_status_merge(submitted, ggml_backend_synchronize(backend));
 }
 
 static ggml_backend_set_abort_callback_t ggml_backend_native_abort_callback(ggml_backend_t backend) {
@@ -534,34 +527,64 @@ static ggml_backend_set_abort_callback_t ggml_backend_native_abort_callback(ggml
         reg, "ggml_backend_set_abort_callback");
 }
 
+static void ggml_backend_graph_cancel_capability_reset(
+        struct ggml_backend_graph_cancel_capability * capability) {
+    capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    capability->observation_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE;
+}
+
+static void ggml_backend_graph_cancel_capability_merge(
+        struct ggml_backend_graph_cancel_capability * destination,
+        const struct ggml_backend_graph_cancel_capability * source) {
+    if (source->mechanism == GGML_BACKEND_GRAPH_CANCEL_DISABLED) {
+        return;
+    }
+    if (destination->mechanism == GGML_BACKEND_GRAPH_CANCEL_DISABLED) {
+        *destination = *source;
+        return;
+    }
+    if (source->mechanism == GGML_BACKEND_GRAPH_CANCEL_SEGMENTED) {
+        destination->mechanism = GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+    }
+    if (source->observation_granularity > destination->observation_granularity) {
+        destination->observation_granularity = source->observation_granularity;
+    }
+}
+
+static enum ggml_status ggml_backend_native_abort_status(
+        enum ggml_status status, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+    return abort_callback(abort_callback_data) ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_backend_graph_compute_with_abort(
         ggml_backend_t backend, struct ggml_cgraph * cgraph,
         ggml_abort_callback abort_callback, void * abort_callback_data,
-        enum ggml_backend_graph_cancel_mode * cancel_mode) {
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(backend);
     GGML_ASSERT(cgraph);
-    GGML_ASSERT(cancel_mode);
+    GGML_ASSERT(cancel_capability);
 
-    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    ggml_backend_graph_cancel_capability_reset(cancel_capability);
     if (abort_callback == NULL) {
         return ggml_backend_graph_compute(backend, cgraph);
     }
 
     ggml_backend_set_abort_callback_t native = ggml_backend_native_abort_callback(backend);
-    *cancel_mode = native != NULL
-        ? GGML_BACKEND_GRAPH_CANCEL_NATIVE
-        : GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
 
     // A pre-start cancellation still honors the synchronous return contract:
     // no work previously queued on this backend remains in flight.
     if (abort_callback(abort_callback_data)) {
-        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_synchronize(backend));
+        return ggml_backend_status_merge(GGML_STATUS_ABORTED, ggml_backend_synchronize(backend));
     }
 
     if (native != NULL) {
-        native(backend, abort_callback, abort_callback_data);
+        native(backend, abort_callback, abort_callback_data, cancel_capability);
         enum ggml_status status = ggml_backend_graph_compute(backend, cgraph);
-        native(backend, NULL, NULL);
+        status = ggml_backend_native_abort_status(status, abort_callback, abort_callback_data);
+        native(backend, NULL, NULL, NULL);
         return status;
     }
 
@@ -573,9 +596,12 @@ enum ggml_status ggml_backend_graph_compute_with_abort(
     for (int i = 0; i < cgraph->n_nodes; i += GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES) {
         const int i_end = std::min(i + GGML_BACKEND_GRAPH_CANCEL_SEGMENT_NODES, cgraph->n_nodes);
         struct ggml_cgraph view = ggml_graph_view(cgraph, i, i_end);
+        cancel_capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+        cancel_capability->observation_granularity =
+            GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
         enum ggml_status submitted = backend->iface.graph_compute(backend, &view);
         enum ggml_status completed = ggml_backend_synchronize(backend);
-        enum ggml_status status = ggml_backend_terminal_status(submitted, completed);
+        enum ggml_status status = ggml_backend_status_merge(submitted, completed);
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
@@ -1679,7 +1705,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(
-        ggml_backend_sched_t sched, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_backend_sched_t sched, ggml_abort_callback abort_callback, void * abort_callback_data,
+        bool native_cancel, struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1893,12 +1920,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(
 
         if (!sched->callback_eval) {
             enum ggml_status ec;
-            if (abort_callback == NULL) {
+            if (abort_callback == NULL || native_cancel) {
                 ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             } else {
-                enum ggml_backend_graph_cancel_mode unused_mode;
+                struct ggml_backend_graph_cancel_capability split_capability;
                 ec = ggml_backend_graph_compute_with_abort(
-                    split_backend, &split->graph, abort_callback, abort_callback_data, &unused_mode);
+                    split_backend, &split->graph, abort_callback, abort_callback_data, &split_capability);
+                ggml_backend_graph_cancel_capability_merge(cancel_capability, &split_capability);
             }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1922,12 +1950,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
                 enum ggml_status ec;
-                if (abort_callback == NULL) {
+                if (abort_callback == NULL || native_cancel) {
                     ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 } else {
-                    enum ggml_backend_graph_cancel_mode unused_mode;
+                    struct ggml_backend_graph_cancel_capability split_capability;
                     ec = ggml_backend_graph_compute_with_abort(
-                        split_backend, &gv, abort_callback, abort_callback_data, &unused_mode);
+                        split_backend, &gv, abort_callback, abort_callback_data, &split_capability);
+                    ggml_backend_graph_cancel_capability_merge(cancel_capability, &split_capability);
                 }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
@@ -2333,7 +2362,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     enum ggml_status submitted = ggml_backend_sched_graph_compute_async(sched, graph);
-    return ggml_backend_terminal_status(submitted, ggml_backend_sched_synchronize(sched));
+    return ggml_backend_status_merge(submitted, ggml_backend_sched_synchronize(sched));
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -2351,33 +2380,33 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched, NULL, NULL);
+    return ggml_backend_sched_compute_splits(sched, NULL, NULL, false, NULL);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_with_abort(
         ggml_backend_sched_t sched, struct ggml_cgraph * graph,
         ggml_abort_callback abort_callback, void * abort_callback_data,
-        enum ggml_backend_graph_cancel_mode * cancel_mode) {
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(sched);
     GGML_ASSERT(graph);
-    GGML_ASSERT(cancel_mode);
+    GGML_ASSERT(cancel_capability);
 
-    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    ggml_backend_graph_cancel_capability_reset(cancel_capability);
     if (abort_callback == NULL) {
         return ggml_backend_sched_graph_compute(sched, graph);
     }
 
-    *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+    bool native_cancel = true;
     for (int i = 0; i < sched->n_backends; ++i) {
         if (ggml_backend_native_abort_callback(sched->backends[i]) == NULL) {
-            *cancel_mode = GGML_BACKEND_GRAPH_CANCEL_SEGMENTED;
+            native_cancel = false;
         }
     }
 
     // Avoid graph splitting/allocation and its possible backend synchronization
     // when the request was already cancelled before this compute began.
     if (abort_callback(abort_callback_data)) {
-        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
+        return ggml_backend_status_merge(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
     }
 
     if (!sched->is_reset && !sched->is_alloc) {
@@ -2388,18 +2417,43 @@ enum ggml_status ggml_backend_sched_graph_compute_with_abort(
     }
 
     if (abort_callback(abort_callback_data)) {
-        return ggml_backend_terminal_status(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
+        return ggml_backend_status_merge(GGML_STATUS_ABORTED, ggml_backend_sched_synchronize(sched));
     }
 
-    enum ggml_status submitted = ggml_backend_sched_compute_splits(sched, abort_callback, abort_callback_data);
-    return ggml_backend_terminal_status(submitted, ggml_backend_sched_synchronize(sched));
+    std::vector<struct ggml_backend_graph_cancel_capability> backend_capabilities;
+    if (native_cancel) {
+        backend_capabilities.resize(sched->n_backends);
+        for (int i = 0; i < sched->n_backends; ++i) {
+            ggml_backend_graph_cancel_capability_reset(&backend_capabilities[i]);
+            ggml_backend_native_abort_callback(sched->backends[i])(
+                sched->backends[i], abort_callback, abort_callback_data, &backend_capabilities[i]);
+        }
+    }
+
+    enum ggml_status submitted = ggml_backend_sched_compute_splits(
+        sched, abort_callback, abort_callback_data, native_cancel, cancel_capability);
+    enum ggml_status status = ggml_backend_status_merge(
+        submitted, ggml_backend_sched_synchronize(sched));
+
+    if (native_cancel) {
+        for (const auto & backend_capability : backend_capabilities) {
+            ggml_backend_graph_cancel_capability_merge(cancel_capability, &backend_capability);
+        }
+        status = ggml_backend_native_abort_status(status, abort_callback, abort_callback_data);
+        for (int i = 0; i < sched->n_backends; ++i) {
+            ggml_backend_native_abort_callback(sched->backends[i])(
+                sched->backends[i], NULL, NULL, NULL);
+        }
+    }
+
+    return status;
 }
 
 enum ggml_status ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     enum ggml_status status = GGML_STATUS_SUCCESS;
     for (int i = 0; i < sched->n_backends; i++) {
-        status = ggml_backend_terminal_status(status, ggml_backend_synchronize(sched->backends[i]));
+        status = ggml_backend_status_merge(status, ggml_backend_synchronize(sched->backends[i]));
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

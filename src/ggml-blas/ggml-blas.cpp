@@ -40,6 +40,7 @@
 
 struct ggml_backend_blas_context {
     int n_threads = GGML_DEFAULT_N_THREADS;
+    struct ggml_backend_abort_context abort = {};
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
     uint64_t memory_generation = 1;
@@ -291,7 +292,13 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_BACKEND_POISONED;
     }
 
+    ggml_backend_abort_context_mark_native(
+        &ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (ggml_backend_abort_context_requested(&ctx->abort)) {
+            return GGML_STATUS_ABORTED;
+        }
         struct ggml_tensor * node = cgraph->nodes[i];
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -689,6 +696,15 @@ void ggml_backend_blas_set_n_threads(ggml_backend_t backend_blas, int n_threads)
     ctx->n_threads = n_threads;
 }
 
+static void ggml_backend_blas_set_abort_callback(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
+    GGML_ASSERT(ggml_backend_is_blas(backend));
+    ggml_backend_blas_context * ctx = (ggml_backend_blas_context *) backend->context;
+    ggml_backend_abort_context_set(
+        &ctx->abort, abort_callback, abort_callback_data, cancel_capability);
+}
+
 // device interface
 
 static const char * ggml_backend_blas_device_get_name(ggml_backend_dev_t dev) {
@@ -917,6 +933,9 @@ static void * ggml_backend_blas_get_proc_address(ggml_backend_reg_t reg, const c
         return (void *) +[]() -> const ggml_backend_memory_api_v1 * {
             return &ggml_backend_blas_memory_api;
         };
+    }
+    if (std::strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_blas_set_abort_callback;
     }
     return NULL;
 

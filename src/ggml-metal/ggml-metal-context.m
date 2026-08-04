@@ -83,6 +83,7 @@ struct ggml_metal {
     // the backend can still encode its command buffers on parallel host tasks.
     ggml_abort_callback abort_callback;
     void * abort_callback_data;
+    struct ggml_backend_graph_cancel_capability * cancel_capability;
     id<MTLBuffer> abort_flag;
     id<MTLBuffer> abort_indirect_args[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
     dispatch_semaphore_t abort_monitor_stop;
@@ -476,7 +477,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_BACKEND_POISONED;
     }
 
-    if (ctx->abort_callback != NULL) {
+    if (ctx->abort_callback != NULL && ctx->cancel_capability != NULL) {
+        ctx->cancel_capability->mechanism = GGML_BACKEND_GRAPH_CANCEL_NATIVE;
+        ctx->cancel_capability->observation_granularity =
+            GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
         // Metal cannot cancel a committed command buffer. A tiny gate kernel
         // before every normal dispatch samples a host-visible abort flag and
         // turns the remaining work into zero-sized indirect dispatches. This
@@ -661,10 +665,12 @@ bool ggml_metal_is_quarantined(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_abort_callback(
-        ggml_metal_t ctx, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_metal_t ctx, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(!ctx->abort_monitor_active);
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
+    ctx->cancel_capability = abort_callback != NULL ? cancel_capability : NULL;
 }
 
 enum ggml_status ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {

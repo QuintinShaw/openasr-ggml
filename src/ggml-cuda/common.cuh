@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
@@ -1400,6 +1401,7 @@ struct ggml_backend_cuda_context {
     int device;
     enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
     bool memory_quarantined = false;
+    struct ggml_backend_abort_context abort = {};
     std::string name;
     cudaEvent_t copy_event = nullptr;
 

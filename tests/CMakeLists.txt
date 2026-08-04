@@ -168,6 +168,42 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+if (GGML_VULKAN)
+    # Vulkan registry/device/backend publication and teardown stress.
+    set(TEST_TARGET test-backend-vulkan-lifecycle)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    add_test(
+        NAME test-backend-vulkan-instance-retry
+        COMMAND $<TARGET_FILE:${TEST_TARGET}> --retry-after-failure)
+
+    set(TEST_TARGET test-backend-vulkan-cancel-isolation)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    set(TEST_TARGET test-backend-vulkan-prior-pending-cancel)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
+if ((GGML_CUDA AND GGML_CUDA_GRAPHS) OR (GGML_HIP AND GGML_HIP_GRAPHS))
+    # CUDA and HIP share the ggml-cuda graph implementation. Build the same
+    # hardware contract test against the concrete provider selected here so a
+    # backend cannot silently drift from submission-checkpoint capture to
+    # graph-completion replay semantics.
+    set(TEST_TARGET test-backend-cuda-graph-cancel-contract)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    if (GGML_HIP)
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-hip ggml-cpu Threads::Threads)
+    else()
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-cuda ggml-cpu Threads::Threads)
+    endif()
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
 # shared backend graph cancellation contract
 set(TEST_TARGET test-backend-cancel)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)

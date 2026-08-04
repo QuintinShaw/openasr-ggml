@@ -570,10 +570,12 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
 }
 
 static void ggml_backend_metal_set_abort_callback(
-        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
-    ggml_metal_set_abort_callback(ctx, abort_callback, abort_callback_data);
+    ggml_metal_set_abort_callback(
+        ctx, abort_callback, abort_callback_data, cancel_capability);
 }
 
 static ggml_backend_i ggml_backend_metal_i = {
