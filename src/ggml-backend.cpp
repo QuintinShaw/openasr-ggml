@@ -2197,7 +2197,6 @@ enum ggml_status ggml_backend_sched_memory_plan_create_v1(
     }
     plan->sched = sched;
     plan->source_graph = graph;
-    plan->source_graph_fingerprint = ggml_backend_sched_memory_graph_fingerprint(graph);
     plan->previous_cur_copy = sched->cur_copy;
     plan->committed = false;
     sched->cur_copy = sched->next_copy;
@@ -2283,6 +2282,11 @@ enum ggml_status ggml_backend_sched_memory_plan_create_v1(
         delete plan;
         return GGML_STATUS_ALLOC_FAILED;
     }
+    // Splitting a mixed-backend graph legitimately replaces cross-backend
+    // sources with scheduler-owned copies. Freeze the graph only after those
+    // internal rewrites are complete, so commit rejects caller mutation but
+    // does not reject the scheduler's own plan.
+    plan->source_graph_fingerprint = ggml_backend_sched_memory_graph_fingerprint(graph);
     sched->memory_plan_active = true;
     sched->active_memory_plan = plan;
     *out_plan = plan;
@@ -2304,6 +2308,16 @@ bool ggml_backend_sched_memory_plan_get_item_v1(
 }
 
 enum ggml_status ggml_backend_sched_memory_plan_commit_v1(ggml_backend_sched_memory_plan_t plan) {
+    uint32_t flags = 0;
+    return ggml_backend_sched_memory_plan_commit_v2(plan, &flags);
+}
+
+enum ggml_status ggml_backend_sched_memory_plan_commit_v2(
+        ggml_backend_sched_memory_plan_t plan, uint32_t * out_flags) {
+    if (out_flags == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    *out_flags = 0;
     if (plan == NULL || plan->committed || plan->sched == NULL || !plan->sched->memory_plan_active) {
         return GGML_STATUS_FAILED;
     }
@@ -2314,6 +2328,10 @@ enum ggml_status ggml_backend_sched_memory_plan_commit_v1(ggml_backend_sched_mem
     if (!ggml_gallocr_measure_commit_v1(sched->galloc)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
+    // The measure commit atomically publishes replacement buffers. From this
+    // point onward a failure may leave the scheduler's high-water allocation
+    // changed even if graph tensor placement cannot be completed.
+    *out_flags |= GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
     if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
