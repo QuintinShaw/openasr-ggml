@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -17,12 +18,41 @@ struct ggml_metal_device_deleter {
 
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
 
+struct ggml_metal_device_cache {
+    std::mutex mutex;
+    std::vector<ggml_metal_device_ptr> devices;
+};
+
+static ggml_metal_device_cache & ggml_metal_device_cache_get(void) {
+    static ggml_metal_device_cache cache;
+    return cache;
+}
+
 ggml_metal_device_t ggml_metal_device_get(int device) {
-    static std::vector<ggml_metal_device_ptr> devs;
+    GGML_ASSERT(device >= 0);
 
-    devs.emplace_back(ggml_metal_device_init(device));
+    ggml_metal_device_cache & cache = ggml_metal_device_cache_get();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const size_t index = (size_t) device;
+    if (cache.devices.size() <= index) {
+        cache.devices.resize(index + 1);
+    }
+    if (!cache.devices[index]) {
+        cache.devices[index].reset(ggml_metal_device_init(device));
+    }
 
-    return devs.back().get();
+    return cache.devices[index].get();
+}
+
+size_t openasr_ggml_metal_cached_device_count(void) {
+    ggml_metal_device_cache & cache = ggml_metal_device_cache_get();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    size_t count = 0;
+    for (const ggml_metal_device_ptr & device : cache.devices) {
+        count += device != nullptr;
+    }
+
+    return count;
 }
 
 struct ggml_metal_pipelines {

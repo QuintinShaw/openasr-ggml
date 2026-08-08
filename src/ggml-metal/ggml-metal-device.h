@@ -289,6 +289,10 @@ void ggml_metal_device_free(ggml_metal_device_t dev);
 
 ggml_metal_device_t ggml_metal_device_get(int device);
 
+// OpenASR regression seam: the backend memory quote must reuse the registry's
+// process-lifetime device context instead of constructing one per quote.
+size_t openasr_ggml_metal_cached_device_count(void);
+
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 

@@ -968,14 +968,15 @@ static enum ggml_status ggml_backend_metal_memory_quote(
                     requests[i].buft->iface.get_name != ggml_backend_metal_buffer_type_mapped_get_name) {
                 return GGML_STATUS_FAILED;
             }
-            ggml_backend_metal_buffer_type * buft_ctx =
-                (ggml_backend_metal_buffer_type *) requests[i].buft->context;
             const bool shared = requests[i].buft->iface.get_name !=
                 ggml_backend_metal_buffer_type_private_get_name;
+            ggml_metal_device_t device =
+                (ggml_metal_device_t) requests[i].buft->device->context;
+            if (device == NULL) return GGML_STATUS_FAILED;
             committed = ggml_metal_device_get_buffer_allocation_size(
-                ggml_metal_device_get(buft_ctx->device), requests[i].requested_bytes, shared);
+                device, requests[i].requested_bytes, shared);
             before = ggml_metal_device_get_buffer_allocation_size(
-                ggml_metal_device_get(buft_ctx->device), requests[i].currently_allocated_bytes, shared);
+                device, requests[i].currently_allocated_bytes, shared);
         }
         const bool reuse = requests[i].currently_allocated_bytes >= requests[i].requested_bytes;
         const uint64_t after = reuse ? before : committed;
