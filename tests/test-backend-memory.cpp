@@ -154,6 +154,20 @@ int main() {
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 1, 32, false, false);
     assert(sched != nullptr);
 
+    // The mixed-backend regression in test-backend-cancel proves that the
+    // scheduler's own split is accepted. A caller mutation after create must
+    // still invalidate the frozen plan.
+    ggml_backend_sched_memory_plan_t mutated_plan = nullptr;
+    assert(ggml_backend_sched_memory_plan_create_v1(sched, graph, &mutated_plan) == GGML_STATUS_SUCCESS);
+    assert(mutated_plan != nullptr);
+    const int64_t original_out_ne0 = out->ne[0];
+    out->ne[0]++;
+    uint32_t mutated_commit_flags = UINT32_MAX;
+    assert(ggml_backend_sched_memory_plan_commit_v2(mutated_plan, &mutated_commit_flags) == GGML_STATUS_FAILED);
+    assert(mutated_commit_flags == 0);
+    out->ne[0] = original_out_ne0;
+    ggml_backend_sched_memory_plan_free_v1(mutated_plan);
+
     ggml_backend_sched_memory_plan_t plan = nullptr;
     assert(ggml_backend_sched_memory_plan_create_v1(sched, graph, &plan) == GGML_STATUS_SUCCESS);
     assert(plan != nullptr);
@@ -215,7 +229,10 @@ int main() {
     actual_count = static_cast<uint32_t>(actual.size());
     assert(api->reserve_private(requests.data(), item_count, &quote, actual.data(), &actual_count) == GGML_STATUS_SUCCESS);
 
-    assert(ggml_backend_sched_memory_plan_commit_v1(plan) == GGML_STATUS_SUCCESS);
+    assert(ggml_backend_sched_memory_plan_commit_v2(plan, nullptr) == GGML_STATUS_FAILED);
+    uint32_t commit_flags = 0;
+    assert(ggml_backend_sched_memory_plan_commit_v2(plan, &commit_flags) == GGML_STATUS_SUCCESS);
+    assert((commit_flags & GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED) != 0);
     ggml_backend_sched_memory_plan_free_v1(plan);
     assert(out->data != nullptr);
 

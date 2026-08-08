@@ -886,6 +886,44 @@ int main() {
 
     ggml_backend_t scheduler_backends[] = {&gpu_backend, &cpu_backend};
     ggml_backend_buffer_type_t scheduler_bufts[] = {&gpu_buft, &cpu_buft};
+
+    // A memory plan freezes the graph after the scheduler has performed its
+    // own mixed-backend split. The split legitimately replaces a cross-backend
+    // source with a scheduler-owned copy; commit must not misclassify that
+    // internal rewrite as caller mutation.
+    ggml_backend_sched_t memory_plan_scheduler = ggml_backend_sched_new(
+        scheduler_backends, scheduler_bufts, 2, 16, false, false);
+    ggml_context * memory_plan_cpu_ctx = ggml_init(params);
+    ggml_context * memory_plan_gpu_ctx = ggml_init(params);
+    assert(memory_plan_cpu_ctx != nullptr);
+    assert(memory_plan_gpu_ctx != nullptr);
+    ggml_tensor * memory_plan_input = ggml_new_tensor_1d(memory_plan_cpu_ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * memory_plan_cpu_node = ggml_sqr(memory_plan_cpu_ctx, memory_plan_input);
+    ggml_tensor * memory_plan_gpu_node = ggml_sqr(memory_plan_gpu_ctx, memory_plan_cpu_node);
+    ggml_backend_buffer_t memory_plan_cpu_buffer =
+        ggml_backend_alloc_ctx_tensors(memory_plan_cpu_ctx, &cpu_backend);
+    ggml_backend_buffer_t memory_plan_gpu_buffer =
+        ggml_backend_alloc_ctx_tensors(memory_plan_gpu_ctx, &gpu_backend);
+    assert(memory_plan_cpu_buffer != nullptr);
+    assert(memory_plan_gpu_buffer != nullptr);
+    ggml_cgraph * memory_plan_graph = ggml_new_graph_custom(memory_plan_gpu_ctx, 16, false);
+    ggml_build_forward_expand(memory_plan_graph, memory_plan_gpu_node);
+    ggml_backend_sched_memory_plan_t memory_plan = nullptr;
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               memory_plan_scheduler, memory_plan_graph, &memory_plan) == GGML_STATUS_SUCCESS);
+    assert(memory_plan != nullptr);
+    assert(memory_plan_gpu_node->src[0] != memory_plan_cpu_node);
+    // The v1 entrypoint remains ABI-compatible and delegates to the v2 commit
+    // contract used by OpenASR's typed admission layer.
+    assert(ggml_backend_sched_memory_plan_commit_v1(memory_plan) == GGML_STATUS_SUCCESS);
+    ggml_backend_sched_memory_plan_free_v1(memory_plan);
+    memory_plan_gpu_node->src[0] = memory_plan_cpu_node;
+    ggml_backend_sched_free(memory_plan_scheduler);
+    ggml_backend_buffer_free(memory_plan_gpu_buffer);
+    ggml_backend_buffer_free(memory_plan_cpu_buffer);
+    ggml_free(memory_plan_gpu_ctx);
+    ggml_free(memory_plan_cpu_ctx);
+
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
         scheduler_backends, scheduler_bufts, 2, 16, false, false);
 

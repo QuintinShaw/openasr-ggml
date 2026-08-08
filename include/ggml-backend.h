@@ -589,6 +589,14 @@ extern "C" {
             struct ggml_backend_memory_request_v1 * out_item);
     GGML_API enum ggml_status ggml_backend_sched_memory_plan_commit_v1(
             ggml_backend_sched_memory_plan_t plan);
+    // Reports whether the commit may have changed scheduler-owned native
+    // allocation state. On failure, callers may safely refund admission only
+    // when the bit remains clear. Unknown future bits are conservative.
+    enum ggml_backend_sched_memory_plan_commit_flag {
+        GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED = 1u << 0,
+    };
+    GGML_API enum ggml_status ggml_backend_sched_memory_plan_commit_v2(
+            ggml_backend_sched_memory_plan_t plan, uint32_t * out_flags);
     GGML_API void ggml_backend_sched_memory_plan_free_v1(
             ggml_backend_sched_memory_plan_t plan);
 
