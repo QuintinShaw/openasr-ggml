@@ -3420,6 +3420,16 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static constexpr int ggml_metal_norm_thread_count(int candidate, int ne00) {
+    const int capped = candidate < ne00 ? candidate : ne00;
+    return capped < 32 ? 32 : (capped/32)*32;
+}
+
+static_assert(ggml_metal_norm_thread_count(32,   7) ==  32);
+static_assert(ggml_metal_norm_thread_count(64,  33) ==  32);
+static_assert(ggml_metal_norm_thread_count(256, 132) == 128);
+static_assert(ggml_metal_norm_thread_count(512, 260) == 256);
+
 int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3540,7 +3550,9 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     }
 
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-    nth = std::min(nth, args.ne00_t);
+    // simd_sum() requires complete 32-lane simdgroups. Round down and let the
+    // existing strided loops cover the tail; only sub-group rows need padding.
+    nth = ggml_metal_norm_thread_count(nth, args.ne00_t);
 
     const size_t smem = pipeline.smem;
 
