@@ -1420,9 +1420,37 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
+            if (!ggml_is_contiguous_rows(op->src[0]) || !ggml_is_contiguous_rows(op->src[1])) {
+                return false;
+            }
+            {
+                const bool supported =
+                    (op->src[0]->type == GGML_TYPE_F32 &&
+                     op->src[1]->type == GGML_TYPE_F32 &&
+                     op->type == GGML_TYPE_F32) ||
+                    (op->src[0]->type == GGML_TYPE_F16 &&
+                     op->src[1]->type == GGML_TYPE_F16 &&
+                     op->type == GGML_TYPE_F16);
+                return supported;
+            }
         case GGML_OP_ADD_ID:
+            {
+                const bool supported =
+                    ggml_is_contiguous_rows(op->src[0]) &&
+                    ggml_is_contiguous_rows(op->src[1]) &&
+                    ggml_is_contiguous_rows(op->src[2]) &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[2]->type == GGML_TYPE_I32 &&
+                    op->type == GGML_TYPE_F32;
+                return supported;
+            }
         case GGML_OP_ACC:
-            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
+            return ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]) &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
