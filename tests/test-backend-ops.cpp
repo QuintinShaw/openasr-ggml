@@ -9543,10 +9543,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen3 forced-aligner uses Q8_0 K/V with head_dim=128, 16 query heads,
     // and 8 KV heads. Exercise both Metal dispatch paths against the CPU
-    // reference: one-row tails use the vector kernel, while 64-row prefill
-    // chunks use the regular kernel.
+    // reference: one-row tails use the vector kernel, while 64-row bounded
+    // batches and the full 752-row forced-aligner prefill use the regular
+    // kernel.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752, 752, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -9883,9 +9885,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     // Qwen3 forced-aligner prefill: head_dim=128, 16 query heads / 8 KV heads,
-    // covering both Metal's vector tail and regular prefill kernels.
+    // covering Metal's vector tail, bounded regular batches, and full prefill.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 752, 752, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
