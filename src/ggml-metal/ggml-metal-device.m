@@ -128,10 +128,54 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 #if GGML_METAL_EMBED_LIBRARY
         GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
 
+#if GGML_METAL_EMBED_LIBRARY_BINARY
+        extern const char ggml_metallib_baseline_start[];
+        extern const char ggml_metallib_baseline_end[];
+        extern const char ggml_metallib_bf16_start[];
+        extern const char ggml_metallib_bf16_end[];
+        extern const char ggml_metallib_tensor_start[];
+        extern const char ggml_metallib_tensor_end[];
+
+        const char * library_start = ggml_metallib_baseline_start;
+        const char * library_end   = ggml_metallib_baseline_end;
+        const char * library_kind  = "baseline";
+
+        // Metal 4 hardware necessarily supports the Metal 3 bfloat surface.
+        // The tensor library is therefore compiled with both feature sets;
+        // runtime feature gates still prevent bfloat pipelines from being
+        // created when a diagnostic override disables has_bfloat.
+        if (ggml_metal_device_get_props(dev)->has_tensor) {
+            library_start = ggml_metallib_tensor_start;
+            library_end   = ggml_metallib_tensor_end;
+            library_kind  = "tensor";
+        } else if (ggml_metal_device_get_props(dev)->has_bfloat) {
+            library_start = ggml_metallib_bf16_start;
+            library_end   = ggml_metallib_bf16_end;
+            library_kind  = "bfloat";
+        }
+
+        const size_t library_size = (size_t) (library_end - library_start);
+        GGML_LOG_INFO("%s: loading embedded precompiled %s library (%zu bytes)\n",
+                __func__, library_kind, library_size);
+
+        dispatch_data_t library_data = dispatch_data_create(
+                library_start,
+                library_size,
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                ^{});
+        library = [device newLibraryWithData:library_data error:&error];
+        dispatch_release(library_data);
+        if (error || !library) {
+            GGML_LOG_ERROR("%s: error loading embedded precompiled %s library: %s\n",
+                    __func__, library_kind, error ? [[error description] UTF8String] : "unknown");
+            return nil;
+        }
+#else
         extern const char ggml_metallib_start[];
         extern const char ggml_metallib_end[];
 
         src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+#endif
 #else
 
 #ifdef SWIFT_PACKAGE
@@ -672,6 +716,23 @@ static void openasr_metal_pipeline_cache_open(ggml_metal_device_t dev) {
     const char * disable = getenv("GGML_METAL_PIPELINE_CACHE_DISABLE");
     if (disable && disable[0] != '\0' && disable[0] != '0') {
         GGML_LOG_INFO("%s: GGML_METAL_PIPELINE_CACHE_DISABLE set - skipping pipeline cache\n", __func__);
+        return;
+    }
+
+    // The archive is additive: a device-wide file accumulates every specialized
+    // pipeline used by every model. Loading a 420 MiB archive on an M1 measured
+    // 2.47 GiB peak RSS and 8.4 s for a graph that needs 91 MiB and 0.12 s
+    // without it. Metal already keeps this process's live pipeline states in
+    // ggml_metal_library::pipelines, so make the disk archive an explicit
+    // diagnostic opt-in instead of imposing an unbounded cold-start tax on all
+    // models. An explicit cache directory also counts as an opt-in.
+    const char * enable = getenv("GGML_METAL_PIPELINE_CACHE_ENABLE");
+    const char * cache_dir = getenv("GGML_METAL_PIPELINE_CACHE");
+    const bool enabled = (enable && enable[0] != '\0' && enable[0] != '0') ||
+                         (cache_dir && cache_dir[0] != '\0');
+    if (!enabled) {
+        GGML_LOG_INFO("%s: pipeline cache disabled by default; set GGML_METAL_PIPELINE_CACHE_ENABLE=1 to opt in\n",
+                __func__);
         return;
     }
 
