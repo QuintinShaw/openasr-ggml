@@ -276,6 +276,55 @@ int main() {
     ggml_backend_sched_memory_plan_free_v1(reuse_plan);
     ggml_free(ctx2);
 
+    // A larger sibling graph forces the scheduler gallocr to replace its
+    // backend buffer objects. Reset must detach the retained first graph while
+    // the old buffers are alive, so that graph can be planned and bound again
+    // instead of dereferencing a dangling `tensor->buffer`.
+    ggml_context * ctx3 = ggml_init(params);
+    assert(ctx3 != nullptr);
+    ggml_tensor * lhs3 = ggml_new_tensor_2d(ctx3, GGML_TYPE_F32, 256, 256);
+    ggml_tensor * rhs3 = ggml_new_tensor_2d(ctx3, GGML_TYPE_F32, 256, 256);
+    ggml_tensor * out3 = ggml_mul_mat(ctx3, lhs3, rhs3);
+    ggml_set_input(lhs3);
+    ggml_set_input(rhs3);
+    ggml_set_output(out3);
+    ggml_cgraph * graph3 = ggml_new_graph_custom(ctx3, 32, false);
+    ggml_build_forward_expand(graph3, out3);
+    ggml_backend_sched_memory_plan_t larger_plan = nullptr;
+    assert(ggml_backend_sched_memory_plan_create_v1(sched, graph3, &larger_plan) == GGML_STATUS_SUCCESS);
+    uint32_t larger_flags = 0;
+    assert(ggml_backend_sched_memory_plan_commit_v2(larger_plan, &larger_flags) == GGML_STATUS_SUCCESS);
+    ggml_backend_sched_memory_plan_free_v1(larger_plan);
+    assert(out3->data != nullptr);
+
+    ggml_backend_sched_memory_plan_t rebound_plan = nullptr;
+    assert(ggml_backend_sched_memory_plan_create_v1(sched, graph, &rebound_plan) == GGML_STATUS_SUCCESS);
+    uint32_t rebound_flags = 0;
+    assert(ggml_backend_sched_memory_plan_commit_v2(rebound_plan, &rebound_flags) == GGML_STATUS_SUCCESS);
+    ggml_backend_sched_memory_plan_free_v1(rebound_plan);
+    assert(out3->data == nullptr);
+    assert(out->data != nullptr);
+    ggml_free(ctx3);
+
+    // Even a sibling rejected by the scheduler's graph-size preflight must
+    // detach the currently allocated graph. Otherwise a later reset could
+    // dereference that graph after its owning context has been released.
+    ggml_context * oversized_ctx = ggml_init(params);
+    assert(oversized_ctx != nullptr);
+    ggml_tensor * oversized_input = ggml_new_tensor_1d(oversized_ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * oversized_output = oversized_input;
+    for (int i = 0; i < 64; ++i) {
+        oversized_output = ggml_add(oversized_ctx, oversized_output, oversized_input);
+    }
+    ggml_cgraph * oversized_graph = ggml_new_graph_custom(oversized_ctx, 128, false);
+    ggml_build_forward_expand(oversized_graph, oversized_output);
+    assert(ggml_graph_n_nodes(oversized_graph) > 32);
+    ggml_backend_sched_memory_plan_t oversized_plan = nullptr;
+    assert(ggml_backend_sched_memory_plan_create_v1(sched, oversized_graph, &oversized_plan) == GGML_STATUS_FAILED);
+    assert(oversized_plan == nullptr);
+    assert(out->data == nullptr);
+    ggml_free(oversized_ctx);
+
     ggml_backend_memory_stats_v1 stats = {};
     stats.struct_size = sizeof(stats);
     uint32_t stats_count = 1;

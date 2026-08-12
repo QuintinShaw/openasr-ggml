@@ -925,6 +925,11 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_src_rewrite {
+    struct ggml_tensor ** slot;
+    struct ggml_tensor * original;
+};
+
 struct ggml_backend_sched_memory_plan {
     ggml_backend_sched_t sched;
     struct ggml_cgraph * source_graph;
@@ -940,6 +945,15 @@ struct ggml_backend_sched {
     bool is_alloc;
     bool memory_plan_active;
     ggml_backend_sched_memory_plan * active_memory_plan;
+    // Source graph whose tensor bindings currently refer to `galloc` buffers.
+    // It is detached before the scheduler can replace those buffers.
+    struct ggml_cgraph * allocated_graph;
+
+    // Graph splitting may replace a source edge with a scheduler-context copy.
+    // Retained cgraphs need those edges restored before `sched->ctx` is reset.
+    ggml_backend_sched_src_rewrite * src_rewrites;
+    size_t n_src_rewrites;
+    size_t src_rewrites_capacity;
 
     int n_backends;
 
@@ -997,6 +1011,31 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static void ggml_backend_sched_record_src_rewrite(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor ** slot) {
+    if (sched->n_src_rewrites == sched->src_rewrites_capacity) {
+        const size_t next_capacity = sched->src_rewrites_capacity == 0
+                ? 16
+                : sched->src_rewrites_capacity * 2;
+        void * grown = realloc(
+                sched->src_rewrites,
+                next_capacity * sizeof(sched->src_rewrites[0]));
+        GGML_ASSERT(grown != NULL);
+        sched->src_rewrites = (ggml_backend_sched_src_rewrite *) grown;
+        sched->src_rewrites_capacity = next_capacity;
+    }
+    sched->src_rewrites[sched->n_src_rewrites++] = {slot, *slot};
+}
+
+static void ggml_backend_sched_restore_src_rewrites(ggml_backend_sched_t sched) {
+    while (sched->n_src_rewrites > 0) {
+        const ggml_backend_sched_src_rewrite rewrite =
+                sched->src_rewrites[--sched->n_src_rewrites];
+        *rewrite.slot = rewrite.original;
+    }
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1533,6 +1572,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
                     }
+                    ggml_backend_sched_record_src_rewrite(sched, &node->src[j]);
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
@@ -2088,6 +2128,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
     free(sched->context_buffer);
+    free(sched->src_rewrites);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
@@ -2101,6 +2142,11 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     // reset state for the next run
     if (!sched->is_reset) {
+        ggml_backend_sched_restore_src_rewrites(sched);
+        if (sched->allocated_graph != NULL) {
+            ggml_gallocr_detach_graph_tensors_v1(sched->galloc, sched->allocated_graph);
+            sched->allocated_graph = NULL;
+        }
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
@@ -2181,11 +2227,14 @@ enum ggml_status ggml_backend_sched_memory_plan_create_v1(
         return GGML_STATUS_FAILED;
     }
     *out_plan = NULL;
+
+    // Detach the previously allocated graph before every validation exit. In
+    // particular, an oversized sibling must not leave the prior cgraph bound
+    // after its caller has conservatively invalidated that binding.
+    ggml_backend_sched_reset(sched);
     if ((int) sched->hash_set.size < graph->n_nodes + graph->n_leafs) {
         return GGML_STATUS_FAILED;
     }
-
-    ggml_backend_sched_reset(sched);
     const enum ggml_status synchronized = ggml_backend_sched_synchronize(sched);
     if (synchronized != GGML_STATUS_SUCCESS) {
         return synchronized;
@@ -2332,6 +2381,7 @@ enum ggml_status ggml_backend_sched_memory_plan_commit_v2(
     // point onward a failure may leave the scheduler's high-water allocation
     // changed even if graph tensor placement cannot be completed.
     *out_flags |= GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
+    sched->allocated_graph = plan->source_graph;
     if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
@@ -2369,7 +2419,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
+    sched->allocated_graph = graph;
     if (!ggml_backend_sched_alloc_splits(sched)) {
+        ggml_backend_sched_reset(sched);
         return false;
     }
 
