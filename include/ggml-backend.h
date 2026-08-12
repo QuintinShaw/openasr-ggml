@@ -630,8 +630,10 @@ extern "C" {
             struct ggml_backend_graph_cancel_capability * cancel_capability);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
-    // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
-    // The correct way to use this API is to discard the deallocated tensors and create new ones.
+    // Scheduler-owned tensor bindings are detached while their buffers are
+    // still alive, and scheduler-inserted source copies are restored. A
+    // retained graph can therefore be allocated again after another graph;
+    // external/static tensor bindings are preserved.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute

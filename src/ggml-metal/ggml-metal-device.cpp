@@ -1441,13 +1441,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
 
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
+    const bool precise_q8 = op->src[1]->type == GGML_TYPE_Q8_0 &&
+            ggml_flash_attn_ext_get_prec(op) == GGML_PREC_F32;
 
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    snprintf(base, 256, "kernel_%s_%s%s_dk%d_dv%d",
             "flash_attn_ext",
             ggml_type_name(op->src[1]->type),
+            precise_q8 ? "_f32" : "",
             dk,
             dv);
 

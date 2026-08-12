@@ -2542,8 +2542,13 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
-    // use vec kernel if the batch size is small and if the head size is supported
-    return (ne01 < 20) && (ne00 % 32 == 0);
+    const bool precise_q8 = op->src[1]->type == GGML_TYPE_Q8_0 &&
+            ggml_flash_attn_ext_get_prec(op) == GGML_PREC_F32;
+
+    // The precise Q8 implementation lives in the regular matrix kernel. Keep
+    // narrow-query precise calls there as well so precision never depends on
+    // the query-count dispatch threshold.
+    return !precise_q8 && (ne01 < 20) && (ne00 % 32 == 0);
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
@@ -2819,6 +2824,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
 
         const int is_q = ggml_is_quantized(op->src[1]->type) ? 1 : 0;
+        const bool precise_q8 = op->src[1]->type == GGML_TYPE_Q8_0 &&
+                ggml_flash_attn_ext_get_prec(op) == GGML_PREC_F32;
+        const int q_shared_width = precise_q8 ? 2 : 1;
+        const int kv_shared_width = precise_q8 ? 2 : 1;
 
         // 2*(2*ncpsg)
         // ncpsg soft_max values + ncpsg mask values
@@ -2827,7 +2836,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // the shared memory needed for the simdgroups to load the KV cache
         // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
         //
-#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
+#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(q_shared_width*ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*kv_shared_width*(16*32*(nsg)))*(sizeof(float)/2), 16))
 
         //int64_t nsgmax = 4;
         //

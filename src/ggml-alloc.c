@@ -1068,6 +1068,48 @@ bool ggml_gallocr_measure_commit_v1(ggml_gallocr_t galloc) {
     return true;
 }
 
+static bool ggml_gallocr_owns_buffer(
+        const ggml_gallocr_t galloc,
+        const ggml_backend_buffer_t buffer) {
+    if (buffer == NULL) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        const struct vbuffer * vbuffer = galloc->buffers[i];
+        if (vbuffer == NULL) {
+            continue;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS && vbuffer->chunks[c] != NULL; ++c) {
+            if (vbuffer->chunks[c] == buffer) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void ggml_gallocr_detach_tensor(
+        const ggml_gallocr_t galloc,
+        struct ggml_tensor * tensor) {
+    if (tensor != NULL && ggml_gallocr_owns_buffer(galloc, tensor->buffer)) {
+        tensor->buffer = NULL;
+        tensor->data = NULL;
+    }
+}
+
+void ggml_gallocr_detach_graph_tensors_v1(
+        ggml_gallocr_t galloc,
+        struct ggml_cgraph * graph) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(graph != NULL);
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        ggml_gallocr_detach_tensor(galloc, graph->leafs[i]);
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_gallocr_detach_tensor(galloc, graph->nodes[i]);
+    }
+}
+
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }

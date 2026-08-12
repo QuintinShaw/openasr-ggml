@@ -86,6 +86,14 @@ GGML_API bool ggml_gallocr_measure_get_chunk_v1(
     uint64_t * currently_allocated_bytes);
 GGML_API bool ggml_gallocr_measure_commit_v1(ggml_gallocr_t galloc);
 
+// Clear tensor bindings owned by this allocator while its backend buffers are
+// still alive. This makes a retained cgraph safe to allocate again after the
+// allocator is reused or grown for a different graph; external/static tensor
+// bindings are preserved.
+GGML_API void ggml_gallocr_detach_graph_tensors_v1(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph);
+
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
