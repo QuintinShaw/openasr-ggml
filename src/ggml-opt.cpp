@@ -585,6 +585,11 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
+    // The scheduler retains tensor bindings and source rewrites for the last
+    // allocated graph. Detach and restore them while the optimizer-owned graph
+    // contexts are still alive; the scheduler itself may be reused after this
+    // optimizer is destroyed.
+    ggml_backend_sched_reset(opt_ctx->backend_sched);
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     ggml_free(opt_ctx->ctx_static);
