@@ -91,6 +91,16 @@ struct rpc_msg_hello_rsp {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+static constexpr bool rpc_protocol_version_compatible(uint8_t major, uint8_t minor, uint8_t patch) {
+    return major == RPC_PROTO_MAJOR_VERSION &&
+           minor == RPC_PROTO_MINOR_VERSION &&
+           patch == RPC_PROTO_PATCH_VERSION;
+}
+
+static_assert(rpc_protocol_version_compatible(4, 0, 5));
+static_assert(!rpc_protocol_version_compatible(4, 0, 4));
+static_assert(!rpc_protocol_version_compatible(4, 1, 5));
+
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
 };
@@ -336,7 +346,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
+    if (!rpc_protocol_version_compatible(response.major, response.minor, response.patch)) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
         return false;
@@ -894,6 +904,10 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (request.srcs[i].id != 0) {
             tensor->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+            if (tensor->src[i] == nullptr) {
+                GGML_LOG_ERROR("[%s] invalid source tensor at index %d\n", __func__, i);
+                return false;
+            }
         }
     }
 
@@ -994,6 +1008,13 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
+        return nullptr;
+    }
+
+    // Operation IDs are serialized as raw enum values. Reject unknown values
+    // before they can reach backend dispatch or index operation-name tables.
+    if (tensor->op >= GGML_OP_COUNT) {
+        GGML_LOG_ERROR("[%s] invalid tensor operation received: %u\n", __func__, tensor->op);
         return nullptr;
     }
 

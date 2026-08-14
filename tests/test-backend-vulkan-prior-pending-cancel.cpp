@@ -72,6 +72,34 @@ static graph_fixture make_graph(ggml_backend_t backend) {
     return { ctx, allocator, graph, output };
 }
 
+static graph_fixture make_large_softmax_graph(ggml_backend_t backend) {
+    // Vulkan's large-softmax path grows two backend scratch buffers during
+    // its first armed graph execution. That growth submits and synchronizes
+    // the same command context, including the legitimate empty second submit
+    // that this regression test protects.
+    constexpr int element_count = 20000;
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, element_count);
+    ggml_tensor * output = ggml_soft_max(ctx, input);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, output);
+    assert(ggml_graph_n_nodes(graph) == 1);
+
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    assert(allocator != nullptr);
+    assert(ggml_gallocr_alloc_graph(allocator, graph));
+    std::vector<float> values(element_count, 1.0f);
+    ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+    assert(ggml_backend_synchronize(backend) == GGML_STATUS_SUCCESS);
+    return { ctx, allocator, graph, output };
+}
+
 static void free_graph(graph_fixture & fixture) {
     ggml_gallocr_free(fixture.allocator);
     ggml_free(fixture.ctx);
@@ -122,6 +150,17 @@ int main() {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     assert(backend != nullptr);
+
+    graph_fixture large_softmax = make_large_softmax_graph(backend);
+    struct ggml_backend_graph_cancel_capability scratch_growth_capability = {};
+    assert(ggml_backend_graph_compute_with_abort(
+        backend, large_softmax.graph, never_cancel, nullptr,
+        &scratch_growth_capability) == GGML_STATUS_SUCCESS);
+    assert(scratch_growth_capability.mechanism == GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+    assert(scratch_growth_capability.observation_granularity ==
+           GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
+    assert(ggml_backend_graph_compute(backend, large_softmax.graph) == GGML_STATUS_SUCCESS);
+    free_graph(large_softmax);
 
     gate_create_fn gate_create = get_test_proc<gate_create_fn>(reg, "ggml_backend_vk_test_gate_create");
     gate_enqueue_wait_fn enqueue_wait =

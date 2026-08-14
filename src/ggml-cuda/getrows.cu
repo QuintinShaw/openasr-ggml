@@ -76,6 +76,71 @@ static __global__ void k_get_rows_float(
     }
 }
 
+static inline __device__ void get_scale_min_k4_rows(
+        const int j, const uint8_t * scales, uint8_t & scale, uint8_t & minimum) {
+    if (j < 4) {
+        scale   = scales[j]     & 0x3f;
+        minimum = scales[j + 4] & 0x3f;
+    } else {
+        scale   = (scales[j + 4] & 0x0f) | ((scales[j - 4] >> 6) << 4);
+        minimum = (scales[j + 4] >> 4)   | ((scales[j]     >> 6) << 4);
+    }
+}
+
+// q4_K uses one 256-element super-block with eight independently scaled
+// 32-element groups. Unlike the legacy q4 formats, its two values cannot be
+// recovered by the generic (qk, qr, iqs) dequantizer above. Decode one complete
+// super-block per CUDA block instead, reusing the same 32-thread mapping as the
+// canonical q4_K row dequantizer in convert.cu while selecting only requested
+// rows.
+template<typename dst_t>
+static __global__ void k_get_rows_q4_K(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_sync();
+    const int64_t blocks_per_row = ne00 / QK_K;
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const block_q4_K * src0_row = (const block_q4_K *)((const char *)src0
+            + i01*nb01 + i11*nb02 + i12*nb03);
+
+        for (int64_t ib = blockIdx.y; ib < blocks_per_row; ib += gridDim.y) {
+            const block_q4_K & block = src0_row[ib];
+            const int64_t tid = threadIdx.x;
+            const int64_t il  = tid / 8;
+            const int64_t ir  = tid % 8;
+            const int64_t is  = 2*il;
+            const int64_t base = ib*QK_K + 64*il + 4*ir;
+
+            const float dall = __low2half(block.dm);
+            const float dmin = __high2half(block.dm);
+            const uint8_t * q = block.qs + 32*il + 4*ir;
+
+            uint8_t sc, m;
+            get_scale_min_k4_rows(is, block.scales, sc, m);
+            const float d1 = dall*sc;
+            const float m1 = dmin*m;
+            get_scale_min_k4_rows(is + 1, block.scales, sc, m);
+            const float d2 = dall*sc;
+            const float m2 = dmin*m;
+            #pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                dst_row[base + l]      = ggml_cuda_cast<dst_t>(d1*(q[l] & 0x0f) - m1);
+                dst_row[base + l + 32] = ggml_cuda_cast<dst_t>(d2*(q[l] >> 4)   - m2);
+            }
+        }
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -176,6 +241,44 @@ static void get_rows_cuda_float(
         s10, s11, s12/*, s13*/);
 }
 
+template<typename dst_t>
+static void get_rows_cuda_q4_K(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 > 0 && ne00 % QK_K == 0);
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+
+    const int64_t blocks_per_row = ne00 / QK_K;
+    const dim3 block_dims(32, 1, 1);
+    const dim3 block_nums(
+        ne10,
+        MIN(blocks_per_row, (int64_t)UINT16_MAX),
+        MIN(ne11*ne12, (int64_t)UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    const ggml_cuda_kernel_launch_params launch_params = {
+        block_nums, block_dims, 0, stream
+    };
+    ggml_cuda_kernel_launch(k_get_rows_q4_K<dst_t>, launch_params,
+        src0_d, src1_d, dst_d,
+        ne00, ne11, ne12_fdv,
+        s1, s2, s3,
+        nb01, nb02, nb03,
+        s10, s11, s12);
+}
+
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
@@ -224,8 +327,11 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q4_K:
+            get_rows_cuda_q4_K(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         default:
-            // TODO: k-quants
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;
     }

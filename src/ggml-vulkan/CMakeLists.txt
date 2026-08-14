@@ -181,6 +181,10 @@ if (Vulkan_FOUND)
     ExternalProject_Add(
         vulkan-shaders-gen
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders
+        # Cargo and other superbuilds already place this project below a deep
+        # per-package output path. Keep the host generator's build tree flat
+        # enough for MSVC's object-file path limit on Windows.
+        BINARY_DIR ${CMAKE_BINARY_DIR}/vk-gen
         CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
                    -DCMAKE_INSTALL_BINDIR=.
                    -DCMAKE_BUILD_TYPE=$<CONFIG>

@@ -1,0 +1,82 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) readonly buffer InputWeights { float input_weights[]; };
+layout(binding = 2) readonly buffer RecurrentWeights { float recurrent_weights[]; };
+layout(binding = 3) readonly buffer Bias { float bias_data[]; };
+layout(binding = 4) readonly buffer Output { float output_data[]; };
+layout(binding = 5) buffer Workspace { float workspace_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint input_size;
+    uint sequence_length;
+    uint batch_size;
+    uint hidden_size;
+    uint bias_elements;
+    uint reverse;
+    uint logical_step;
+    uint input_offset;
+    uint input_weights_offset;
+    uint recurrent_weights_offset;
+    uint bias_offset;
+    uint output_offset;
+    uint workspace_offset;
+};
+
+#if !USE_SUBGROUP_ADD
+shared float partials[32];
+#endif
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint gate_units = 4 * hidden_size;
+    const uint job = gl_WorkGroupID.x;
+    const uint batch = job / gate_units;
+    const uint gate_unit = job - batch * gate_units;
+    const uint time = reverse != 0 ? sequence_length - 1 - logical_step : logical_step;
+    float sum = 0.0;
+
+    const uint input_base = input_offset + input_size * (time + sequence_length * batch);
+    const uint input_weight_base = input_weights_offset + input_size * gate_unit;
+    for (uint k = lane; k < input_size; k += 32) {
+        sum += input_data[input_base + k] * input_weights[input_weight_base + k];
+    }
+
+    if (logical_step != 0) {
+        const uint previous_time = reverse != 0 ? sequence_length - logical_step : logical_step - 1;
+        const uint previous_output_base = output_offset + hidden_size * (previous_time + sequence_length * batch);
+        const uint recurrent_weight_base = recurrent_weights_offset + hidden_size * gate_unit;
+        for (uint k = lane; k < hidden_size; k += 32) {
+            sum += output_data[previous_output_base + k] * recurrent_weights[recurrent_weight_base + k];
+        }
+    }
+
+#if USE_SUBGROUP_ADD
+    sum = subgroupAdd(sum);
+#else
+    partials[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        barrier();
+    }
+    sum = partials[0];
+#endif
+
+    if (lane == 0) {
+        float value = sum + bias_data[bias_offset + gate_unit];
+        if (bias_elements == 8 * hidden_size) {
+            value += bias_data[bias_offset + gate_units + gate_unit];
+        }
+        workspace_data[workspace_offset + gate_unit + 5 * hidden_size * batch] = value;
+    }
+}

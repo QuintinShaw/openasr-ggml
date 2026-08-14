@@ -19,7 +19,11 @@ layout (push_constant) uniform parameter
     int p0; int p1;
     int d0; int d1;
     uint batch_IC;
+    uint misalign_offsets;
 } p;
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 
@@ -94,14 +98,14 @@ void im2col(const uint ow, const uint z_idx) {
 
             A_TYPE val = A_TYPE(0);
             if (uint(iih) < p.IH && uint(iiw) < p.IW) {
-                val = data_a[ic_offset + uint(iih) * p.IW + uint(iiw)];
+                val = data_a[get_aoffset() + ic_offset + uint(iih) * p.IW + uint(iiw)];
             }
 
 #if BDA
             D_ptr(current_dst_addr).d = D_TYPE(val);
             current_dst_addr += bda_step;
 #else
-            data_d[current_dst_idx] = D_TYPE(val);
+            data_d[get_doffset() + current_dst_idx] = D_TYPE(val);
             current_dst_idx += BLOCK_SIZE;
 #endif
 

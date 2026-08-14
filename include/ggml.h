@@ -595,6 +595,10 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        // Keep newly added operations at the end so RPC numeric IDs for all
+        // existing operations remain stable across protocol patch versions.
+        GGML_OP_LSTM_SEQ,
+        GGML_OP_ARGMAX_FIRST,
 
         GGML_OP_COUNT,
     };
@@ -622,8 +626,14 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        GGML_UNARY_OP_SWOOSH,
 
         GGML_UNARY_OP_COUNT,
+    };
+
+    enum ggml_lstm_gate_order {
+        GGML_LSTM_GATE_ORDER_IOFC = 0,
+        GGML_LSTM_GATE_ORDER_IFGO = 1,
     };
 
     enum ggml_glu_op {
@@ -1028,6 +1038,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // softplus(a - offset) - linear_scale*a - shift
+    GGML_API struct ggml_tensor * ggml_swoosh(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 offset,
+            float                 shift,
+            float                 linear_scale);
+
     GGML_API struct ggml_tensor * ggml_sin(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1065,6 +1083,11 @@ extern "C" {
 
     // argmax along rows
     GGML_API struct ggml_tensor * ggml_argmax(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // argmax along rows, resolving exact ties to the lowest column index
+    GGML_API struct ggml_tensor * ggml_argmax_first(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
@@ -2490,6 +2513,19 @@ extern "C" {
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids);
+
+    // x: [input, seq, batch], w: [input, 4*hidden], r: [hidden, 4*hidden]
+    // b: [4*hidden] or [8*hidden], result: [hidden, seq, batch]
+    // The initial hidden and cell states are zero. reverse changes traversal direction
+    // while keeping outputs at their original time indices.
+    GGML_API struct ggml_tensor * ggml_lstm_seq(
+            struct ggml_context *       ctx,
+            struct ggml_tensor  *       x,
+            struct ggml_tensor  *       w,
+            struct ggml_tensor  *       r,
+            struct ggml_tensor  *       b,
+            enum ggml_lstm_gate_order   gate_order,
+            bool                         reverse);
 
     // partition into non-overlapping windows with padding if needed
     // example:

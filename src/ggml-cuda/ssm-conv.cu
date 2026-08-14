@@ -147,13 +147,15 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         }
     };
 
+    GGML_ASSERT(ggml_cuda_ssm_conv_supports_d_conv(nc));
     switch (nc) {
         case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
         case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
         case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+        case 20: launch_kernel(std::integral_constant<int, 20>{}); break;
+        default: GGML_ABORT("unreachable");
     }
 }
 
@@ -177,7 +179,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t n_t = out->ne[1];                 // tokens per sequence
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
 
-    GGML_ASSERT(out->ne[0] == nr);
+    GGML_ASSERT(ggml_cuda_ssm_conv_supports_shape(src0, src1, dst));
+    GGML_ASSERT(ggml_cuda_ssm_conv_supports_shape(src0, src1, out));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
@@ -189,6 +192,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     cudaStream_t  stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(out->type == GGML_TYPE_F32);
     if (fuse_bias) {
         GGML_ASSERT(bias->type == GGML_TYPE_F32);

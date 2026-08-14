@@ -5,6 +5,13 @@
 #include "common.cuh"
 #include "sum.cuh"
 
+template <bool first_max>
+static __device__ __forceinline__ bool argmax_better(float value, int col, float best_value, int best_col) {
+    return value > best_value ||
+        (first_max && value == best_value && (best_col < 0 || col < best_col));
+}
+
+template <bool first_max>
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
@@ -14,7 +21,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
         const float val = rowx[col];
-        if (val > maxval) {
+        if (argmax_better<first_max>(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -24,7 +31,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        if (argmax_better<first_max>(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -53,7 +60,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (argmax_better<first_max>(val, col, maxval, argmax)) {
                     maxval = val;
                     argmax = col;
                 }
@@ -87,5 +94,10 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const dim3 blocks_dim(num_threads, 1, 1);
     const dim3 blocks_num(num_blocks, 1, 1);
 
-    argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
+    if (dst->op == GGML_OP_ARGMAX_FIRST) {
+        argmax_f32<true><<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
+    } else {
+        GGML_ASSERT(dst->op == GGML_OP_ARGMAX);
+        argmax_f32<false><<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
+    }
 }

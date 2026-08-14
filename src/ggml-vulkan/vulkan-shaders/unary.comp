@@ -105,6 +105,13 @@ float op_softplus(float x) {
     return (x > 20.0f) ? x : log(1.0f + exp(x));
 }
 
+float op_swoosh(float x) {
+    const float shifted = x - p.param1;
+    const float softplus = op_softplus(shifted);
+    const float linear = p.param3 * x;
+    return (softplus - linear) - p.param2;
+}
+
 float op_gelu_erf(float a) {
     // based on Abramowitz and Stegun formula 7.1.26 or similar Hastings' approximation
     const float p_erf  = 0.3275911f;
