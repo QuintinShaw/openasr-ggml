@@ -1109,9 +1109,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "LSTM_SEQ",
+    "ARGMAX_FIRST",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "lstm_seq(x, w, r, b)",
+    "argmax_first(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1254,9 +1258,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "SWOOSH",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -2431,6 +2436,29 @@ struct ggml_tensor * ggml_softplus_inplace(
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_SOFTPLUS);
 }
 
+struct ggml_tensor * ggml_swoosh(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 offset,
+        float                 shift,
+        float                 linear_scale) {
+    GGML_ASSERT(isfinite(offset));
+    GGML_ASSERT(isfinite(shift));
+    GGML_ASSERT(isfinite(linear_scale));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) GGML_UNARY_OP_SWOOSH);
+    ggml_set_op_params_f32(result, 1, offset);
+    ggml_set_op_params_f32(result, 2, shift);
+    ggml_set_op_params_f32(result, 3, linear_scale);
+
+    result->op     = GGML_OP_UNARY;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_sin
 
 static struct ggml_tensor * ggml_sin_impl(
@@ -2554,6 +2582,24 @@ struct ggml_tensor * ggml_argmax(
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, a->ne[1]);
 
     result->op     = GGML_OP_ARGMAX;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_argmax_first
+
+struct ggml_tensor * ggml_argmax_first(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(ggml_is_matrix(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] > 0 && a->ne[0] <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, a->ne[1]);
+
+    result->op     = GGML_OP_ARGMAX_FIRST;
     result->src[0] = a;
 
     return result;
@@ -5725,6 +5771,67 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[4] = B;
     result->src[5] = C;
     result->src[6] = ids;
+
+    return result;
+}
+
+// ggml_lstm_seq
+
+struct ggml_tensor * ggml_lstm_seq(
+        struct ggml_context *       ctx,
+        struct ggml_tensor  *       x,
+        struct ggml_tensor  *       w,
+        struct ggml_tensor  *       r,
+        struct ggml_tensor  *       b,
+        enum ggml_lstm_gate_order   gate_order,
+        bool                         reverse) {
+    GGML_ASSERT(ctx != NULL);
+    GGML_ASSERT(x != NULL && w != NULL && r != NULL && b != NULL);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(r->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(r));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(x->view_offs % sizeof(float) == 0);
+    GGML_ASSERT(w->view_offs % sizeof(float) == 0);
+    GGML_ASSERT(r->view_offs % sizeof(float) == 0);
+    GGML_ASSERT(b->view_offs % sizeof(float) == 0);
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_matrix(w));
+    GGML_ASSERT(ggml_is_matrix(r));
+    GGML_ASSERT(ggml_is_vector(b));
+    GGML_ASSERT(x->ne[0] > 0 && x->ne[0] <= INT32_MAX);
+    GGML_ASSERT(x->ne[1] > 0);
+    GGML_ASSERT(x->ne[2] > 0);
+    GGML_ASSERT(w->ne[0] == x->ne[0]);
+    GGML_ASSERT(w->ne[1] % 4 == 0);
+
+    const int64_t hidden = w->ne[1] / 4;
+
+    GGML_ASSERT(hidden >= 1 && hidden <= 256);
+    GGML_ASSERT(r->ne[0] == hidden);
+    GGML_ASSERT(r->ne[1] == w->ne[1]);
+    GGML_ASSERT(b->ne[0] == w->ne[1] || b->ne[0] == 2*w->ne[1]);
+    GGML_ASSERT(gate_order == GGML_LSTM_GATE_ORDER_IOFC || gate_order == GGML_LSTM_GATE_ORDER_IFGO);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, x->ne[1], x->ne[2]);
+    // GPU backends split gate reduction and state update into bounded dispatches
+    // so no single kernel can exceed the host watchdog. The graph-owned workspace
+    // carries gate preactivations and cell state between those dispatches.
+    struct ggml_tensor * cell_workspace = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5*hidden, x->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) gate_order);
+    ggml_set_op_params_i32(result, 1, reverse ? 1 : 0);
+
+    result->op     = GGML_OP_LSTM_SEQ;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = r;
+    result->src[3] = b;
+    result->src[4] = cell_workspace;
 
     return result;
 }

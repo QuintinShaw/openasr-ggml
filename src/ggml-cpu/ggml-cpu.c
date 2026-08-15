@@ -1793,6 +1793,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argmax(params, tensor);
             } break;
+        case GGML_OP_ARGMAX_FIRST:
+            {
+                ggml_compute_forward_argmax_first(params, tensor);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 ggml_compute_forward_count_equal(params, tensor);
@@ -2019,6 +2023,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
+            } break;
+        case GGML_OP_LSTM_SEQ:
+            {
+                ggml_compute_forward_lstm_seq(params, tensor);
             } break;
         case GGML_OP_WIN_PART:
             {
@@ -2257,6 +2265,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = 1;
             } break;
+        case GGML_OP_ARGMAX_FIRST:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
@@ -2300,6 +2312,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_XIELU:
+                case GGML_UNARY_OP_SWOOSH:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2407,6 +2420,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_LSTM_SEQ:
+            {
+                n_tasks = MIN(n_threads, (int) MIN(node->src[0]->ne[2], (int64_t) n_threads));
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:

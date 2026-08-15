@@ -512,6 +512,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_ARGMAX_FIRST:
+            return src0 != nullptr && src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                ggml_is_matrix(src0) && ggml_is_contiguous(src0) &&
+                src0->ne[0] > 0 && src0->ne[0] <= INT32_MAX &&
+                op->ne[0] == src0->ne[1] && ggml_is_vector(op);
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
@@ -542,6 +547,51 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return (src0->type == GGML_TYPE_F32 ||
                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_LSTM_SEQ: {
+            const struct ggml_tensor * src2 = op->src[2];
+            const struct ggml_tensor * src3 = op->src[3];
+            const struct ggml_tensor * src4 = op->src[4];
+
+            if (src0 == nullptr || src1 == nullptr || src2 == nullptr || src3 == nullptr || src4 == nullptr ||
+                src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+                src2->type != GGML_TYPE_F32 || src3->type != GGML_TYPE_F32 ||
+                src4->type != GGML_TYPE_F32 ||
+                op->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+                !ggml_is_contiguous(src2) || !ggml_is_contiguous(src3) ||
+                !ggml_is_contiguous(src4) || !ggml_is_contiguous(op) || !ggml_is_3d(src0) ||
+                !ggml_is_matrix(src1) || !ggml_is_matrix(src2) ||
+                !ggml_is_vector(src3) || !ggml_is_matrix(src4) || !ggml_is_3d(op) ||
+                src0->ne[0] <= 0 || src0->ne[0] > INT32_MAX ||
+                src0->ne[1] <= 0 || src0->ne[2] <= 0 ||
+                src1->ne[0] != src0->ne[0] || src1->ne[1] % 4 != 0) {
+                return false;
+            }
+            for (int i = 5; i < GGML_MAX_SRC; ++i) {
+                if (op->src[i] != nullptr) {
+                    return false;
+                }
+            }
+            const struct ggml_tensor * tensors[] = { src0, src1, src2, src3, src4, op };
+            for (const struct ggml_tensor * tensor : tensors) {
+                if (tensor->view_offs % alignof(float) != 0 ||
+                    (tensor->data != nullptr && (uintptr_t) tensor->data % alignof(float) != 0)) {
+                    return false;
+                }
+            }
+
+            const int64_t hidden = src1->ne[1]/4;
+            const int32_t gate_order = ggml_get_op_params_i32(op, 0);
+            const int32_t reverse = ggml_get_op_params_i32(op, 1);
+
+            return hidden >= 1 && hidden <= 256 &&
+                src2->ne[0] == hidden && src2->ne[1] == 4*hidden &&
+                (src3->ne[0] == 4*hidden || src3->ne[0] == 8*hidden) &&
+                src4->ne[0] == 5*hidden && src4->ne[1] == src0->ne[2] &&
+                op->ne[0] == hidden && op->ne[1] == src0->ne[1] && op->ne[2] == src0->ne[2] &&
+                (gate_order == GGML_LSTM_GATE_ORDER_IOFC || gate_order == GGML_LSTM_GATE_ORDER_IFGO) &&
+                (reverse == 0 || reverse == 1);
+        }
         default:
             return true;
     }

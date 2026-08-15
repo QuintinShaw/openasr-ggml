@@ -19,6 +19,9 @@ layout (push_constant) uniform parameter
     int pad_y;
     int dilation_x;
     int dilation_y;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
 } p;
 
 layout (binding = 0) readonly buffer A {A_TYPE knl_data[];};
@@ -49,8 +52,8 @@ FLOAT_TYPE conv_2d_dw_whcn(uint idx) {
             if (src_x >= p.src_w) { // src_x < 0 will wrap to a large unsigned int
                 continue;
             }
-            FLOAT_TYPE v = FLOAT_TYPE(src_data[src_i + src_y * p.src_w + src_x]);
-            FLOAT_TYPE k = FLOAT_TYPE(knl_data[knl_i + knl_y * p.knl_w + knl_x]);
+            FLOAT_TYPE v = FLOAT_TYPE(src_data[p.b_offset + src_i + src_y * p.src_w + src_x]);
+            FLOAT_TYPE k = FLOAT_TYPE(knl_data[p.a_offset + knl_i + knl_y * p.knl_w + knl_x]);
             sum = fma(v, k, sum);
         }
     }
@@ -80,8 +83,8 @@ FLOAT_TYPE conv_2d_dw_cwhn(uint idx) {
             if (src_x >= p.src_w) { // src_x < 0 will wrap to a large unsigned int
                 continue;
             }
-            FLOAT_TYPE v = FLOAT_TYPE(src_data[src_i + src_y * src_row + src_x * p.channels + c]);
-            FLOAT_TYPE k = FLOAT_TYPE(knl_data[        knl_y * knl_row + knl_x * p.channels + c]);
+            FLOAT_TYPE v = FLOAT_TYPE(src_data[p.b_offset + src_i + src_y * src_row + src_x * p.channels + c]);
+            FLOAT_TYPE k = FLOAT_TYPE(knl_data[p.a_offset +         knl_y * knl_row + knl_x * p.channels + c]);
             sum = fma(v, k, sum);
         }
     }
@@ -100,6 +103,6 @@ void main() {
 #else
         conv_2d_dw_cwhn(idx);
 #endif
-    dst_data[idx] = D_TYPE(result);
+    dst_data[p.d_offset + idx] = D_TYPE(result);
 }
 

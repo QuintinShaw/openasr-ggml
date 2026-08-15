@@ -1613,6 +1613,39 @@ void ggml_compute_forward_argmax(
     }
 }
 
+// ggml_compute_forward_argmax_first
+
+void ggml_compute_forward_argmax_first(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(src0->ne[0] > 0 && src0->ne[0] <= INT32_MAX);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    const int64_t ncols = src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t rows_per_thread = (nrows + params->nth - 1) / params->nth;
+    const int64_t row_begin = rows_per_thread * params->ith;
+    const int64_t row_end = std::min(row_begin + rows_per_thread, nrows);
+
+    for (int64_t row = row_begin; row < row_end; ++row) {
+        const float * values = (const float *) ((const char *) src0->data + row * src0->nb[1]);
+        int32_t best = 0;
+        for (int32_t col = 1; col < ncols; ++col) {
+            if (values[col] > values[best]) {
+                best = col;
+            }
+        }
+        ((int32_t *) dst->data)[row] = best;
+    }
+}
+
 // ggml_compute_forward_count_equal
 
 static void ggml_compute_forward_count_equal_i32(
@@ -10012,6 +10045,124 @@ void ggml_compute_forward_ssm_scan(
     }
 }
 
+// ggml_compute_forward_lstm_seq
+
+static float ggml_lstm_sigmoid_f32(float x) {
+    if (x >= 0.0f) {
+        const float z = expf(-x);
+        return 1.0f/(1.0f + z);
+    }
+
+    const float z = expf(x);
+    return z/(1.0f + z);
+}
+
+static void ggml_compute_forward_lstm_seq_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * r = dst->src[2];
+    const ggml_tensor * b = dst->src[3];
+
+    const int64_t input  = x->ne[0];
+    const int64_t seq    = x->ne[1];
+    const int64_t batch  = x->ne[2];
+    const int64_t hidden = dst->ne[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(r));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(input > 0 && input <= INT32_MAX);
+    GGML_ASSERT(seq > 0 && batch > 0);
+    GGML_ASSERT(hidden >= 1 && hidden <= 256);
+    GGML_ASSERT(w->ne[0] == input && w->ne[1] == 4*hidden);
+    GGML_ASSERT(r->ne[0] == hidden && r->ne[1] == 4*hidden);
+    GGML_ASSERT(b->ne[0] == 4*hidden || b->ne[0] == 8*hidden);
+
+    const int32_t gate_order = ggml_get_op_params_i32(dst, 0);
+    const int32_t reverse = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(gate_order == GGML_LSTM_GATE_ORDER_IOFC || gate_order == GGML_LSTM_GATE_ORDER_IFGO);
+    GGML_ASSERT(reverse == 0 || reverse == 1);
+
+    const int input_gate  = 0;
+    const int forget_gate = gate_order == GGML_LSTM_GATE_ORDER_IOFC ? 2 : 1;
+    const int cell_gate   = gate_order == GGML_LSTM_GATE_ORDER_IOFC ? 3 : 2;
+    const int output_gate = gate_order == GGML_LSTM_GATE_ORDER_IOFC ? 1 : 3;
+    const bool has_recurrent_bias = b->ne[0] == 8*hidden;
+
+    const float * x_data = (const float *) x->data;
+    const float * w_data = (const float *) w->data;
+    const float * r_data = (const float *) r->data;
+    const float * b_data = (const float *) b->data;
+          float * y_data = (      float *) dst->data;
+
+    for (int64_t ib = params->ith; ib < batch; ib += params->nth) {
+        float h[256] = { 0.0f };
+        float c[256] = { 0.0f };
+        float h_next[256];
+
+        for (int64_t step = 0; step < seq; ++step) {
+            const int64_t it = reverse ? seq - 1 - step : step;
+            const float * x_row = x_data + (ib*seq + it)*input;
+                  float * y_row = y_data + (ib*seq + it)*hidden;
+
+            for (int64_t ih = 0; ih < hidden; ++ih) {
+                const int64_t i_col = input_gate*hidden + ih;
+                const int64_t f_col = forget_gate*hidden + ih;
+                const int64_t c_col = cell_gate*hidden + ih;
+                const int64_t o_col = output_gate*hidden + ih;
+                float i_pre = b_data[i_col] + (has_recurrent_bias ? b_data[4*hidden + i_col] : 0.0f);
+                float f_pre = b_data[f_col] + (has_recurrent_bias ? b_data[4*hidden + f_col] : 0.0f);
+                float c_pre = b_data[c_col] + (has_recurrent_bias ? b_data[4*hidden + c_col] : 0.0f);
+                float o_pre = b_data[o_col] + (has_recurrent_bias ? b_data[4*hidden + o_col] : 0.0f);
+                float dot = 0.0f;
+
+                ggml_vec_dot_f32((int) input, &dot, 0, x_row, 0, w_data + i_col*input, 0, 1);
+                i_pre += dot;
+                ggml_vec_dot_f32((int) input, &dot, 0, x_row, 0, w_data + f_col*input, 0, 1);
+                f_pre += dot;
+                ggml_vec_dot_f32((int) input, &dot, 0, x_row, 0, w_data + c_col*input, 0, 1);
+                c_pre += dot;
+                ggml_vec_dot_f32((int) input, &dot, 0, x_row, 0, w_data + o_col*input, 0, 1);
+                o_pre += dot;
+
+                ggml_vec_dot_f32((int) hidden, &dot, 0, h, 0, r_data + i_col*hidden, 0, 1);
+                i_pre += dot;
+                ggml_vec_dot_f32((int) hidden, &dot, 0, h, 0, r_data + f_col*hidden, 0, 1);
+                f_pre += dot;
+                ggml_vec_dot_f32((int) hidden, &dot, 0, h, 0, r_data + c_col*hidden, 0, 1);
+                c_pre += dot;
+                ggml_vec_dot_f32((int) hidden, &dot, 0, h, 0, r_data + o_col*hidden, 0, 1);
+                o_pre += dot;
+
+                const float input_value  = ggml_lstm_sigmoid_f32(i_pre);
+                const float forget_value = ggml_lstm_sigmoid_f32(f_pre);
+                const float cell_value   = tanhf(c_pre);
+                const float output_value = ggml_lstm_sigmoid_f32(o_pre);
+
+                c[ih] = forget_value*c[ih] + input_value*cell_value;
+                h_next[ih] = output_value*tanhf(c[ih]);
+            }
+
+            memcpy(h, h_next, hidden*sizeof(float));
+            memcpy(y_row, h, hidden*sizeof(float));
+        }
+    }
+}
+
+void ggml_compute_forward_lstm_seq(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_lstm_seq_f32(params, dst);
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(
@@ -10232,6 +10383,10 @@ void ggml_compute_forward_unary(
         case GGML_UNARY_OP_SOFTPLUS:
             {
                 ggml_compute_forward_softplus(params, dst);
+            } break;
+        case GGML_UNARY_OP_SWOOSH:
+            {
+                ggml_compute_forward_swoosh(params, dst);
             } break;
         default:
             {

@@ -67,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/lstm-seq.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2105,6 +2106,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
+        case GGML_OP_ARGMAX_FIRST:
             ggml_cuda_argmax(ctx, dst);
             break;
         case GGML_OP_COUNT_EQUAL:
@@ -2223,6 +2225,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     break;
                 case GGML_UNARY_OP_SOFTPLUS:
                     ggml_cuda_op_softplus(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_SWOOSH:
+                    ggml_cuda_op_swoosh(ctx, dst);
                     break;
                 default:
                     return false;
@@ -2358,7 +2363,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_conv2d(ctx, dst);
             break;
         case GGML_OP_CONV_2D_DW:
-            ggml_cuda_op_conv2d_dw(ctx, dst);
+            if (!ggml_cuda_op_conv2d_dw(ctx, dst)) {
+                return false;
+            }
             break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             ggml_cuda_conv_2d_transpose_p0(ctx, dst);
@@ -2443,6 +2450,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_LSTM_SEQ:
+            ggml_cuda_op_lstm_seq(ctx, dst);
             break;
         default:
             return false;
@@ -4908,6 +4918,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
+                case GGML_UNARY_OP_SWOOSH:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_XIELU:
                 case GGML_UNARY_OP_FLOOR:
@@ -5005,6 +5016,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_K:
                         return true;
                     default:
                         return false;
@@ -5097,6 +5109,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_ARGMAX:
+        case GGML_OP_ARGMAX_FIRST:
+            {
+                return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
+                    op->type == GGML_TYPE_I32 && ggml_is_matrix(op->src[0]) &&
+                    ggml_is_contiguous(op->src[0]) && op->src[0]->ne[0] > 0 &&
+                    op->src[0]->ne[0] <= INT32_MAX && op->ne[0] == op->src[0]->ne[1] &&
+                    ggml_is_vector(op);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 return true;
@@ -5205,8 +5225,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            const ggml_tensor * src0 = op->src[0];
+            const ggml_tensor * src1 = op->src[1];
+
+            // The CUDA kernels load a 128-channel tile and only instantiate the
+            // convolution widths listed by ggml_cuda_ssm_conv_supports_d_conv.
+            return op->type == GGML_TYPE_F32 &&
+                   src0->type == GGML_TYPE_F32 &&
+                   src1->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) &&
+                   src1->nb[0] == sizeof(float) &&
+                   src0->nb[1] == src0->ne[0] * sizeof(float) &&
+                   src0->ne[1] % 128 == 0 &&
+                   ggml_cuda_ssm_conv_supports_shape(src0, src1, op) &&
+                   ggml_cuda_ssm_conv_supports_d_conv(src1->ne[0]);
         }
         case GGML_OP_CONT:
             return true;
@@ -5233,7 +5265,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_2D:
             return true;
         case GGML_OP_CONV_2D_DW:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return ggml_cuda_supports_conv2d_dw(op);
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_2D:
             return true;
@@ -5296,6 +5328,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_LSTM_SEQ:
+            return ggml_cuda_lstm_seq_supported(op);
 
         default:
             return false;

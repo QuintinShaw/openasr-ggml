@@ -536,6 +536,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return ret;
     };
 
+    // Stateful nonlinear sequence operations cannot be reconstructed from
+    // independently computed partial sums. Keep them replicated until a
+    // dedicated, shape-aware batch sharding contract exists.
+    auto handle_mirrored_only = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    };
+
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
@@ -849,6 +862,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CUMSUM:
             case GGML_OP_MEAN:
             case GGML_OP_ARGMAX:
+            case GGML_OP_ARGMAX_FIRST:
             case GGML_OP_COUNT_EQUAL: {
                 split_state = handle_per_row(src_ss);
             } break;
@@ -992,6 +1006,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_LSTM_SEQ: {
+                split_state = handle_mirrored_only(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

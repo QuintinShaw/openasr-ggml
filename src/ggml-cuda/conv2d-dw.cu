@@ -1,4 +1,5 @@
 #include "conv2d-dw.cuh"
+#include "convert.cuh"
 
 struct conv_params {
     int in_w, in_h;
@@ -78,8 +79,9 @@ struct cwhn_layout {
     }
 };
 
-template <typename T, typename Layout>
-__global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restrict__ kernel, T * __restrict__ output,
+template <typename KernelT, typename Layout>
+__global__ void conv2d_dw_kernel(const float * __restrict__ input, const KernelT * __restrict__ kernel,
+                                 float * __restrict__ output,
                                  const int in_w, const int in_h, const int out_w, const int out_h,
                                  const int kernel_w, const int kernel_h, const int stride_x, const int stride_y,
                                  const int padding_x, const int padding_y, const int dilation_x, const int dilation_y,
@@ -97,7 +99,7 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
     int batch_idx, channel_idx, out_y_idx, out_x_idx;
     Layout::unpack_indices(global_idx, params, batch_idx, channel_idx, out_y_idx, out_x_idx);
 
-    T accumulator = 0;
+    float accumulator = 0.0f;
     kernel_bounds bounds = calculate_kernel_bounds(out_x_idx, out_y_idx, params);
 
     for (int kern_y = bounds.y_min; kern_y < bounds.y_max; ++kern_y) {
@@ -106,8 +108,9 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
         for (int kern_x = bounds.x_min; kern_x < bounds.x_max; ++kern_x) {
             int in_x_idx = calculate_input_coord(out_x_idx, kern_x, params.stride_x, params.dilation_x, params.padding_x);
 
-            const T input_val  = input[Layout::input_index(batch_idx, channel_idx, in_y_idx, in_x_idx, params)];
-            const T kernel_val = kernel[Layout::kernel_index(channel_idx, kern_y, kern_x, params)];
+            const float input_val = input[Layout::input_index(batch_idx, channel_idx, in_y_idx, in_x_idx, params)];
+            const float kernel_val = ggml_cuda_cast<float>(
+                kernel[Layout::kernel_index(channel_idx, kern_y, kern_x, params)]);
 
             accumulator += input_val * kernel_val;
         }
@@ -116,12 +119,71 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
     output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] = accumulator;
 }
 
-void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+bool ggml_cuda_supports_conv2d_dw(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * input  = dst->src[1];
+    const bool supported_shape =
+        kernel->ne[2] == 1 && kernel->ne[3] == input->ne[2] &&
+        dst->ne[2] == input->ne[2] && dst->ne[3] == input->ne[3];
+    const bool supported_types =
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16) &&
+        input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    if (!supported_shape || !supported_types) {
+        return false;
+    }
+
+    const bool whcn = ggml_is_contiguous(input) && ggml_is_contiguous(kernel) && ggml_is_contiguous(dst);
+
+    const size_t input_type_size  = ggml_type_size(input->type);
+    const size_t kernel_type_size = ggml_type_size(kernel->type);
+    const size_t output_type_size = ggml_type_size(dst->type);
+    const bool cwhn_input =
+        input->nb[2] == input_type_size && input->nb[0] == input->ne[2] * input_type_size &&
+        input->nb[1] == input->ne[0] * input->nb[0] && input->nb[3] == input->ne[1] * input->nb[1];
+    const bool cwhn_kernel =
+        kernel->nb[3] == kernel_type_size && kernel->nb[0] == input->ne[2] * kernel_type_size &&
+        kernel->nb[1] == kernel->ne[0] * kernel->nb[0];
+    const bool cwhn_output =
+        dst->nb[2] == output_type_size && dst->nb[0] == dst->ne[2] * output_type_size &&
+        dst->nb[1] == dst->ne[0] * dst->nb[0] && dst->nb[3] == dst->ne[1] * dst->nb[1];
+    const bool cwhn = cwhn_input && cwhn_kernel && cwhn_output;
+    return whcn || cwhn;
+}
+
+template <typename KernelT>
+static void launch_conv2d_dw(
+        const float * input, const KernelT * kernel, float * output, const conv_params & params,
+        bool cwhn, cudaStream_t stream) {
+    const int total  = params.batches * params.channels * params.out_h * params.out_w;
+    const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
+
+    if (cwhn) {
+        conv2d_dw_kernel<KernelT, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, stream>>>(
+            input, kernel, output, params.in_w, params.in_h, params.out_w, params.out_h, params.kernel_w,
+            params.kernel_h, params.stride_x, params.stride_y, params.padding_x, params.padding_y,
+            params.dilation_x, params.dilation_y, params.channels, params.batches);
+    } else {
+        conv2d_dw_kernel<KernelT, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, stream>>>(
+            input, kernel, output, params.in_w, params.in_h, params.out_w, params.out_h, params.kernel_w,
+            params.kernel_h, params.stride_x, params.stride_y, params.padding_x, params.padding_y,
+            params.dilation_x, params.dilation_y, params.channels, params.batches);
+    }
+}
+
+bool ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
 
-    GGML_ASSERT(kernel->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    const float * w_d = (const float *) kernel->data;
+    if (!ggml_cuda_supports_conv2d_dw(dst)) {
+        GGML_LOG_ERROR("%s: unsupported kernel/input/output dtype or layout\n", __func__);
+        ctx.terminal_status = GGML_STATUS_EXECUTION_FAILED;
+        return false;
+    }
+
     const float * x_d = (const float *) input->data;
     float *       y_d = (float *) dst->data;
 
@@ -133,29 +195,19 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int       dilation_x = p[4];
     const int       dilation_y = p[5];
 
-    const int in_w     = input->ne[0];
-    const int in_h     = input->ne[1];
-    const int kernel_w = kernel->ne[0];
-    const int kernel_h = kernel->ne[1];
-    const int out_w    = dst->ne[0];
-    const int out_h    = dst->ne[1];
-    const int channels = dst->ne[2];
-    const int batches  = dst->ne[3];
+    const conv_params params = {
+        (int) input->ne[0],  (int) input->ne[1],  (int) dst->ne[0], (int) dst->ne[1],
+        (int) kernel->ne[0], (int) kernel->ne[1], stride_x,         stride_y,
+        padding_x,           padding_y,           dilation_x,       dilation_y,
+        (int) dst->ne[2],    (int) dst->ne[3],
+    };
+    const bool cwhn = ggml_is_contiguous_channels(input);
 
-    cudaStream_t st = ctx.stream();
-
-    const int total  = batches * channels * out_h * out_w;
-    const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
-
-    if (ggml_is_contiguous(input)) {
-        conv2d_dw_kernel<float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
-            dilation_x, dilation_y, channels, batches);
-    } else if (ggml_is_contiguous_channels(input)) {
-        conv2d_dw_kernel<float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
-            dilation_x, dilation_y, channels, batches);
+    if (kernel->type == GGML_TYPE_F16) {
+        launch_conv2d_dw(x_d, (const half *) kernel->data, y_d, params, cwhn, ctx.stream());
     } else {
-        GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+        launch_conv2d_dw(x_d, (const float *) kernel->data, y_d, params, cwhn, ctx.stream());
     }
+
+    return true;
 }

@@ -81,6 +81,13 @@ static inline float op_softplus(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));
 }
 
+static inline float op_swoosh(float x, float offset, float shift, float linear_scale) {
+    const float shifted = x - offset;
+    const float softplus = op_softplus(shifted);
+    const float linear = linear_scale * x;
+    return (softplus - linear) - shift;
+}
+
 static inline float op_floor(float x) {
     return floorf(x);
 }
@@ -304,6 +311,18 @@ void ggml_compute_forward_expm1(const ggml_compute_params * params, ggml_tensor 
 
 void ggml_compute_forward_softplus(const ggml_compute_params * params, ggml_tensor * dst) {
     unary_op<op_softplus>(params, dst);
+}
+
+void ggml_compute_forward_swoosh(const ggml_compute_params * params, ggml_tensor * dst) {
+    const float offset = ggml_get_op_params_f32(dst, 1);
+    const float shift = ggml_get_op_params_f32(dst, 2);
+    const float linear_scale = ggml_get_op_params_f32(dst, 3);
+
+    const auto swoosh_op_params = [offset, shift, linear_scale](float x) {
+        return op_swoosh(x, offset, shift, linear_scale);
+    };
+
+    unary_op_functor(params, dst, swoosh_op_params);
 }
 
 void ggml_compute_forward_floor(const ggml_compute_params * params, ggml_tensor * dst) {

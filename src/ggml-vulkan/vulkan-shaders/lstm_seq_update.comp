@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Output { float output_data[]; };
+layout(binding = 1) buffer Workspace { float workspace_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint sequence_length;
+    uint batch_size;
+    uint hidden_size;
+    uint gate_order;
+    uint reverse;
+    uint logical_step;
+    uint output_offset;
+    uint workspace_offset;
+};
+
+float logistic(float value) {
+    if (value >= 0.0) {
+        const float z = exp(-value);
+        return 1.0 / (1.0 + z);
+    }
+    const float z = exp(value);
+    return z / (1.0 + z);
+}
+
+void main() {
+    const uint job = gl_GlobalInvocationID.x;
+    if (job >= hidden_size * batch_size) {
+        return;
+    }
+
+    const uint batch = job / hidden_size;
+    const uint unit = job - batch * hidden_size;
+    const uint workspace_base = workspace_offset + 5 * hidden_size * batch;
+    const uint input_slot = 0;
+    const uint forget_slot = gate_order == 0 ? 2 : 1;
+    const uint cell_slot = gate_order == 0 ? 3 : 2;
+    const uint output_slot = gate_order == 0 ? 1 : 3;
+
+    const float input_gate = logistic(workspace_data[workspace_base + input_slot * hidden_size + unit]);
+    const float forget_gate = logistic(workspace_data[workspace_base + forget_slot * hidden_size + unit]);
+    const float cell_gate = tanh(workspace_data[workspace_base + cell_slot * hidden_size + unit]);
+    const float output_gate = logistic(workspace_data[workspace_base + output_slot * hidden_size + unit]);
+    const uint cell_index = workspace_base + 4 * hidden_size + unit;
+    const float previous_cell = logical_step == 0 ? 0.0 : workspace_data[cell_index];
+    const float cell = forget_gate * previous_cell + input_gate * cell_gate;
+    workspace_data[cell_index] = cell;
+
+    const uint time = reverse != 0 ? sequence_length - 1 - logical_step : logical_step;
+    output_data[output_offset + unit + hidden_size * (time + sequence_length * batch)] =
+        output_gate * tanh(cell);
+}

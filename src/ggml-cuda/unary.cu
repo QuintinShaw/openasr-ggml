@@ -257,6 +257,45 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_softplus>(ctx, dst);
 }
+
+template <typename T>
+static __global__ void swoosh_kernel(
+        const T * x, T * dst, int64_t k, float offset, float shift, float linear_scale) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const float xi = ggml_cuda_cast<float>(x[i]);
+    const float shifted = xi - offset;
+    const float softplus = op_softplus(shifted);
+    const float linear = linear_scale * xi;
+    dst[i] = ggml_cuda_cast<T>((softplus - linear) - shift);
+}
+
+template <typename T>
+static void swoosh_cuda(
+        const T * x, T * dst, int64_t k, float offset, float shift, float linear_scale, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_XIELU_BLOCK_SIZE - 1) / CUDA_XIELU_BLOCK_SIZE;
+    swoosh_kernel<<<num_blocks, CUDA_XIELU_BLOCK_SIZE, 0, stream>>>(x, dst, k, offset, shift, linear_scale);
+}
+
+void ggml_cuda_op_swoosh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
+
+    const float offset = ggml_get_op_params_f32(dst, 1);
+    const float shift = ggml_get_op_params_f32(dst, 2);
+    const float linear_scale = ggml_get_op_params_f32(dst, 3);
+    cudaStream_t stream = ctx.stream();
+    if (src0->type == GGML_TYPE_F16) {
+        swoosh_cuda((const half *) src0->data, (half *) dst->data, ggml_nelements(src0), offset, shift, linear_scale, stream);
+    } else {
+        swoosh_cuda((const float *) src0->data, (float *) dst->data, ggml_nelements(src0), offset, shift, linear_scale, stream);
+    }
+}
 /* gated ops */
 
 template <float (*op)(float), typename T>

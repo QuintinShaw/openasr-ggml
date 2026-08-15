@@ -170,19 +170,53 @@ class BackendMemoryStaticContract(unittest.TestCase):
         )
         self.assertIn("GGML_BACKEND_MEMORY_API_V1_PROC", self.vulkan)
 
-    def test_vulkan_quote_rejects_ambiguous_cross_domain_fallback(self) -> None:
+    def test_vulkan_quote_and_allocator_share_immutable_heap_binding(self) -> None:
+        context = self.vulkan[
+            self.vulkan.index("struct ggml_backend_vk_buffer_type_context") :
+            self.vulkan.index("struct vk_queue;")
+        ]
+        self.assertIn("uint32_t allocation_heap_index", context)
+
+        selector = self.vulkan[
+            self.vulkan.index("static uint32_t ggml_vk_select_default_allocation_heap") :
+            self.vulkan.index("static vk_buffer ggml_vk_create_buffer(")
+        ]
+        self.assertIn("largest_heap_with", selector)
+        self.assertIn("device->uma", selector)
+        self.assertIn("getBufferMemoryRequirements(probe)", selector)
+        self.assertIn("requirements.memoryTypeBits", selector)
+
+        allocator_start = self.vulkan.index("static vk_buffer ggml_vk_create_buffer(")
+        allocator = self.vulkan[
+            allocator_start :
+            self.vulkan.index("static void ggml_vk_destroy_buffer", allocator_start)
+        ]
+        self.assertIn("memory_type.heapIndex == allocation_heap_index", self.vulkan)
+        self.assertIn(
+            "ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, allocation_heap_index)",
+            allocator,
+        )
+        self.assertIn(
+            "ctx->device, size, ctx->allocation_heap_index",
+            self.vulkan,
+        )
+
         resolver = self.vulkan[
             self.vulkan.index("static bool ggml_backend_vk_memory_type_for_buffer") :
             self.vulkan.index("static enum ggml_status ggml_backend_vk_memory_buffer_commitment")
         ]
-        self.assertIn("props.memoryHeaps[props.memoryTypes[i].heapIndex].size", resolver)
-        self.assertIn(
-            "candidate_kind = device->uma ? GGML_BACKEND_MEMORY_DOMAIN_UNIFIED",
-            resolver,
+        self.assertIn("allocation_heap_index", resolver)
+        self.assertIn("ggml_vk_find_memory_properties", resolver)
+
+        quote = function_body(
+            self.vulkan,
+            "ggml_backend_vk_memory_quote",
+            "ggml_backend_vk_memory_reserve_private",
         )
-        self.assertIn("selected_device_local != candidate_device_local", resolver)
-        self.assertIn("*heap_index != candidate_heap", resolver)
-        self.assertNotIn("return true;\n        }", resolver)
+        self.assertIn(
+            "buft_ctx, requests[i].requested_bytes",
+            quote,
+        )
 
     def test_vulkan_quote_generation_excludes_live_heap_usage(self) -> None:
         generation = self.vulkan[
