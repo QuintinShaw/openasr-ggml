@@ -4,6 +4,13 @@
 
 #include "ggml-backend.h"
 
+#ifndef OPENASR_BACKEND_ABI_V1
+#define OPENASR_BACKEND_ABI_V1 ""
+#endif
+#ifndef OPENASR_BACKEND_PROVIDER_V1
+#define OPENASR_BACKEND_PROVIDER_V1 ""
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -304,6 +311,14 @@ extern "C" {
 #        define GGML_BACKEND_DL_IMPL(reg_fn)                             \
             extern "C" {                                                 \
             GGML_BACKEND_API ggml_backend_reg_t ggml_backend_init(void); \
+            GGML_BACKEND_API const char * openasr_ggml_backend_abi_v1(void); \
+            GGML_BACKEND_API const char * openasr_ggml_backend_provider_v1(void); \
+            }                                                            \
+            const char * openasr_ggml_backend_abi_v1(void) {              \
+                return OPENASR_BACKEND_ABI_V1;                            \
+            }                                                            \
+            const char * openasr_ggml_backend_provider_v1(void) {         \
+                return OPENASR_BACKEND_PROVIDER_V1;                       \
             }                                                            \
             ggml_backend_reg_t ggml_backend_init(void) {                 \
                 return reg_fn();                                         \
@@ -318,6 +333,14 @@ extern "C" {
 #    else
 #        define GGML_BACKEND_DL_IMPL(reg_fn)                              \
             GGML_BACKEND_API ggml_backend_reg_t ggml_backend_init(void);  \
+            GGML_BACKEND_API const char * openasr_ggml_backend_abi_v1(void); \
+            GGML_BACKEND_API const char * openasr_ggml_backend_provider_v1(void); \
+            const char * openasr_ggml_backend_abi_v1(void) {               \
+                return OPENASR_BACKEND_ABI_V1;                             \
+            }                                                             \
+            const char * openasr_ggml_backend_provider_v1(void) {          \
+                return OPENASR_BACKEND_PROVIDER_V1;                        \
+            }                                                             \
             ggml_backend_reg_t                  ggml_backend_init(void) { \
                 return reg_fn();                                          \
             }

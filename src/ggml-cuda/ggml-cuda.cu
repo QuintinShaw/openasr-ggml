@@ -5835,4 +5835,69 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     return cuda_backend;
 }
 
+#ifdef GGML_BACKEND_DL
+extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
+        const char * expected_target,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        driver_out[0] = '\0';
+    }
+    if (expected_target == nullptr || expected_target[0] == '\0') {
+        return 0;
+    }
+
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        return 0;
+    }
+    bool matched = false;
+    for (int device = 0; device < device_count; ++device) {
+        cudaDeviceProp prop = {};
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+            continue;
+        }
+#ifdef GGML_USE_HIP
+        std::string actual_target = prop.gcnArchName;
+        const size_t feature_suffix = actual_target.find(':');
+        if (feature_suffix != std::string::npos) {
+            actual_target.resize(feature_suffix);
+        }
+#else
+        char actual_target_buffer[32] = {};
+        std::snprintf(actual_target_buffer, sizeof(actual_target_buffer), "sm_%d%d", prop.major, prop.minor);
+        std::string actual_target = actual_target_buffer;
+#endif
+        if (actual_target == expected_target) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) {
+        return 0;
+    }
+
+    int raw_driver = 0;
+    if (cudaDriverGetVersion(&raw_driver) != cudaSuccess || raw_driver <= 0) {
+        return 0;
+    }
+    char normalized_driver[64] = {};
+#ifdef GGML_USE_HIP
+    if (raw_driver >= 1000000) {
+        std::snprintf(normalized_driver, sizeof(normalized_driver), "%d.%d.%d",
+            raw_driver / 10000000, (raw_driver / 100000) % 100, (raw_driver / 1000) % 100);
+    } else {
+        std::snprintf(normalized_driver, sizeof(normalized_driver), "%d", raw_driver);
+    }
+#else
+    std::snprintf(normalized_driver, sizeof(normalized_driver), "%d.%d.%d",
+        raw_driver / 1000, (raw_driver % 1000) / 10, raw_driver % 10);
+#endif
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        std::snprintf(driver_out, driver_out_capacity, "%s", normalized_driver);
+    }
+    return 1;
+}
+#endif
+
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

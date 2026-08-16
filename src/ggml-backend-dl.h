@@ -12,6 +12,7 @@
 #    include <unistd.h>
 #endif
 #include <filesystem>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -40,6 +41,7 @@ struct dl_handle_deleter {
 using dl_handle_ptr = std::unique_ptr<dl_handle, dl_handle_deleter>;
 
 dl_handle * dl_load_library(const fs::path & path);
+dl_handle * dl_load_library(const fs::path & path, const std::vector<fs::path> & dependency_dirs);
 void * dl_get_sym(dl_handle * handle, const char * name);
 const char * dl_error();
 
