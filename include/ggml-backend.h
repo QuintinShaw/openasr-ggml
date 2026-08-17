@@ -505,6 +505,74 @@ extern "C" {
 
     // Load a backend from a dynamic library and register it
     GGML_API ggml_backend_reg_t ggml_backend_load(const char * path);
+    // Load an exact backend path encoded as UTF-8. This is distinct from the
+    // legacy native-narrow path on Windows so user-profile directories outside
+    // the active ANSI code page remain loadable without lossy conversion.
+    GGML_API ggml_backend_reg_t ggml_backend_load_utf8(const char * path_utf8);
+    // Load one exact UTF-8 path only when its OpenASR ABI-v1 export matches.
+    // The comparison happens before ggml_backend_score/ggml_backend_init, so an
+    // incompatible plugin cannot register devices or start backend threads.
+    GGML_API ggml_backend_reg_t ggml_backend_load_verified_utf8(
+            const char * path_utf8,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1);
+    // As above, additionally requiring the module's side-effect-free hardware
+    // probe to attest an exact device target and a driver at or above the
+    // signed catalog floor before ggml_backend_score/ggml_backend_init runs.
+    GGML_API ggml_backend_reg_t ggml_backend_load_verified_v2_utf8(
+            const char * path_utf8,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1,
+            const char * expected_device_target,
+            const char * minimum_driver_version);
+    // Version 3 additionally accepts exact, already verified dependency
+    // directories. On Windows these directories participate only in this
+    // LoadLibraryEx transaction; PATH and the current directory are never
+    // searched.
+    GGML_API ggml_backend_reg_t ggml_backend_load_verified_v3_utf8(
+            const char * path_utf8,
+            const char * const * dependency_dirs_utf8,
+            size_t dependency_dir_count,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1,
+            const char * expected_device_target,
+            const char * minimum_driver_version);
+    // Validate the same contract and return the normalized live driver
+    // version without registering the backend. `driver_out` is always NUL
+    // terminated when its capacity is non-zero.
+    GGML_API bool ggml_backend_probe_verified_v2_utf8(
+            const char * path_utf8,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1,
+            const char * expected_device_target,
+            const char * minimum_driver_version,
+            char * driver_out,
+            size_t driver_out_capacity);
+    GGML_API bool ggml_backend_probe_verified_v3_utf8(
+            const char * path_utf8,
+            const char * const * dependency_dirs_utf8,
+            size_t dependency_dir_count,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1,
+            const char * expected_device_target,
+            const char * minimum_driver_version,
+            char * driver_out,
+            size_t driver_out_capacity);
+    // Load only the CPU and Vulkan modules from one host-owned absolute
+    // directory. Unlike load_all, this never consults the executable's current
+    // directory, GGML_BACKEND_PATH, or any downloaded plugin store.
+    GGML_API void               ggml_backend_load_bundled_from_path(const char * dir_path_utf8);
+    GGML_API void               ggml_backend_load_bundled_verified_from_path(
+            const char * dir_path_utf8,
+            const char * expected_openasr_abi_v1);
+    // Select the highest-scoring backend only from this already verified,
+    // host-owned exact path list. No directory enumeration or environment
+    // search participates.
+    GGML_API ggml_backend_reg_t ggml_backend_load_best_verified_utf8(
+            const char * const * paths_utf8,
+            size_t path_count,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1);
     // Unload a backend if loaded dynamically and unregister it
     GGML_API void               ggml_backend_unload(ggml_backend_reg_t reg);
     // Load all known backends from dynamic libraries

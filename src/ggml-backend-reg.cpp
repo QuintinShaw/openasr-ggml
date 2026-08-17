@@ -8,8 +8,11 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <cctype>
+#include <climits>
+#include <cstdio>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -111,6 +114,131 @@ struct ggml_backend_reg_entry {
     ggml_backend_reg_t reg;
     dl_handle_ptr handle;
 };
+
+typedef const char * (*openasr_ggml_backend_abi_v1_t)(void);
+typedef int (*openasr_ggml_backend_probe_v1_t)(const char * expected_target, char * driver_out, size_t driver_out_capacity);
+
+static bool openasr_backend_abi_matches(dl_handle * handle, const char * expected_abi, const fs::path & path, bool silent) {
+    if (expected_abi == nullptr || expected_abi[0] == '\0') {
+        return true;
+    }
+    auto abi_fn = (openasr_ggml_backend_abi_v1_t) dl_get_sym(handle, "openasr_ggml_backend_abi_v1");
+    const char * actual = abi_fn != nullptr ? abi_fn() : nullptr;
+    if (actual == nullptr || std::strcmp(actual, expected_abi) != 0) {
+        if (!silent) {
+            GGML_LOG_ERROR("%s: refusing %s before initialization: OpenASR backend ABI mismatch\n",
+                __func__, path_str(path).c_str());
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool openasr_backend_provider_matches(dl_handle * handle, const char * expected_provider, const fs::path & path, bool silent) {
+    if (expected_provider == nullptr || expected_provider[0] == '\0') {
+        return true;
+    }
+    auto provider_fn = (openasr_ggml_backend_abi_v1_t) dl_get_sym(handle, "openasr_ggml_backend_provider_v1");
+    const char * actual = provider_fn != nullptr ? provider_fn() : nullptr;
+    std::string expected = std::string("ggml-") + expected_provider;
+    bool matches = actual != nullptr && (expected == actual ||
+        (std::strcmp(expected_provider, "cpu") == 0 && std::strncmp(actual, "ggml-cpu", 8) == 0));
+    if (!matches) {
+        if (!silent) {
+            GGML_LOG_ERROR("%s: refusing %s before initialization: expected OpenASR provider %s\n",
+                __func__, path_str(path).c_str(), expected_provider);
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool openasr_parse_driver_version(const char * value, std::vector<unsigned long long> & parts) {
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    unsigned long long current = 0;
+    bool have_digit = false;
+    for (const char * cursor = value;; ++cursor) {
+        const unsigned char ch = static_cast<unsigned char>(*cursor);
+        if (std::isdigit(ch)) {
+            const unsigned digit = ch - static_cast<unsigned char>('0');
+            if (current > (ULLONG_MAX - digit) / 10) {
+                return false;
+            }
+            current = current * 10 + digit;
+            have_digit = true;
+            continue;
+        }
+        if ((*cursor == '.' || *cursor == '\0') && have_digit) {
+            parts.push_back(current);
+            current = 0;
+            have_digit = false;
+            if (*cursor == '\0') {
+                return true;
+            }
+            continue;
+        }
+        return false;
+    }
+}
+
+static bool openasr_driver_version_at_least(const char * current, const char * minimum) {
+    if (minimum == nullptr || minimum[0] == '\0') {
+        return true;
+    }
+    std::vector<unsigned long long> current_parts;
+    std::vector<unsigned long long> minimum_parts;
+    if (!openasr_parse_driver_version(current, current_parts) ||
+        !openasr_parse_driver_version(minimum, minimum_parts)) {
+        return false;
+    }
+    const size_t width = std::max(current_parts.size(), minimum_parts.size());
+    current_parts.resize(width, 0);
+    minimum_parts.resize(width, 0);
+    return current_parts >= minimum_parts;
+}
+
+static bool openasr_backend_runtime_matches(
+        dl_handle * handle,
+        const char * expected_target,
+        const char * minimum_driver,
+        const fs::path & path,
+        bool silent,
+        std::string * actual_driver_out = nullptr) {
+    if (expected_target == nullptr || expected_target[0] == '\0') {
+        return true;
+    }
+    auto probe_fn = (openasr_ggml_backend_probe_v1_t) dl_get_sym(handle, "openasr_ggml_backend_probe_v1");
+    char actual_driver[64] = {};
+    const bool matches = probe_fn != nullptr && probe_fn(expected_target, actual_driver, sizeof(actual_driver)) == 1 &&
+        actual_driver[0] != '\0' && openasr_driver_version_at_least(actual_driver, minimum_driver);
+    if (!matches) {
+        if (!silent) {
+            GGML_LOG_ERROR("%s: refusing %s before initialization: live target/driver proof failed for %s\n",
+                __func__, path_str(path).c_str(), expected_target);
+        }
+        return false;
+    }
+    if (actual_driver_out != nullptr) {
+        *actual_driver_out = actual_driver;
+    }
+    return true;
+}
+
+static bool openasr_verify_loaded_backend(
+        dl_handle * handle,
+        const fs::path & path,
+        bool silent,
+        const char * expected_abi,
+        const char * expected_provider,
+        const char * expected_target,
+        const char * minimum_driver,
+        std::string * actual_driver_out = nullptr) {
+    return openasr_backend_abi_matches(handle, expected_abi, path, silent) &&
+        openasr_backend_provider_matches(handle, expected_provider, path, silent) &&
+        openasr_backend_runtime_matches(handle, expected_target, minimum_driver, path, silent, actual_driver_out);
+}
 
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_entry> backends;
@@ -217,12 +345,24 @@ struct ggml_backend_registry {
         devices.push_back(device);
     }
 
-    ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
-        dl_handle_ptr handle { dl_load_library(path) };
+    ggml_backend_reg_t load_backend(
+            const fs::path & path,
+            bool silent,
+            const char * expected_abi = nullptr,
+            const char * expected_provider = nullptr,
+            const char * expected_target = nullptr,
+            const char * minimum_driver = nullptr,
+            const std::vector<fs::path> & dependency_dirs = {}) {
+        dl_handle_ptr handle { dl_load_library(path, dependency_dirs) };
         if (!handle) {
             if (!silent) {
                 GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(path).c_str(), dl_error());
             }
+            return nullptr;
+        }
+
+        if (!openasr_verify_loaded_backend(handle.get(), path, silent, expected_abi, expected_provider,
+                                           expected_target, minimum_driver)) {
             return nullptr;
         }
 
@@ -391,7 +531,209 @@ ggml_backend_t ggml_backend_init_best(void) {
 
 // Dynamic loading
 ggml_backend_reg_t ggml_backend_load(const char * path) {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    GGML_UNUSED(path);
+    return nullptr;
+#else
     return get_reg().load_backend(path, false);
+#endif
+}
+
+ggml_backend_reg_t ggml_backend_load_utf8(const char * path_utf8) {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    GGML_UNUSED(path_utf8);
+    return nullptr;
+#else
+    if (path_utf8 == nullptr) {
+        return nullptr;
+    }
+    return get_reg().load_backend(fs::u8path(path_utf8), false);
+#endif
+}
+
+ggml_backend_reg_t ggml_backend_load_verified_utf8(
+        const char * path_utf8,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1) {
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0') {
+        return nullptr;
+    }
+    return get_reg().load_backend(
+        fs::u8path(path_utf8), false, expected_openasr_abi_v1, expected_provider_v1);
+}
+
+ggml_backend_reg_t ggml_backend_load_verified_v2_utf8(
+        const char * path_utf8,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1,
+        const char * expected_device_target,
+        const char * minimum_driver_version) {
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0' ||
+        expected_device_target == nullptr || expected_device_target[0] == '\0') {
+        return nullptr;
+    }
+    return get_reg().load_backend(fs::u8path(path_utf8), false, expected_openasr_abi_v1,
+        expected_provider_v1, expected_device_target, minimum_driver_version);
+}
+
+static bool openasr_parse_dependency_dirs(
+        const char * const * dependency_dirs_utf8,
+        size_t dependency_dir_count,
+        std::vector<fs::path> & dependency_dirs) {
+    if (dependency_dir_count == 0) {
+        return dependency_dirs_utf8 == nullptr;
+    }
+    if (dependency_dirs_utf8 == nullptr) {
+        return false;
+    }
+    dependency_dirs.reserve(dependency_dir_count);
+    for (size_t index = 0; index < dependency_dir_count; ++index) {
+        if (dependency_dirs_utf8[index] == nullptr || dependency_dirs_utf8[index][0] == '\0') {
+            return false;
+        }
+        fs::path dependency_dir = fs::u8path(dependency_dirs_utf8[index]);
+        if (!dependency_dir.is_absolute()) {
+            return false;
+        }
+        dependency_dirs.push_back(std::move(dependency_dir));
+    }
+    return true;
+}
+
+ggml_backend_reg_t ggml_backend_load_verified_v3_utf8(
+        const char * path_utf8,
+        const char * const * dependency_dirs_utf8,
+        size_t dependency_dir_count,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1,
+        const char * expected_device_target,
+        const char * minimum_driver_version) {
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0' ||
+        expected_device_target == nullptr || expected_device_target[0] == '\0') {
+        return nullptr;
+    }
+    std::vector<fs::path> dependency_dirs;
+    if (!openasr_parse_dependency_dirs(dependency_dirs_utf8, dependency_dir_count, dependency_dirs)) {
+        return nullptr;
+    }
+    return get_reg().load_backend(fs::u8path(path_utf8), false, expected_openasr_abi_v1,
+        expected_provider_v1, expected_device_target, minimum_driver_version, dependency_dirs);
+}
+
+bool ggml_backend_probe_verified_v2_utf8(
+        const char * path_utf8,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1,
+        const char * expected_device_target,
+        const char * minimum_driver_version,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        driver_out[0] = '\0';
+    }
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0' ||
+        expected_device_target == nullptr || expected_device_target[0] == '\0') {
+        return false;
+    }
+    const fs::path path = fs::u8path(path_utf8);
+    dl_handle_ptr handle { dl_load_library(path) };
+    if (!handle) {
+        return false;
+    }
+    std::string actual_driver;
+    if (!openasr_verify_loaded_backend(handle.get(), path, false, expected_openasr_abi_v1,
+                                       expected_provider_v1, expected_device_target,
+                                       minimum_driver_version, &actual_driver)) {
+        return false;
+    }
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver.c_str());
+    }
+    return true;
+}
+
+bool ggml_backend_probe_verified_v3_utf8(
+        const char * path_utf8,
+        const char * const * dependency_dirs_utf8,
+        size_t dependency_dir_count,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1,
+        const char * expected_device_target,
+        const char * minimum_driver_version,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        driver_out[0] = '\0';
+    }
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0' ||
+        expected_device_target == nullptr || expected_device_target[0] == '\0') {
+        return false;
+    }
+    std::vector<fs::path> dependency_dirs;
+    if (!openasr_parse_dependency_dirs(dependency_dirs_utf8, dependency_dir_count, dependency_dirs)) {
+        return false;
+    }
+    const fs::path path = fs::u8path(path_utf8);
+    dl_handle_ptr handle { dl_load_library(path, dependency_dirs) };
+    if (!handle) {
+        return false;
+    }
+    std::string actual_driver;
+    if (!openasr_verify_loaded_backend(handle.get(), path, false, expected_openasr_abi_v1,
+                                       expected_provider_v1, expected_device_target,
+                                       minimum_driver_version, &actual_driver)) {
+        return false;
+    }
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver.c_str());
+    }
+    return true;
+}
+
+ggml_backend_reg_t ggml_backend_load_best_verified_utf8(
+        const char * const * paths_utf8,
+        size_t path_count,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1) {
+    if (paths_utf8 == nullptr || path_count == 0 || expected_openasr_abi_v1 == nullptr ||
+        expected_openasr_abi_v1[0] == '\0' || expected_provider_v1 == nullptr ||
+        expected_provider_v1[0] == '\0') {
+        return nullptr;
+    }
+    std::vector<std::pair<int, fs::path>> candidates;
+    for (size_t index = 0; index < path_count; ++index) {
+        if (paths_utf8[index] == nullptr || paths_utf8[index][0] == '\0') {
+            continue;
+        }
+        const fs::path path = fs::u8path(paths_utf8[index]);
+        if (!path.is_absolute()) {
+            continue;
+        }
+        dl_handle_ptr handle { dl_load_library(path) };
+        if (!handle || !openasr_verify_loaded_backend(handle.get(), path, false,
+                expected_openasr_abi_v1, expected_provider_v1, nullptr, nullptr)) {
+            continue;
+        }
+        auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
+        const int score = score_fn != nullptr ? score_fn() : 1;
+        if (score > 0) {
+            candidates.emplace_back(score, path);
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const auto & left, const auto & right) { return left.first > right.first; });
+    for (const auto & candidate : candidates) {
+        if (ggml_backend_reg_t reg = get_reg().load_backend(
+                candidate.second, false, expected_openasr_abi_v1, expected_provider_v1)) {
+            return reg;
+        }
+    }
+    return nullptr;
 }
 
 void ggml_backend_unload(ggml_backend_reg_t reg) {
@@ -477,7 +819,11 @@ static fs::path backend_filename_extension() {
 #endif
 }
 
-static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
+static ggml_backend_reg_t ggml_backend_load_best(
+        const char * name,
+        bool silent,
+        const char * user_search_path,
+        const char * expected_openasr_abi_v1 = nullptr) {
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
     const fs::path name_path = fs::u8path(name);
     const fs::path file_prefix = backend_filename_prefix().native() + name_path.native() + fs::u8path("-").native();
@@ -519,6 +865,12 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                         GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(entry.path()).c_str(), dl_error());
                     }
                     if (handle) {
+                        if (!openasr_backend_abi_matches(handle.get(), expected_openasr_abi_v1, entry.path(), silent)) {
+                            continue;
+                        }
+                        if (!openasr_backend_provider_matches(handle.get(), name, entry.path(), silent)) {
+                            continue;
+                        }
                         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
                         if (score_fn) {
                             int s = score_fn();
@@ -546,7 +898,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             fs::path filename = backend_filename_prefix().native() + name_path.native() + backend_filename_extension().native();
             fs::path path = search_path / filename;
             if (std::error_code ec; fs::exists(path, ec)) {
-                return get_reg().load_backend(path, silent);
+                return get_reg().load_backend(path, silent, expected_openasr_abi_v1, name);
             } else {
                 if (ec) {
                     GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(path).c_str(), ec.message().c_str());
@@ -556,14 +908,73 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         return nullptr;
     }
 
-    return get_reg().load_backend(best_path, silent);
+    return get_reg().load_backend(best_path, silent, expected_openasr_abi_v1, name);
+}
+
+void ggml_backend_load_bundled_from_path(const char * dir_path_utf8) {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    GGML_UNUSED(dir_path_utf8);
+    return;
+#else
+    if (dir_path_utf8 == nullptr) {
+        return;
+    }
+    const fs::path dir = fs::u8path(dir_path_utf8);
+    if (!dir.is_absolute()) {
+        GGML_LOG_ERROR("%s: bundled backend directory must be absolute\n", __func__);
+        return;
+    }
+#ifdef NDEBUG
+    bool silent = true;
+#else
+    bool silent = false;
+#endif
+    const std::string path = path_str(dir);
+    ggml_backend_load_best("vulkan", silent, path.c_str());
+    ggml_backend_load_best("cpu", silent, path.c_str());
+#endif
+}
+
+void ggml_backend_load_bundled_verified_from_path(
+        const char * dir_path_utf8,
+        const char * expected_openasr_abi_v1) {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    GGML_UNUSED(dir_path_utf8);
+    GGML_UNUSED(expected_openasr_abi_v1);
+    return;
+#else
+    if (dir_path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0') {
+        return;
+    }
+    const fs::path dir = fs::u8path(dir_path_utf8);
+    if (!dir.is_absolute()) {
+        GGML_LOG_ERROR("%s: bundled backend directory must be absolute\n", __func__);
+        return;
+    }
+#ifdef NDEBUG
+    bool silent = true;
+#else
+    bool silent = false;
+#endif
+    const std::string path = path_str(dir);
+    ggml_backend_load_best("vulkan", silent, path.c_str(), expected_openasr_abi_v1);
+    ggml_backend_load_best("cpu", silent, path.c_str(), expected_openasr_abi_v1);
+#endif
 }
 
 void ggml_backend_load_all() {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    return;
+#else
     ggml_backend_load_all_from_path(nullptr);
+#endif
 }
 
 void ggml_backend_load_all_from_path(const char * dir_path) {
+#ifdef OPENASR_VERIFIED_BACKEND_LOADING_ONLY
+    GGML_UNUSED(dir_path);
+    return;
+#else
 #ifdef NDEBUG
     bool silent = true;
 #else
@@ -590,4 +1001,5 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     if (backend_path) {
         ggml_backend_load(backend_path);
     }
+#endif
 }

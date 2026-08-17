@@ -244,6 +244,13 @@ add_library(ggml
             ggml-backend-reg.cpp)
 add_library(ggml::ggml ALIAS ggml)
 
+if (OPENASR_VERIFIED_BACKEND_LOADING_ONLY)
+    if (NOT GGML_BACKEND_DL)
+        message(FATAL_ERROR "OPENASR_VERIFIED_BACKEND_LOADING_ONLY requires GGML_BACKEND_DL")
+    endif()
+    target_compile_definitions(ggml PRIVATE OPENASR_VERIFIED_BACKEND_LOADING_ONLY)
+endif()
+
 set_target_properties(ggml PROPERTIES
     VERSION ${GGML_VERSION}
     SOVERSION ${GGML_VERSION_MAJOR}
@@ -268,6 +275,10 @@ function(ggml_add_backend_library backend)
         # write the shared library to the output directory
         set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
+        target_compile_definitions(${backend} PRIVATE OPENASR_BACKEND_PROVIDER_V1="${backend}")
+        if (DEFINED OPENASR_BACKEND_ABI_V1 AND NOT OPENASR_BACKEND_ABI_V1 STREQUAL "")
+            target_compile_definitions(${backend} PRIVATE OPENASR_BACKEND_ABI_V1="${OPENASR_BACKEND_ABI_V1}")
+        endif()
         add_dependencies(ggml ${backend})
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
