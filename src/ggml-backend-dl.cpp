@@ -8,10 +8,11 @@ dl_handle * dl_load_library(const fs::path & path, const std::vector<fs::path> &
     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
 
     // Every production caller supplies a verified absolute path. Resolve
-    // dependencies only from the plugin's own directory, the application
-    // directory (ggml-base/ggml), and System32. In particular, do not consult
-    // the current directory or PATH, which would let an unrelated DLL shadow a
-    // signed pack dependency.
+    // dependencies only from the plugin's own directory, explicitly registered
+    // verified dependency directories, and System32. The host's ggml DLLs are
+    // already loaded before any optional plugin transaction; consulting the
+    // application directory here would let an unrelated colocated vendor DLL
+    // shadow a verified pack dependency.
     std::vector<DLL_DIRECTORY_COOKIE> dependency_cookies;
     dependency_cookies.reserve(dependency_dirs.size());
     bool dependency_setup_ok = true;
@@ -25,7 +26,6 @@ dl_handle * dl_load_library(const fs::path & path, const std::vector<fs::path> &
     }
 
     const DWORD flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                        LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
                         LOAD_LIBRARY_SEARCH_SYSTEM32 |
                         LOAD_LIBRARY_SEARCH_USER_DIRS;
     HMODULE handle = dependency_setup_ok ? LoadLibraryExW(path.wstring().c_str(), nullptr, flags) : nullptr;

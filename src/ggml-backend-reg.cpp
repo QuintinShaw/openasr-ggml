@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <cctype>
 #include <climits>
@@ -704,32 +705,35 @@ ggml_backend_reg_t ggml_backend_load_best_verified_utf8(
         expected_provider_v1[0] == '\0') {
         return nullptr;
     }
-    int best_score = 0;
-    fs::path best_path;
+    std::vector<std::pair<int, fs::path>> candidates;
     for (size_t index = 0; index < path_count; ++index) {
         if (paths_utf8[index] == nullptr || paths_utf8[index][0] == '\0') {
-            return nullptr;
+            continue;
         }
         const fs::path path = fs::u8path(paths_utf8[index]);
         if (!path.is_absolute()) {
-            return nullptr;
+            continue;
         }
         dl_handle_ptr handle { dl_load_library(path) };
         if (!handle || !openasr_verify_loaded_backend(handle.get(), path, false,
                 expected_openasr_abi_v1, expected_provider_v1, nullptr, nullptr)) {
-            return nullptr;
+            continue;
         }
         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
         const int score = score_fn != nullptr ? score_fn() : 1;
-        if (score > best_score) {
-            best_score = score;
-            best_path = path;
+        if (score > 0) {
+            candidates.emplace_back(score, path);
         }
     }
-    if (best_score <= 0 || best_path.empty()) {
-        return nullptr;
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const auto & left, const auto & right) { return left.first > right.first; });
+    for (const auto & candidate : candidates) {
+        if (ggml_backend_reg_t reg = get_reg().load_backend(
+                candidate.second, false, expected_openasr_abi_v1, expected_provider_v1)) {
+            return reg;
+        }
     }
-    return get_reg().load_backend(best_path, false, expected_openasr_abi_v1, expected_provider_v1);
+    return nullptr;
 }
 
 void ggml_backend_unload(ggml_backend_reg_t reg) {
