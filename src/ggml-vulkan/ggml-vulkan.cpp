@@ -19086,12 +19086,52 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// Vulkan 1.1 deviceUUID is a stable per-physical-device token when PCI-BDF is
+// unavailable. It is only safe to emit when it is non-zero and unique among
+// the instance's physical devices. Duplicate UUIDs (MoltenVK multi-GPU, two
+// ICDs for one GPU already de-duplicated above, or a broken driver) must stay
+// all-zero so DEVICE_LOCAL admission fail-closes instead of colliding.
+static bool ggml_backend_vk_unique_nonzero_device_uuid(const uint8_t * uuid) {
+    bool nonzero = false;
+    for (uint32_t i = 0; i < VK_UUID_SIZE; ++i) {
+        if (uuid[i] != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    if (!nonzero) {
+        return false;
+    }
+    int matches = 0;
+    for (const auto & phys : vk_instance.instance.enumeratePhysicalDevices()) {
+        vk::PhysicalDeviceIDProperties id_props{};
+        vk::PhysicalDeviceProperties2 props{};
+        props.pNext = &id_props;
+        phys.getProperties2(&props);
+        if (std::equal(uuid, uuid + VK_UUID_SIZE, id_props.deviceUUID.data())) {
+            matches++;
+        }
+    }
+    return matches == 1;
+}
+
 static ggml_backend_memory_domain_id_v1 ggml_backend_vk_memory_domain(
         const vk_device & device, uint32_t heap_index, uint32_t kind) {
     ggml_backend_memory_domain_id_v1 id = {};
     const std::string pci_bus_id = ggml_backend_vk_get_device_pci_id((int) device->idx);
-    (void) ggml_backend_memory_encode_pci_bdf_v1(
-        pci_bus_id.empty() ? NULL : pci_bus_id.c_str(), id.physical_device_uuid);
+    // DEVICE_LOCAL admission fail-closes on an all-zero identity. Several
+    // Windows vendor ICDs (including AMD Adrenalin) omit VK_EXT_pci_bus_info,
+    // so PCI-BDF encoding is not always available; Vulkan 1.1 deviceUUID is.
+    if (!ggml_backend_memory_encode_pci_bdf_v1(
+            pci_bus_id.empty() ? nullptr : pci_bus_id.c_str(), id.physical_device_uuid)) {
+        vk::PhysicalDeviceIDProperties id_props{};
+        vk::PhysicalDeviceProperties2 props{};
+        props.pNext = &id_props;
+        device->physical_device.getProperties2(&props);
+        if (ggml_backend_vk_unique_nonzero_device_uuid(id_props.deviceUUID.data())) {
+            memcpy(id.physical_device_uuid, id_props.deviceUUID.data(), sizeof(id.physical_device_uuid));
+        }
+    }
     id.heap_index = heap_index;
     id.kind = kind;
     return id;
