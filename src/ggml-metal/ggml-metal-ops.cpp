@@ -831,6 +831,12 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         args.val   = ggml_get_op_params_f32(op, 4); // eps
     }
 
+    if (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SWOOSH) {
+        args.slope = ggml_get_op_params_f32(op, 1); // offset
+        args.scale = ggml_get_op_params_f32(op, 2); // shift
+        args.bias  = ggml_get_op_params_f32(op, 3); // linear_scale
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
 
     if (pipeline.c4) {
