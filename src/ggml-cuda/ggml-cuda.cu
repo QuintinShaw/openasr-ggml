@@ -6186,9 +6186,10 @@ extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
         const char * expected_target,
         char * driver_out,
         size_t driver_out_capacity) {
-    if (driver_out != nullptr && driver_out_capacity > 0) {
-        driver_out[0] = '\0';
+    if (driver_out == nullptr || driver_out_capacity == 0) {
+        return 0;
     }
+    driver_out[0] = '\0';
     try {
     if (expected_target == nullptr || expected_target[0] == '\0') {
         return 0;
@@ -6240,14 +6241,14 @@ extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
     std::snprintf(normalized_driver, sizeof(normalized_driver), "%d.%d.%d",
         raw_driver / 1000, (raw_driver % 1000) / 10, raw_driver % 10);
 #endif
-    if (driver_out != nullptr && driver_out_capacity > 0) {
-        std::snprintf(driver_out, driver_out_capacity, "%s", normalized_driver);
+    const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%s", normalized_driver);
+    if (driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
+        driver_out[0] = '\0';
+        return 0;
     }
     return 1;
     } catch (...) {
-        if (driver_out != nullptr && driver_out_capacity > 0) {
-            driver_out[0] = '\0';
-        }
+        driver_out[0] = '\0';
         return 0;
     }
 }

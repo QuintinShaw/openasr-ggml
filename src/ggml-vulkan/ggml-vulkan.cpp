@@ -67,6 +67,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <future>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstring>
 #include <cstdio>
 #include <new>
 #include <thread>
@@ -18362,7 +18363,6 @@ static ggml_guid_t ggml_backend_vk_guid() {
 }
 
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
-    VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
     std::unique_ptr<ggml_backend_vk_context> ctx;
     const auto cleanup_failed_init = [](ggml_backend_vk_context * value) noexcept {
         if (value == nullptr || !value->device) {
@@ -18402,6 +18402,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     };
 
     try {
+        // Keep even debug-stream formatting inside the C-ABI exception
+        // boundary. An iostream configured to throw must not escape this
+        // exported entry point before Vulkan initialization is attempted.
+        VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
         ctx.reset(new ggml_backend_vk_context {});
         ggml_vk_init(ctx.get(), dev_num);
         std::unique_ptr<ggml_backend> vk_backend(new ggml_backend {
@@ -20997,6 +21001,82 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 
     VK_LOG_DEBUG("END ggml_vk_check_results_1(" << tensor->name << ")");
+}
+#endif
+
+#ifdef GGML_BACKEND_DL
+extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
+        const char * expected_target,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (driver_out == nullptr || driver_out_capacity == 0) {
+        return 0;
+    }
+    driver_out[0] = '\0';
+    try {
+        if (expected_target == nullptr || expected_target[0] == '\0') {
+            return 0;
+        }
+
+        ggml_vk_instance_init();
+        const std::vector<vk::PhysicalDevice> physical_devices =
+            vk_instance.instance.enumeratePhysicalDevices();
+        for (size_t physical_index : vk_instance.device_indices) {
+            if (physical_index >= physical_devices.size()) {
+                return 0;
+            }
+            const vk::PhysicalDevice physical_device = physical_devices[physical_index];
+            vk::PhysicalDeviceProperties2 properties{};
+            physical_device.getProperties2(&properties);
+            const auto & pipeline_uuid = properties.properties.pipelineCacheUUID;
+            if (std::all_of(pipeline_uuid.begin(), pipeline_uuid.end(), [](uint8_t byte) { return byte == 0; })) {
+                continue;
+            }
+
+            // `deviceUUID` is per physical card and would make a signed
+            // activation useless on another card of the same model. Vulkan's
+            // pipelineCacheUUID is explicitly an implementation compatibility
+            // token. Combined with vendor/device ids and the separately bound
+            // exact driver version, it defines the narrow reusable capability
+            // class used by release qualification. Physical UUID remains a
+            // memory-domain/isolation identity and is never broadened here.
+            char actual_target[8 + 8 + 1 + 8 + 1 + VK_UUID_SIZE * 2 + 1] = {};
+            const int target_prefix_length = std::snprintf(
+                actual_target,
+                sizeof(actual_target),
+                "vk_caps_%08x_%08x_",
+                properties.properties.vendorID,
+                properties.properties.deviceID);
+            if (target_prefix_length != 26) {
+                return 0;
+            }
+            for (uint32_t index = 0; index < VK_UUID_SIZE; ++index) {
+                std::snprintf(
+                    actual_target + 26 + index * 2,
+                    sizeof(actual_target) - 26 - index * 2,
+                    "%02x",
+                    static_cast<unsigned>(pipeline_uuid[index]));
+            }
+            if (std::strcmp(actual_target, expected_target) != 0) {
+                continue;
+            }
+
+            const uint32_t raw_driver = properties.properties.driverVersion;
+            if (raw_driver == 0) {
+                return 0;
+            }
+            const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%u", raw_driver);
+            if (driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
+                driver_out[0] = '\0';
+                return 0;
+            }
+            return 1;
+        }
+        return 0;
+    } catch (...) {
+        driver_out[0] = '\0';
+        return 0;
+    }
 }
 #endif
 
