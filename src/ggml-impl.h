@@ -230,13 +230,13 @@ struct ggml_hash_set {
 };
 
 struct ggml_hash_set ggml_hash_set_new(size_t size);
-bool                 ggml_hash_set_try_new(size_t size, struct ggml_hash_set * out_hash_set);
+GGML_API bool        ggml_hash_set_try_new(size_t size, struct ggml_hash_set * out_hash_set);
 void                 ggml_hash_set_free(struct ggml_hash_set * hash_set);
 
 // Fallible context construction for status-returning C seams. The legacy
 // ggml_init API retains its historical fatal-on-host-OOM contract; new runtime
 // paths must use this helper and propagate allocation failure instead.
-struct ggml_context * ggml_try_init(struct ggml_init_params params);
+GGML_API struct ggml_context * ggml_try_init(struct ggml_init_params params);
 bool ggml_graph_overhead_custom_try(size_t size, bool grads, size_t * out_size);
 
 // returns the minimum size for a hash set that can hold min_sz elements
