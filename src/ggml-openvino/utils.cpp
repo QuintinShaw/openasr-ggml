@@ -1,5 +1,6 @@
 #include "utils.h"
 
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-openvino-extra.h"
 #include "ggml-openvino/ggml-decoder.h"
@@ -53,6 +54,8 @@ enum ggml_status ov_graph_compute(ggml_cgraph * cgraph, ggml_backend_t backend) 
         std::shared_ptr<ov_runtime_context> r_ctx = std::static_pointer_cast<ov_runtime_context>(ctx->runtime_context);
 
         return is_static ? ov_graph_compute_static(cgraph, r_ctx) : ov_graph_compute_dynamic(cgraph, r_ctx);
+    } catch (const ggml_backend_exception & e) {
+        return e.status;
     } catch (const ov::Exception & e) {
         GGML_LOG_ERROR("GGML OpenVINO backend ov::Exception: %s\n", e.what());
         return GGML_STATUS_FAILED;
@@ -778,7 +781,11 @@ ov::Tensor make_contiguous_split_input_tensor(std::shared_ptr<GgmlOvDecoder> ggm
     const size_t source_offset = ggml_tensor->view_src != nullptr ? ggml_tensor->view_offs : 0;
 
     std::vector<uint8_t> source_data(ggml_nbytes(source_tensor));
-    ggml_backend_tensor_get(source_tensor, source_data.data(), 0, source_data.size());
+    const enum ggml_status status =
+        ggml_backend_tensor_get(source_tensor, source_data.data(), 0, source_data.size());
+    if (status != GGML_STATUS_SUCCESS) {
+        throw ggml_backend_exception { status, 0 };
+    }
 
     ov::Tensor input_tensor(ggml_decoder->get_ov_type(ggml_tensor), input_shape);
     auto * dst = static_cast<uint8_t *>(input_tensor.data());

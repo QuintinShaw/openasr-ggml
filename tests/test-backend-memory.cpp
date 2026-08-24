@@ -320,7 +320,9 @@ int main() {
     ggml_build_forward_expand(oversized_graph, oversized_output);
     assert(ggml_graph_n_nodes(oversized_graph) > 32);
     ggml_backend_sched_memory_plan_t oversized_plan = nullptr;
-    assert(ggml_backend_sched_memory_plan_create_v1(sched, oversized_graph, &oversized_plan) == GGML_STATUS_FAILED);
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               sched, oversized_graph, &oversized_plan) ==
+           GGML_STATUS_ALLOC_FAILED);
     assert(oversized_plan == nullptr);
     assert(out->data == nullptr);
     ggml_free(oversized_ctx);

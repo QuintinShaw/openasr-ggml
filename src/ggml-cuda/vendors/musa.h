@@ -45,11 +45,13 @@
 #define cudaDeviceProp musaDeviceProp
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaError_t musaError_t
+#define cudaErrorAssert musaErrorAssert
 #define cudaErrorContextIsDestroyed musaErrorContextIsDestroyed
 #define cudaErrorECCUncorrectable musaErrorECCUncorrectable
 #define cudaErrorIllegalAddress musaErrorIllegalAddress
 #define cudaErrorLaunchFailure musaErrorLaunchFailure
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
+#define cudaErrorNoDevice musaErrorNoDevice
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags musaEventCreateWithFlags

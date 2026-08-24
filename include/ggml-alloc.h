@@ -48,6 +48,7 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+GGML_API enum ggml_status ggml_gallocr_free_status(ggml_gallocr_t galloc);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
@@ -85,6 +86,16 @@ GGML_API bool ggml_gallocr_measure_get_chunk_v1(
     uint64_t * requested_bytes,
     uint64_t * currently_allocated_bytes);
 GGML_API bool ggml_gallocr_measure_commit_v1(ggml_gallocr_t galloc);
+enum ggml_gallocr_measure_commit_flag {
+    GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED = 1u << 0,
+    // A cleanup or retired-buffer release failed after its handle left the
+    // allocator. Releasing the surviving allocator cannot prove that orphaned
+    // provider state disappeared.
+    GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN = 1u << 1,
+};
+GGML_API enum ggml_status ggml_gallocr_measure_commit_v2(
+    ggml_gallocr_t galloc,
+    uint32_t * out_flags);
 
 // Clear tensor bindings owned by this allocator while its backend buffers are
 // still alive. This makes a retained cgraph safe to allocate again after the
@@ -97,6 +108,8 @@ GGML_API void ggml_gallocr_detach_graph_tensors_v1(
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+GGML_API enum ggml_status ggml_gallocr_alloc_graph_v2(
+    ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 

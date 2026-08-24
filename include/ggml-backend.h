@@ -247,20 +247,49 @@ extern "C" {
 
     typedef const struct ggml_backend_memory_api_v1 * (*ggml_backend_memory_get_api_v1_t)(void);
 
+    // Exception-safe host trampolines for the optional provider table. Native
+    // callers must use these functions instead of invoking plugin-owned C++
+    // callbacks directly across an FFI seam.
+    GGML_API const struct ggml_backend_memory_api_v1 * ggml_backend_memory_api_for_backend_v1(ggml_backend_t backend);
+    GGML_API enum ggml_status ggml_backend_memory_api_get_domains_v1(
+        const struct ggml_backend_memory_api_v1 * api, ggml_backend_dev_t dev,
+        struct ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count);
+    GGML_API enum ggml_status ggml_backend_memory_api_quote_v1(
+        const struct ggml_backend_memory_api_v1 * api,
+        const struct ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        struct ggml_backend_memory_quote_v1 * quote,
+        struct ggml_backend_memory_claim_v1 * claims, uint32_t * inout_claim_count);
+    GGML_API enum ggml_status ggml_backend_memory_api_reserve_private_v1(
+        const struct ggml_backend_memory_api_v1 * api,
+        const struct ggml_backend_memory_request_v1 * requests, uint32_t request_count,
+        const struct ggml_backend_memory_quote_v1 * quote,
+        struct ggml_backend_memory_claim_v1 * actual, uint32_t * inout_actual_count);
+    GGML_API enum ggml_status ggml_backend_memory_api_get_stats_v1(
+        const struct ggml_backend_memory_api_v1 * api, ggml_backend_dev_t dev,
+        ggml_backend_t backend, struct ggml_backend_memory_stats_v1 * stats,
+        uint32_t * inout_count);
+    GGML_API enum ggml_status ggml_backend_memory_api_trim_v1(
+        const struct ggml_backend_memory_api_v1 * api, ggml_backend_t backend, uint64_t flags);
+    GGML_API enum ggml_status ggml_backend_memory_api_quarantine_v1(
+        const struct ggml_backend_memory_api_v1 * api, ggml_backend_t backend,
+        const struct ggml_backend_memory_quarantine_v1 * request);
+
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
+    GGML_API enum ggml_status               ggml_backend_buffer_free_status   (ggml_backend_buffer_t buffer);
     GGML_API void *                         ggml_backend_buffer_get_base      (ggml_backend_buffer_t buffer);
     GGML_API size_t                         ggml_backend_buffer_get_size      (ggml_backend_buffer_t buffer);
     GGML_API enum ggml_status               ggml_backend_buffer_init_tensor   (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
     GGML_API size_t                         ggml_backend_buffer_get_alignment (ggml_backend_buffer_t buffer);
     GGML_API size_t                         ggml_backend_buffer_get_max_size  (ggml_backend_buffer_t buffer);
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
-    GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
+    GGML_API enum ggml_status               ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
+    GGML_API enum ggml_status               ggml_backend_buffer_reset_status  (ggml_backend_buffer_t buffer);
 
     // tensor copy between different backends
     GGML_API enum ggml_status ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
@@ -272,6 +301,7 @@ extern "C" {
     GGML_API ggml_guid_t  ggml_backend_guid(ggml_backend_t backend);
     GGML_API const char * ggml_backend_name(ggml_backend_t backend);
     GGML_API void         ggml_backend_free(ggml_backend_t backend);
+    GGML_API enum ggml_status ggml_backend_free_status(ggml_backend_t backend);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend);
     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
@@ -289,7 +319,7 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
     GGML_API enum ggml_status ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API enum ggml_status ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
-    GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
+    GGML_API enum ggml_status ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 
     // Completion is terminal: a successful return guarantees this backend has no
     // work from the completed operation still pending.
@@ -365,6 +395,7 @@ extern "C" {
 
     GGML_API ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device);
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
+    GGML_API enum ggml_status     ggml_backend_event_free_status(ggml_backend_event_t event);
     GGML_API enum ggml_status     ggml_backend_event_record_status(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API enum ggml_status     ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API enum ggml_status     ggml_backend_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event);
@@ -374,6 +405,8 @@ extern "C" {
     //
 
     enum ggml_backend_dev_type {
+        // Provider callback failed before a trustworthy class was available.
+        GGML_BACKEND_DEVICE_TYPE_UNKNOWN = -1,
         // CPU device using system memory
         GGML_BACKEND_DEVICE_TYPE_CPU,
         // GPU device using dedicated memory
@@ -442,6 +475,14 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index);
     GGML_API void *             ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name);
 
+    // Shared no-throw adapters for optional registry procedures. Callers must
+    // use these instead of invoking a get_proc_address result across a C ABI.
+    // An unavailable optional procedure preserves the historical no-op/unknown
+    // semantics; a provider exception is converted to a typed status or zero.
+    GGML_API enum ggml_status ggml_backend_set_n_threads_if_supported(
+            ggml_backend_t backend, int n_threads);
+    GGML_API uint32_t ggml_backend_dev_pci_vendor_id(ggml_backend_dev_t device);
+
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
@@ -462,6 +503,7 @@ extern "C" {
     // report GGML_STATUS_ABORTED after an observed request (without hiding a
     // device/execute failure), and retain neither pointer after the clear call.
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data, struct ggml_backend_graph_cancel_capability * cancel_capability);
+    typedef enum ggml_status             (*ggml_backend_set_abort_callback_status_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data, struct ggml_backend_graph_cancel_capability * cancel_capability);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;
@@ -639,6 +681,7 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status     ggml_backend_sched_free_status(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
@@ -662,6 +705,11 @@ extern "C" {
     // when the bit remains clear. Unknown future bits are conservative.
     enum ggml_backend_sched_memory_plan_commit_flag {
         GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED = 1u << 0,
+        // A failed commit rebuilt the scheduler allocator and every native
+        // buffer release callback completed successfully. Callers may refund
+        // the failed candidate only when live device-health evidence is also
+        // available and non-terminal.
+        GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN = 1u << 1,
     };
     GGML_API enum ggml_status ggml_backend_sched_memory_plan_commit_v2(
             ggml_backend_sched_memory_plan_t plan, uint32_t * out_flags);
@@ -683,6 +731,7 @@ extern "C" {
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API enum ggml_status     ggml_backend_sched_split_graph_v2(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success

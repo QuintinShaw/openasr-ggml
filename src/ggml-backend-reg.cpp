@@ -123,7 +123,9 @@ static bool openasr_backend_abi_matches(dl_handle * handle, const char * expecte
         return true;
     }
     auto abi_fn = (openasr_ggml_backend_abi_v1_t) dl_get_sym(handle, "openasr_ggml_backend_abi_v1");
-    const char * actual = abi_fn != nullptr ? abi_fn() : nullptr;
+    const char * actual = abi_fn != nullptr
+        ? ggml_backend_noexcept_or<const char *>([&]() { return abi_fn(); }, nullptr)
+        : nullptr;
     if (actual == nullptr || std::strcmp(actual, expected_abi) != 0) {
         if (!silent) {
             GGML_LOG_ERROR("%s: refusing %s before initialization: OpenASR backend ABI mismatch\n",
@@ -139,7 +141,9 @@ static bool openasr_backend_provider_matches(dl_handle * handle, const char * ex
         return true;
     }
     auto provider_fn = (openasr_ggml_backend_abi_v1_t) dl_get_sym(handle, "openasr_ggml_backend_provider_v1");
-    const char * actual = provider_fn != nullptr ? provider_fn() : nullptr;
+    const char * actual = provider_fn != nullptr
+        ? ggml_backend_noexcept_or<const char *>([&]() { return provider_fn(); }, nullptr)
+        : nullptr;
     std::string expected = std::string("ggml-") + expected_provider;
     bool matches = actual != nullptr && (expected == actual ||
         (std::strcmp(expected_provider, "cpu") == 0 && std::strncmp(actual, "ggml-cpu", 8) == 0));
@@ -211,7 +215,9 @@ static bool openasr_backend_runtime_matches(
     }
     auto probe_fn = (openasr_ggml_backend_probe_v1_t) dl_get_sym(handle, "openasr_ggml_backend_probe_v1");
     char actual_driver[64] = {};
-    const bool matches = probe_fn != nullptr && probe_fn(expected_target, actual_driver, sizeof(actual_driver)) == 1 &&
+    const bool matches = probe_fn != nullptr &&
+        ggml_backend_noexcept_or<int>(
+            [&]() { return probe_fn(expected_target, actual_driver, sizeof(actual_driver)); }, 0) == 1 &&
         actual_driver[0] != '\0' && openasr_driver_version_at_least(actual_driver, minimum_driver);
     if (!matches) {
         if (!silent) {
@@ -246,58 +252,74 @@ struct ggml_backend_registry {
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
-        register_backend(ggml_backend_cuda_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_cuda_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_METAL
-        register_backend(ggml_backend_metal_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_metal_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_SYCL
-        register_backend(ggml_backend_sycl_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_sycl_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_VULKAN
     // Add runtime disable check
     if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
-        register_backend(ggml_backend_vk_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_vk_reg(); }, nullptr));
     } else {
         GGML_LOG_DEBUG("Vulkan backend disabled by GGML_DISABLE_VULKAN environment variable\n");
     }
 #endif
 #ifdef GGML_USE_WEBGPU
-        register_backend(ggml_backend_webgpu_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_webgpu_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_ZDNN
-        register_backend(ggml_backend_zdnn_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_zdnn_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_VIRTGPU_FRONTEND
-        register_backend(ggml_backend_virtgpu_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_virtgpu_reg(); }, nullptr));
 #endif
 
 #ifdef GGML_USE_OPENCL
-        register_backend(ggml_backend_opencl_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_opencl_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_ZENDNN
-        register_backend(ggml_backend_zendnn_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_zendnn_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_HEXAGON
-        register_backend(ggml_backend_hexagon_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_hexagon_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_CANN
-        register_backend(ggml_backend_cann_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_cann_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_BLAS
-        register_backend(ggml_backend_blas_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_blas_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_RPC
-        register_backend(ggml_backend_rpc_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_rpc_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_OPENVINO
-        register_backend(ggml_backend_openvino_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_openvino_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_ET
-        register_backend(ggml_backend_et_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_et_reg(); }, nullptr));
 #endif
 #ifdef GGML_USE_CPU
-        register_backend(ggml_backend_cpu_reg());
+        register_backend(ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            []() { return ggml_backend_cpu_reg(); }, nullptr));
 #endif
     }
 
@@ -367,7 +389,7 @@ struct ggml_backend_registry {
         }
 
         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
-        if (score_fn && score_fn() == 0) {
+        if (score_fn && ggml_backend_noexcept_or<int>([&]() { return score_fn(); }, 0) == 0) {
             if (!silent) {
                 GGML_LOG_INFO("%s: backend %s is not supported on this system\n", __func__, path_str(path).c_str());
             }
@@ -382,7 +404,8 @@ struct ggml_backend_registry {
             return nullptr;
         }
 
-        ggml_backend_reg_t reg = backend_init_fn();
+        ggml_backend_reg_t reg = ggml_backend_noexcept_or<ggml_backend_reg_t>(
+            [&]() { return backend_init_fn(); }, nullptr);
         if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
             if (!silent) {
                 if (!reg) {
@@ -720,7 +743,9 @@ ggml_backend_reg_t ggml_backend_load_best_verified_utf8(
             continue;
         }
         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
-        const int score = score_fn != nullptr ? score_fn() : 1;
+        const int score = score_fn != nullptr
+            ? ggml_backend_noexcept_or<int>([&]() { return score_fn(); }, 0)
+            : 1;
         if (score > 0) {
             candidates.emplace_back(score, path);
         }
@@ -873,7 +898,8 @@ static ggml_backend_reg_t ggml_backend_load_best(
                         }
                         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
                         if (score_fn) {
-                            int s = score_fn();
+                            int s = ggml_backend_noexcept_or<int>(
+                                [&]() { return score_fn(); }, 0);
 #ifndef NDEBUG
                             GGML_LOG_DEBUG("%s: %s score: %d\n", __func__, path_str(entry.path()).c_str(), s);
 #endif

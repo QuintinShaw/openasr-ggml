@@ -178,18 +178,36 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
-[[noreturn]]
-void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
+enum ggml_status ggml_cuda_status(cudaError_t error);
+#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
+enum ggml_status ggml_cuda_driver_status(CUresult error);
+#endif
 
-#define CUDA_CHECK_GEN(err, success, error_fn)                                      \
+[[noreturn]]
+void ggml_cuda_error(
+    const char * stmt, const char * func, const char * file, int line,
+    enum ggml_status status, int64_t native_error, const char * msg);
+[[noreturn]]
+void ggml_cuda_abort(
+    const char * func, const char * file, int line, const char * format, ...);
+
+// CUDA/HIP backend code is reached through public C callbacks. Provider
+// invariants and unsupported-shape failures must become typed execution
+// failures at that seam, never a process-wide abort that Rust cannot catch.
+#undef GGML_ABORT
+#define GGML_ABORT(...) ggml_cuda_abort(__func__, __FILE__, __LINE__, __VA_ARGS__)
+
+#define CUDA_CHECK_GEN(err, success, error_fn, status_expr)                         \
      do {                                                                           \
         auto err_ = (err);                                                          \
         if (err_ != (success)) {                                                    \
-            ggml_cuda_error(#err, __func__, __FILE__, __LINE__, error_fn(err_));    \
+            ggml_cuda_error(                                                        \
+                #err, __func__, __FILE__, __LINE__, (status_expr),                  \
+                (int64_t) err_, error_fn(err_));                                    \
         }                                                                           \
     } while (0)
 
-#define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
+#define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString, ggml_cuda_status(err_))
 
 
 #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
@@ -213,10 +231,14 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     }
 #endif // CUDART_VERSION >= 12000
 
-#define CUBLAS_CHECK(err) CUDA_CHECK_GEN(err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str)
+#define CUBLAS_CHECK(err) CUDA_CHECK_GEN(                                            \
+    err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str,                                \
+    err_ == CUBLAS_STATUS_ALLOC_FAILED ? GGML_STATUS_ALLOC_FAILED                    \
+                                       : GGML_STATUS_EXECUTION_FAILED)
 
 #ifdef GGML_USE_NCCL
-#define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
+#define NCCL_CHECK(err) CUDA_CHECK_GEN(                                              \
+    err, ncclSuccess, ncclGetErrorString, GGML_STATUS_EXECUTION_FAILED)
 #endif // GGML_USE_NCCL
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
@@ -225,7 +247,8 @@ static const char * cu_get_error_str(CUresult err) {
     cuGetErrorString(err, &err_str);
     return err_str;
 }
-#define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
+#define CU_CHECK(err) CUDA_CHECK_GEN(                                                \
+    err, CUDA_SUCCESS, cu_get_error_str, ggml_cuda_driver_status(err_))
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -1154,6 +1177,7 @@ struct ggml_cuda_pool {
     virtual size_t used_size() const = 0;
     virtual size_t cached_size() const = 0;
     virtual enum ggml_status trim() = 0;
+    virtual enum ggml_status release() = 0;
 };
 
 template<typename T>
@@ -1173,7 +1197,7 @@ struct ggml_cuda_pool_alloc {
 
     ~ggml_cuda_pool_alloc() {
         if (ptr != nullptr) {
-            pool->free(ptr, actual_size);
+            ggml_backend_noexcept_void([&]() { pool->free(ptr, actual_size); });
         }
     }
 
@@ -1215,13 +1239,34 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
-    ~ggml_cuda_graph() {
+    void release() {
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        const auto cleanup = [&](auto && callback) {
+            const enum ggml_status current = ggml_backend_noexcept_status([&]() {
+                callback();
+                return GGML_STATUS_SUCCESS;
+            });
+            status = ggml_backend_status_merge(status, current);
+        };
         if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            cleanup([&]() {
+                CUDA_CHECK(cudaGraphExecDestroy(instance));
+                instance = nullptr;
+            });
         }
         if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
+            cleanup([&]() {
+                CUDA_CHECK(cudaGraphDestroy(graph));
+                graph = nullptr;
+            });
         }
+        if (status != GGML_STATUS_SUCCESS) {
+            throw ggml_backend_exception { status, 0 };
+        }
+    }
+
+    ~ggml_cuda_graph() {
+        ggml_backend_noexcept_void([&]() { release(); });
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
@@ -1377,15 +1422,36 @@ struct ggml_cuda_concurrent_event {
         return !writes_overlap && !dependent_srcs;
     }
 
-    ~ggml_cuda_concurrent_event() {
+    void release() {
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        const auto cleanup = [&](auto && callback) {
+            const enum ggml_status current = ggml_backend_noexcept_status([&]() {
+                callback();
+                return GGML_STATUS_SUCCESS;
+            });
+            status = ggml_backend_status_merge(status, current);
+        };
         if (fork_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(fork_event));
+            cleanup([&]() {
+                CUDA_CHECK(cudaEventDestroy(fork_event));
+                fork_event = nullptr;
+            });
         }
-        for (cudaEvent_t e : join_events) {
-            if (e != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(e));
+        for (cudaEvent_t & event : join_events) {
+            if (event != nullptr) {
+                cleanup([&]() {
+                    CUDA_CHECK(cudaEventDestroy(event));
+                    event = nullptr;
+                });
             }
         }
+        if (status != GGML_STATUS_SUCCESS) {
+            throw ggml_backend_exception { status, 0 };
+        }
+    }
+
+    ~ggml_cuda_concurrent_event() {
+        ggml_backend_noexcept_void([&]() { release(); });
     }
 };
 
@@ -1393,14 +1459,32 @@ struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
     void reset() {
-        concurrent_events.clear();
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        for (auto it = concurrent_events.begin(); it != concurrent_events.end();) {
+            const enum ggml_status current = ggml_backend_noexcept_status([&]() {
+                it->second.release();
+                return GGML_STATUS_SUCCESS;
+            });
+            status = ggml_backend_status_merge(status, current);
+            if (current == GGML_STATUS_SUCCESS) {
+                it = concurrent_events.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            throw ggml_backend_exception { status, 0 };
+        }
     }
 };
 
 struct ggml_backend_cuda_context {
     int device;
     enum ggml_status terminal_status = GGML_STATUS_SUCCESS;
+    enum ggml_status last_ggml_status = GGML_STATUS_SUCCESS;
+    int64_t last_native_error = 0;
     bool memory_quarantined = false;
+    uint64_t quarantine_generation = 0;
     struct ggml_backend_abort_context abort = {};
     std::string name;
     cudaEvent_t copy_event = nullptr;
@@ -1425,6 +1509,8 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
+                    ggml_cuda_set_device(device);
+                    it->second->release();
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1469,6 +1555,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    void release();
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

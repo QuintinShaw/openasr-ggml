@@ -1266,6 +1266,12 @@ kernel void kernel_unary_impl(
             const TC y_neg   = (exp(clamped) - TC(1.0f) - xi) * TC(args.slope) + TC(args.bias) * xi;
             dst_ptr[i0] = (T) (gate * y_pos + (TC(1.0f) - gate) * y_neg);
         }
+
+        if (FC_OP == OP_UNARY_NUM_SWOOSH) {
+            const TC shifted = x - TC(args.slope);
+            const TC softplus = select(log(1 + exp(shifted)), shifted, shifted > 20);
+            dst_ptr[i0] = (T) (softplus - TC(args.bias) * x - TC(args.scale));
+        }
     }
 
 #undef FC_OP

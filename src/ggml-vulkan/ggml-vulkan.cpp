@@ -66,6 +66,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <mutex>
 #include <future>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstring>
+#include <cstdio>
+#include <new>
 #include <thread>
 
 #if defined(_MSC_VER)
@@ -179,6 +183,25 @@ static enum ggml_status ggml_vk_status(vk::Result result) {
             return GGML_STATUS_EXECUTION_FAILED;
     }
 }
+
+[[noreturn]]
+static void ggml_vk_abort(
+        const char * func, const char * file, int line, const char * format, ...) {
+    char message[256] = {};
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    GGML_LOG_ERROR(
+        "Vulkan provider invariant failed in %s at %s:%d: %s\n",
+        func, file, line, message);
+    throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 0 };
+}
+
+// Vulkan is reached through public C callbacks. Provider invariants must be
+// translated at that seam rather than terminating the process in GGML_ABORT.
+#undef GGML_ABORT
+#define GGML_ABORT(...) ggml_vk_abort(__func__, __FILE__, __LINE__, __VA_ARGS__)
 
 #define VK_CHECK(err, msg)                                          \
     do {                                                            \
@@ -719,6 +742,9 @@ struct vk_device_struct {
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
     std::atomic<bool> poisoned {};
+    std::atomic<int32_t> last_ggml_status { GGML_STATUS_SUCCESS };
+    std::atomic<int64_t> last_native_error {};
+    std::atomic<uint64_t> quarantine_generation {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -1036,12 +1062,10 @@ struct vk_device_struct {
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
 
-        device.destroyFence(fence);
-
-        ggml_vk_destroy_buffer(sync_staging);
-
-        compute_queue.cmd_pool.destroy(device);
-        transfer_queue.cmd_pool.destroy(device);
+        ggml_backend_noexcept_void([&]() { device.destroyFence(fence); });
+        ggml_backend_noexcept_void([&]() { ggml_vk_destroy_buffer(sync_staging); });
+        ggml_backend_noexcept_void([&]() { compute_queue.cmd_pool.destroy(device); });
+        ggml_backend_noexcept_void([&]() { transfer_queue.cmd_pool.destroy(device); });
 
         for (auto& pipeline : all_pipelines) {
             if (pipeline.expired()) {
@@ -1049,13 +1073,12 @@ struct vk_device_struct {
             }
 
             vk_pipeline pl = pipeline.lock();
-            ggml_vk_destroy_pipeline(device, pl);
+            ggml_backend_noexcept_void([&]() { ggml_vk_destroy_pipeline(device, pl); });
         }
         all_pipelines.clear();
 
-        device.destroyDescriptorSetLayout(dsl);
-
-        device.destroy();
+        ggml_backend_noexcept_void([&]() { device.destroyDescriptorSetLayout(dsl); });
+        ggml_backend_noexcept_void([&]() { device.destroy(); });
     }
 };
 
@@ -1085,14 +1108,25 @@ struct vk_buffer_struct {
 
     vk_device device;
 
-    ~vk_buffer_struct() {
+    void release() {
         if (size == 0) {
             return;
         }
-        VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+        VK_LOG_DEBUG("vk_buffer_struct::release(" << buffer << ", " << size << ")");
 
-        device->device.freeMemory(device_memory);
-        device->device.destroyBuffer(buffer);
+        if (buffer) {
+            device->device.destroyBuffer(buffer);
+            buffer = VK_NULL_HANDLE;
+        }
+        if (device_memory) {
+            device->device.freeMemory(device_memory);
+            device_memory = VK_NULL_HANDLE;
+        }
+        size = 0;
+    }
+
+    ~vk_buffer_struct() {
+        ggml_backend_noexcept_void([&]() { release(); });
     }
 };
 
@@ -2201,6 +2235,10 @@ struct ggml_backend_vk_context {
     // A lost Vulkan device cannot be recovered in place. The first caller
     // receives DEVICE_LOST; all later boundaries fail closed.
     bool poisoned {};
+    bool memory_quarantined {};
+    enum ggml_status last_ggml_status { GGML_STATUS_SUCCESS };
+    int64_t last_native_error {};
+    uint64_t quarantine_generation {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -2347,7 +2385,7 @@ struct ggml_backend_vk_buffer_context {
     }
 
     ~ggml_backend_vk_buffer_context() {
-        ggml_vk_destroy_buffer(dev_buffer);
+        ggml_backend_noexcept_void([&]() { ggml_vk_destroy_buffer(dev_buffer); });
     }
 };
 
@@ -2402,8 +2440,204 @@ struct vk_instance_t {
     vk_device devices[GGML_VK_MAX_DEVICES];
 };
 
-static std::once_flag vk_instance_init_flag;
+static bool ggml_vk_is_terminal_status(enum ggml_status status) {
+    return status == GGML_STATUS_ALLOC_FAILED ||
+        status == GGML_STATUS_EXECUTION_FAILED ||
+        status == GGML_STATUS_DEVICE_LOST ||
+        status == GGML_STATUS_BACKEND_POISONED;
+}
+
+static void ggml_vk_record_device_status(
+        const vk_device & device, enum ggml_status status, int64_t native_error) {
+    if (!device || !ggml_vk_is_terminal_status(status)) {
+        return;
+    }
+    device->last_native_error.store(native_error, std::memory_order_relaxed);
+    device->last_ggml_status.store(status, std::memory_order_release);
+    if (status == GGML_STATUS_DEVICE_LOST) {
+        device->poisoned.store(true, std::memory_order_release);
+    }
+}
+
+static void ggml_vk_record_context_status(
+        ggml_backend_vk_context * ctx, enum ggml_status status, int64_t native_error) {
+    if (ctx == nullptr || !ggml_vk_is_terminal_status(status)) {
+        return;
+    }
+    ctx->last_ggml_status = status;
+    ctx->last_native_error = native_error;
+    ggml_vk_record_device_status(ctx->device, status, native_error);
+    if (status == GGML_STATUS_DEVICE_LOST || status == GGML_STATUS_BACKEND_POISONED) {
+        ctx->poisoned = true;
+    }
+}
+
+static enum ggml_status ggml_vk_result_status(
+        ggml_backend_vk_context * ctx, vk::Result result) {
+    const enum ggml_status status = ggml_vk_status(result);
+    ggml_vk_record_context_status(ctx, status, static_cast<int64_t>(result));
+    return status;
+}
+
+template <typename Fn>
+static enum ggml_status ggml_vk_status_boundary(
+        ggml_backend_vk_context * ctx, Fn && callback) noexcept {
+    if (ctx == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    if (ctx->memory_quarantined || ctx->poisoned || ctx->device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    try {
+        const enum ggml_status status = callback();
+        if (ggml_vk_is_terminal_status(status) && ctx->last_ggml_status != status) {
+            ggml_vk_record_context_status(ctx, status, 0);
+        }
+        return status;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_context_status(ctx, error.status, error.native_error);
+        return error.status;
+    } catch (const vk::SystemError & error) {
+        return ggml_vk_result_status(
+            ctx, static_cast<vk::Result>(error.code().value()));
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_context_status(ctx, GGML_STATUS_ALLOC_FAILED, 0);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        ggml_vk_record_context_status(ctx, GGML_STATUS_EXECUTION_FAILED, 0);
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+template <typename Fn>
+static void ggml_vk_buffer_boundary(const vk_device & device, Fn && callback) {
+    try {
+        callback();
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(device, error.status, error.native_error);
+        throw;
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        const enum ggml_status status = ggml_vk_status(result);
+        ggml_vk_record_device_status(device, status, static_cast<int64_t>(result));
+        throw ggml_backend_exception { status, static_cast<int64_t>(result) };
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+        throw ggml_backend_exception { GGML_STATUS_ALLOC_FAILED, 0 };
+    } catch (...) {
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
+        throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 0 };
+    }
+}
+
+template <typename Fn>
+static enum ggml_status ggml_vk_device_status_boundary(
+        const vk_device & device, Fn && callback) noexcept {
+    if (!device) {
+        return GGML_STATUS_FAILED;
+    }
+    if (device->poisoned.load()) {
+        return GGML_STATUS_BACKEND_POISONED;
+    }
+    try {
+        const enum ggml_status status = callback();
+        if (ggml_vk_is_terminal_status(status) &&
+                device->last_ggml_status.load(std::memory_order_acquire) != status) {
+            ggml_vk_record_device_status(device, status, 0);
+        }
+        return status;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(device, error.status, error.native_error);
+        return error.status;
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        const enum ggml_status status = ggml_vk_status(result);
+        ggml_vk_record_device_status(device, status, static_cast<int64_t>(result));
+        return status;
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+template <typename Fn>
+static enum ggml_status ggml_vk_device_cleanup_step(
+        const vk_device & device, Fn && callback) noexcept {
+    try {
+        callback();
+        return GGML_STATUS_SUCCESS;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(device, error.status, error.native_error);
+        return error.status;
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        const enum ggml_status status = ggml_vk_status(result);
+        ggml_vk_record_device_status(
+            device, status, static_cast<int64_t>(result));
+        return status;
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+template <typename Fn>
+static void ggml_vk_cleanup_step(const vk_device & device, Fn && callback) noexcept {
+    (void) ggml_vk_device_cleanup_step(device, callback);
+}
+
+template <typename Fn>
+static enum ggml_status ggml_vk_context_cleanup_step(
+        ggml_backend_vk_context * ctx, Fn && callback) noexcept {
+    try {
+        callback();
+        return GGML_STATUS_SUCCESS;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_context_status(ctx, error.status, error.native_error);
+        return error.status;
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        return ggml_vk_result_status(ctx, result);
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_context_status(ctx, GGML_STATUS_ALLOC_FAILED, 0);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        ggml_vk_record_context_status(ctx, GGML_STATUS_EXECUTION_FAILED, 0);
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+static std::mutex vk_instance_init_mutex;
+static bool vk_instance_initialized = false;
 static vk_instance_t vk_instance;
+
+static void ggml_vk_reset_failed_instance() noexcept {
+    if (vk_instance.instance) {
+        vkDestroyInstance(static_cast<VkInstance>(vk_instance.instance), nullptr);
+        vk_instance.instance = nullptr;
+    }
+    vk_instance.debug_utils_support = false;
+    vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = nullptr;
+    vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT = nullptr;
+    vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = nullptr;
+    vk_instance.device_indices.clear();
+    vk_instance.device_supports_membudget.clear();
+    vk_perf_logger_enabled = false;
+    vk_perf_logger_concurrent = false;
+    vk_enable_sync_logger = false;
+    vk_memory_logger_enabled = false;
+    vk_perf_logger_frequency = 1;
+    vk_pipeline_stats_filter.clear();
+}
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
 static size_t vk_skip_checks;
@@ -2433,9 +2667,7 @@ static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         vk::Result result = ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX);
         if (result != vk::Result::eSuccess) {
             ctx->almost_ready_fence_pending = false;
-            const enum ggml_status status = ggml_vk_status(result);
-            if (status == GGML_STATUS_DEVICE_LOST) { ctx->poisoned = true; ctx->device->poisoned.store(true); }
-            return status;
+            return ggml_vk_result_status(ctx, result);
         }
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
@@ -2445,9 +2677,7 @@ static enum ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     vk::Result result;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            const enum ggml_status status = ggml_vk_status(result);
-            if (status == GGML_STATUS_DEVICE_LOST) { ctx->poisoned = true; ctx->device->poisoned.store(true); }
-            return status;
+            return ggml_vk_result_status(ctx, result);
         }
         ggml_backend_abort_context_requested(&ctx->abort);
         for (uint32_t i = 0; i < 100; ++i) {
@@ -2493,12 +2723,7 @@ static enum ggml_status ggml_vk_wait_for_compute_completion(
         }
     }
     if (result != VK_SUCCESS) {
-        const enum ggml_status status = ggml_vk_status(static_cast<vk::Result>(result));
-        if (status == GGML_STATUS_DEVICE_LOST) {
-            ctx->poisoned = true;
-            ctx->device->poisoned.store(true);
-        }
-        return status;
+        return ggml_vk_result_status(ctx, static_cast<vk::Result>(result));
     }
     return ggml_backend_abort_context_status(&ctx->abort, GGML_STATUS_SUCCESS);
 }
@@ -3223,7 +3448,7 @@ static uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyPrope
     for(auto &q_family : queue_family_props) {
         std::cerr << "Queue number: "  + std::to_string(q_family.queueCount) << " flags: " + to_string(q_family.queueFlags) << std::endl;
     }
-    abort();
+    throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 0 };
 }
 
 static void ggml_vk_create_queue(vk_device& device, vk_queue& q, uint32_t queue_family_index, uint32_t queue_index, vk::PipelineStageFlags&& stage_flags, bool transfer_only) {
@@ -3626,6 +3851,7 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
         buf->device->memory_logger->log_deallocation(buf);
     }
 
+    buf->release();
     buf.reset();
 }
 
@@ -7304,7 +7530,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
 
-static void ggml_vk_instance_init_impl() try {
+static enum ggml_status ggml_vk_instance_init_impl() try {
     VK_LOG_DEBUG("ggml_vk_instance_init()");
 
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
@@ -7412,7 +7638,7 @@ static void ggml_vk_instance_init_impl() try {
         // If no vulkan devices are found, return early
         if (devices.empty()) {
             GGML_LOG_INFO("ggml_vulkan: No devices found.\n");
-            return;
+            return GGML_STATUS_SUCCESS;
         }
 
         // Default to using all dedicated GPUs
@@ -7527,7 +7753,7 @@ static void ggml_vk_instance_init_impl() try {
 
         if (vk_instance.device_indices.empty()) {
             GGML_LOG_INFO("ggml_vulkan: No devices found.\n");
-            return;
+            return GGML_STATUS_SUCCESS;
         }
     }
     GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan devices:\n", vk_instance.device_indices.size());
@@ -7548,31 +7774,42 @@ static void ggml_vk_instance_init_impl() try {
 
         ggml_vk_print_gpu_info(i);
     }
+
+    return GGML_STATUS_SUCCESS;
+} catch (const ggml_backend_exception & error) {
+    ggml_vk_reset_failed_instance();
+    GGML_LOG_ERROR("ggml_vulkan: instance initialization failed; status=%d; a later call may retry\n", error.status);
+    return error.status;
+} catch (const vk::SystemError & error) {
+    const vk::Result result = static_cast<vk::Result>(error.code().value());
+    const enum ggml_status status = ggml_vk_status(result);
+    ggml_vk_reset_failed_instance();
+    GGML_LOG_ERROR("ggml_vulkan: instance initialization failed; status=%d native=%d; a later call may retry\n",
+        status, static_cast<int>(result));
+    return status;
+} catch (const std::bad_alloc &) {
+    ggml_vk_reset_failed_instance();
+    GGML_LOG_ERROR("ggml_vulkan: instance initialization failed; status=%d; a later call may retry\n",
+        GGML_STATUS_ALLOC_FAILED);
+    return GGML_STATUS_ALLOC_FAILED;
 } catch (...) {
-    if (vk_instance.instance) {
-        vkDestroyInstance(static_cast<VkInstance>(vk_instance.instance), nullptr);
-        vk_instance.instance = nullptr;
-    }
-    vk_instance.debug_utils_support = false;
-    vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = nullptr;
-    vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = nullptr;
-    vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = nullptr;
-    vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = nullptr;
-    vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT = nullptr;
-    vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = nullptr;
-    vk_instance.device_indices.clear();
-    vk_instance.device_supports_membudget.clear();
-    vk_perf_logger_enabled = false;
-    vk_perf_logger_concurrent = false;
-    vk_enable_sync_logger = false;
-    vk_memory_logger_enabled = false;
-    vk_perf_logger_frequency = 1;
-    vk_pipeline_stats_filter.clear();
-    throw;
+    ggml_vk_reset_failed_instance();
+    GGML_LOG_ERROR("ggml_vulkan: instance initialization failed; status=%d; a later call may retry\n",
+        GGML_STATUS_EXECUTION_FAILED);
+    return GGML_STATUS_EXECUTION_FAILED;
 }
 
 static void ggml_vk_instance_init() {
-    std::call_once(vk_instance_init_flag, ggml_vk_instance_init_impl);
+    std::lock_guard<std::mutex> lock(vk_instance_init_mutex);
+    if (vk_instance_initialized) {
+        return;
+    }
+
+    const enum ggml_status status = ggml_vk_instance_init_impl();
+    if (status != GGML_STATUS_SUCCESS) {
+        throw ggml_backend_exception { status, 0 };
+    }
+    vk_instance_initialized = true;
 }
 
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
@@ -8024,7 +8261,7 @@ static void ggml_vk_host_free(vk_device& device, void* ptr) {
         const uint8_t* addr = (const uint8_t*) std::get<0>(device->pinned_memory[i]);
         const uint8_t* endr = addr + std::get<1>(device->pinned_memory[i]);
         if (ptr >= addr && ptr < endr) {
-            buf = std::get<2>(device->pinned_memory[i]);
+            buf = std::move(std::get<2>(device->pinned_memory[i]));
             index = i;
             break;
         }
@@ -8034,9 +8271,8 @@ static void ggml_vk_host_free(vk_device& device, void* ptr) {
         return;
     }
 
-    ggml_vk_destroy_buffer(buf);
-
     device->pinned_memory.erase(device->pinned_memory.begin() + index);
+    ggml_vk_destroy_buffer(buf);
 }
 
 static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset) {
@@ -15227,8 +15463,6 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     ggml_vk_test_dequant_matmul(ctx, 4096, 512, 4096, 2, num_it, 1, 1, GGML_TYPE_Q8_0, true);
     ggml_vk_test_dequant_matmul(ctx, 4096, 512, 4096, 2, num_it, 1, 2, GGML_TYPE_Q8_0, true);
 
-    abort();
-
     for (size_t i = 0; i < vals.size(); i += 3) {
         ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 0);
         ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 1);
@@ -15274,7 +15508,6 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
     }
 
-    GGML_ABORT("fatal error");
 #endif
 
     if (subctx) {
@@ -15923,12 +16156,18 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     }
 
     for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore({ ctx->gc.semaphores[i].s });
+        if (ctx->gc.semaphores[i].s) {
+            ctx->device->device.destroySemaphore({ ctx->gc.semaphores[i].s });
+            ctx->gc.semaphores[i].s = VK_NULL_HANDLE;
+        }
     }
     ctx->gc.semaphores.clear();
 
     for (size_t i = 0; i < ctx->gc.tl_semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
+        if (ctx->gc.tl_semaphores[i].s) {
+            ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
+            ctx->gc.tl_semaphores[i].s = VK_NULL_HANDLE;
+        }
     }
     ctx->gc.tl_semaphores.clear();
     ctx->semaphore_idx = 0;
@@ -15946,20 +16185,42 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 }
 
 // Clean up on backend free
-static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+static enum ggml_status ggml_vk_cleanup(ggml_backend_vk_context * ctx) noexcept {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    const vk_device device = ctx->device;
+    enum ggml_status first_failure = GGML_STATUS_SUCCESS;
+    const auto release = [&](auto && callback) {
+        const enum ggml_status step = ggml_vk_context_cleanup_step(ctx, callback);
+        first_failure = ggml_backend_status_merge(first_failure, step);
+        return step == GGML_STATUS_SUCCESS;
+    };
+    const auto release_handle = [&](auto & handle, auto && callback) {
+        if (!handle) {
+            return;
+        }
+        release([&]() {
+            callback(handle);
+            handle = VK_NULL_HANDLE;
+        });
+    };
     // discard any unsubmitted command buffers
-    ctx->compute_ctx.reset();
+    release([&]() { ctx->compute_ctx.reset(); });
     // wait for any pending command buffers to finish
-    ggml_vk_synchronize(ctx);
+    release([&]() {
+        const enum ggml_status status = ggml_vk_synchronize(ctx);
+        ggml_vk_record_context_status(ctx, status, 0);
+        if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_ABORTED) {
+            throw ggml_backend_exception { status, 0 };
+        }
+    });
 
-    ggml_vk_graph_cleanup(ctx);
+    release([&]() { ggml_vk_graph_cleanup(ctx); });
 
-    ggml_vk_destroy_buffer(ctx->prealloc_x);
-    ggml_vk_destroy_buffer(ctx->prealloc_y);
-    ggml_vk_destroy_buffer(ctx->prealloc_split_k);
-    ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
-    ggml_vk_destroy_buffer(ctx->sync_staging);
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_x); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_y); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_split_k); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->sync_staging); });
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -15969,30 +16230,48 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
 
-    for (auto& event : ctx->gc.events) {
-        ctx->device->device.destroyEvent(event);
+    for (auto & event : ctx->gc.events) {
+        release_handle(event, [&](vk::Event value) { device->device.destroyEvent(value); });
     }
-    ctx->gc.events.clear();
+    ctx->gc.events.erase(
+        std::remove_if(
+            ctx->gc.events.begin(), ctx->gc.events.end(),
+            [](vk::Event event) { return !event; }),
+        ctx->gc.events.end());
 
-    ctx->device->device.destroyFence(ctx->fence);
-    ctx->device->device.destroyFence(ctx->almost_ready_fence);
-    ctx->device->device.destroySemaphore(ctx->compute_completion.s);
+    release_handle(ctx->fence, [&](vk::Fence value) { device->device.destroyFence(value); });
+    release_handle(
+        ctx->almost_ready_fence,
+        [&](vk::Fence value) { device->device.destroyFence(value); });
+    release_handle(
+        ctx->compute_completion.s,
+        [&](vk::Semaphore value) { device->device.destroySemaphore(value); });
 
-    for (auto& pool : ctx->descriptor_pools) {
-        ctx->device->device.destroyDescriptorPool(pool);
+    for (auto & pool : ctx->descriptor_pools) {
+        release_handle(
+            pool,
+            [&](vk::DescriptorPool value) { device->device.destroyDescriptorPool(value); });
     }
-    ctx->descriptor_pools.clear();
-    ctx->descriptor_sets.clear();
-
-    ctx->compute_cmd_pool.destroy(ctx->device->device);
-    if (ctx->device->async_use_transfer_queue) {
-        ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
-
-        ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    ctx->descriptor_pools.erase(
+        std::remove_if(
+            ctx->descriptor_pools.begin(), ctx->descriptor_pools.end(),
+            [](vk::DescriptorPool pool) { return !pool; }),
+        ctx->descriptor_pools.end());
+    if (ctx->descriptor_pools.empty()) {
+        ctx->descriptor_sets.clear();
     }
-    if (vk_perf_logger_enabled) {
-        ctx->perf_logger->print_timings(true);
+
+    release([&]() { ctx->compute_cmd_pool.destroy(device->device); });
+    if (device->async_use_transfer_queue) {
+        release_handle(
+            ctx->transfer_semaphore.s,
+            [&](vk::Semaphore value) { device->device.destroySemaphore(value); });
+        release([&]() { ctx->transfer_cmd_pool.destroy(device->device); });
     }
+    if (vk_perf_logger_enabled && ctx->perf_logger) {
+        release([&]() { ctx->perf_logger->print_timings(true); });
+    }
+    return first_failure;
 }
 
 static int ggml_vk_get_device_count() {
@@ -16023,9 +16302,13 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->context == nullptr) {
+        throw ggml_backend_exception { GGML_STATUS_FAILED, 0 };
+    }
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-    ggml_vk_destroy_buffer(ctx->dev_buffer);
+    const vk_device device = ctx->dev_buffer ? ctx->dev_buffer->device : ctx->device.lock();
+    ggml_vk_buffer_boundary(device, [&]() { ggml_vk_destroy_buffer(ctx->dev_buffer); });
     delete ctx;
 }
 
@@ -16036,9 +16319,14 @@ static void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (buffer == nullptr || tensor == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
     VK_LOG_DEBUG("ggml_backend_vk_buffer_init_tensor(" << buffer << " (" << buffer->context << "), " << tensor << ")");
     if (tensor->view_src != nullptr) {
-        GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
+        if (tensor->view_src->buffer == nullptr || tensor->view_src->buffer->buft != buffer->buft) {
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -16052,8 +16340,10 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
         return;
     }
 
-    uint32_t val32 = (uint32_t)value * 0x01010101;
-    ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+    ggml_vk_buffer_boundary(buf->device, [&]() {
+        const uint32_t val32 = (uint32_t)value * 0x01010101;
+        ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+    });
 }
 
 static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -16065,7 +16355,9 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    ggml_vk_buffer_boundary(buf->device, [&]() {
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    });
 }
 
 static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
@@ -16079,7 +16371,9 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
         return;
     }
 
-    ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+    ggml_vk_buffer_boundary(buf->device, [&]() {
+        ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+    });
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -16092,7 +16386,9 @@ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
-    ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    ggml_vk_buffer_boundary(buf->device, [&]() {
+        ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    });
 }
 
 static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset,
@@ -16107,7 +16403,9 @@ static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, c
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
-    ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
+    ggml_vk_buffer_boundary(buf->device, [&]() {
+        ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
+    });
 }
 
 static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -16122,7 +16420,9 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
-        ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
+        ggml_vk_buffer_boundary(dst_buf->device, [&]() {
+            ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
+        });
 
         return true;
     }
@@ -16134,7 +16434,9 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
-    ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+    ggml_vk_buffer_boundary(ctx->dev_buffer->device, [&]() {
+        ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+    });
 }
 
 static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
@@ -16162,16 +16464,33 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
 
-    vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, ctx->allocation_heap_index);
-    } catch (const vk::SystemError& e) {
+        vk_buffer dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, ctx->allocation_heap_index);
+        std::unique_ptr<ggml_backend_vk_buffer_context> bufctx(
+            new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name));
+        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(
+            buft, ggml_backend_vk_buffer_interface, bufctx.get(), size);
+        if (buffer == nullptr) {
+            ggml_vk_record_device_status(ctx->device, GGML_STATUS_ALLOC_FAILED, 0);
+            return nullptr;
+        }
+        bufctx.release();
+        return buffer;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(ctx->device, error.status, error.native_error);
+        return nullptr;
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        ggml_vk_record_device_status(
+            ctx->device, ggml_vk_status(result), static_cast<int64_t>(result));
+        return nullptr;
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(ctx->device, GGML_STATUS_ALLOC_FAILED, 0);
+        return nullptr;
+    } catch (...) {
+        ggml_vk_record_device_status(ctx->device, GGML_STATUS_EXECUTION_FAILED, 0);
         return nullptr;
     }
-
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
-
-    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -16185,19 +16504,17 @@ static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    return ggml_nbytes(tensor);
-
     UNUSED(buft);
+    return ggml_nbytes(tensor);
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
-    ggml_vk_instance_init();
-
-    VK_LOG_DEBUG("ggml_backend_vk_buffer_type(" << dev_num << ")");
-
-    vk_device dev = ggml_vk_get_device(dev_num);
-
-    return &dev->buffer_type;
+    return ggml_backend_noexcept_or<ggml_backend_buffer_type_t>([&]() {
+        ggml_vk_instance_init();
+        VK_LOG_DEBUG("ggml_backend_vk_buffer_type(" << dev_num << ")");
+        vk_device dev = ggml_vk_get_device(dev_num);
+        return &dev->buffer_type;
+    }, nullptr);
 }
 
 // host buffer type
@@ -16209,30 +16526,68 @@ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_ty
 }
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->context == nullptr || vk_instance.devices[0] == nullptr) {
+        throw ggml_backend_exception { GGML_STATUS_FAILED, 0 };
+    }
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_buffer_boundary(
+        vk_instance.devices[0],
+        [&]() { ggml_vk_host_free(vk_instance.devices[0], buffer->context); });
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
+    if (size > SIZE_MAX - 32) {
+        ggml_vk_record_device_status(vk_instance.devices[0], GGML_STATUS_ALLOC_FAILED, 0);
+        return nullptr;
+    }
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
         ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
-    } catch (vk::SystemError& e) {
-        GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
-        // fallback to cpu buffer
-        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+        if (buffer == nullptr) {
+            ggml_vk_cleanup_step(
+                vk_instance.devices[0], [&]() { ggml_vk_host_free(vk_instance.devices[0], ptr); });
+            ptr = nullptr;
+            ggml_vk_record_device_status(vk_instance.devices[0], GGML_STATUS_ALLOC_FAILED, 0);
+            return nullptr;
+        }
+        buffer->buft = buft;
+        buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
+        return buffer;
+    } catch (const ggml_backend_exception & error) {
+        if (ptr != nullptr) {
+            ggml_vk_cleanup_step(
+                vk_instance.devices[0], [&]() { ggml_vk_host_free(vk_instance.devices[0], ptr); });
+        }
+        ggml_vk_record_device_status(vk_instance.devices[0], error.status, error.native_error);
+        return nullptr;
+    } catch (const vk::SystemError & error) {
+        if (ptr != nullptr) {
+            ggml_vk_cleanup_step(
+                vk_instance.devices[0], [&]() { ggml_vk_host_free(vk_instance.devices[0], ptr); });
+        }
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        ggml_vk_record_device_status(
+            vk_instance.devices[0], ggml_vk_status(result), static_cast<int64_t>(result));
+        return nullptr;
+    } catch (const std::bad_alloc &) {
+        if (ptr != nullptr) {
+            ggml_vk_cleanup_step(
+                vk_instance.devices[0], [&]() { ggml_vk_host_free(vk_instance.devices[0], ptr); });
+        }
+        ggml_vk_record_device_status(vk_instance.devices[0], GGML_STATUS_ALLOC_FAILED, 0);
+        return nullptr;
+    } catch (...) {
+        if (ptr != nullptr) {
+            ggml_vk_cleanup_step(
+                vk_instance.devices[0], [&]() { ggml_vk_host_free(vk_instance.devices[0], ptr); });
+        }
+        ggml_vk_record_device_status(vk_instance.devices[0], GGML_STATUS_EXECUTION_FAILED, 0);
+        return nullptr;
     }
-
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    buffer->buft = buft;
-    buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
-
-    return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -16249,7 +16604,7 @@ static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_
 
 // Should be changed to return device-specific host buffer type
 // but that probably requires changes in llama.cpp
-ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_impl() {
     static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
@@ -16270,6 +16625,12 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
     return &ggml_backend_vk_buffer_type_host;
 }
 
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+    return ggml_backend_noexcept_or<ggml_backend_buffer_type_t>([]() {
+        return ggml_backend_vk_host_buffer_type_impl();
+    }, nullptr);
+}
+
 
 // backend
 
@@ -16280,10 +16641,16 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_vk_free(ggml_backend_t backend) {
+    if (backend == nullptr || backend->context == nullptr) {
+        throw ggml_backend_exception { GGML_STATUS_FAILED, 0 };
+    }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
-    ggml_vk_cleanup(ctx);
+    const enum ggml_status status = ggml_vk_cleanup(ctx);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw ggml_backend_exception { status, ctx->last_native_error };
+    }
 
     delete ctx;
     delete backend;
@@ -16298,12 +16665,23 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
 static enum ggml_status ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
+    if (backend == nullptr || tensor == nullptr || tensor->buffer == nullptr || backend->context == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
+        if (tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) &&
+                tensor->buffer->buft != ggml_backend_vk_host_buffer_type()) {
+            return GGML_STATUS_FAILED;
+        }
 
     if (size == 0) {
         return GGML_STATUS_SUCCESS;
     }
+    if (n_copies != 0 && size > SIZE_MAX / n_copies) {
+        return GGML_STATUS_FAILED;
+    }
+    const size_t staging_size = size * n_copies;
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
@@ -16322,7 +16700,6 @@ static enum ggml_status ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backe
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
     if (!ret) {
-        const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
         ggml_vk_sync_buffers(nullptr, cpy_ctx);
 
@@ -16351,7 +16728,8 @@ static enum ggml_status ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backe
         }
         ggml_vk_synchronize(ctx);
     }
-    return GGML_STATUS_SUCCESS;
+        return GGML_STATUS_SUCCESS;
+    });
 }
 
 static enum ggml_status ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -16362,12 +16740,23 @@ static enum ggml_status ggml_backend_vk_set_tensor_async(ggml_backend_t backend,
 static enum ggml_status ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
+    if (backend == nullptr || tensor == nullptr || tensor->buffer == nullptr || backend->context == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
+        if (tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) &&
+                tensor->buffer->buft != ggml_backend_vk_host_buffer_type()) {
+            return GGML_STATUS_FAILED;
+        }
 
     if (size == 0) {
         return GGML_STATUS_SUCCESS;
     }
+    if (n_copies != 0 && size > SIZE_MAX / n_copies) {
+        return GGML_STATUS_FAILED;
+    }
+    const size_t staging_size = size * n_copies;
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
@@ -16379,7 +16768,6 @@ static enum ggml_status ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backe
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
-        const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
         ggml_vk_sync_buffers(nullptr, compute_ctx);
 
@@ -16408,7 +16796,8 @@ static enum ggml_status ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backe
         }
         ggml_vk_synchronize(ctx);
     }
-    return GGML_STATUS_SUCCESS;
+        return GGML_STATUS_SUCCESS;
+    });
 }
 
 static enum ggml_status ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -16419,6 +16808,7 @@ static enum ggml_status ggml_backend_vk_get_tensor_async(ggml_backend_t backend,
 static enum ggml_status ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
 
     // Skip zero-size tensors
     if (ggml_nbytes(src) == 0) {
@@ -16468,8 +16858,9 @@ static enum ggml_status ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_
                                           src->data, ggml_nbytes(src)) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
     }
 
-    GGML_UNUSED(backend_src);
-    return GGML_STATUS_FAILED;
+        GGML_UNUSED(backend_src);
+        return GGML_STATUS_FAILED;
+    });
 }
 
 static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
@@ -16516,11 +16907,7 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             vk::SemaphoreWaitInfo wait_info{ vk::SemaphoreWaitFlags{}, sem, val };
             vk::Result wait_result = ctx->device->device.waitSemaphores(wait_info, UINT64_MAX);
             if (wait_result != vk::Result::eSuccess) {
-                const enum ggml_status status = ggml_vk_status(wait_result);
-                if (status == GGML_STATUS_DEVICE_LOST) {
-                    ctx->poisoned = true;
-                    ctx->device->poisoned.store(true);
-                }
+                const enum ggml_status status = ggml_vk_result_status(ctx, wait_result);
                 wait_status = ggml_backend_status_merge(wait_status, status);
             }
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
@@ -16531,11 +16918,7 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             if (almost_ready_status == vk::Result::eSuccess) {
                 ctx->device->device.resetFences({ ctx->almost_ready_fence });
             } else {
-                const enum ggml_status status = ggml_vk_status(almost_ready_status);
-                if (status == GGML_STATUS_DEVICE_LOST) {
-                    ctx->poisoned = true;
-                    ctx->device->poisoned.store(true);
-                }
+                const enum ggml_status status = ggml_vk_result_status(ctx, almost_ready_status);
                 wait_status = ggml_backend_status_merge(wait_status, status);
             }
             ctx->almost_ready_fence_pending = false;
@@ -16603,25 +16986,14 @@ static enum ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 static enum ggml_status ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if (ctx->poisoned || ctx->device->poisoned.load()) {
-        return GGML_STATUS_BACKEND_POISONED;
-    }
-
-    try {
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
         enum ggml_status status = ggml_vk_synchronize(ctx);
         if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_ABORTED) {
             return status;
         }
         ggml_vk_graph_cleanup(ctx);
         return status;
-    } catch (const vk::SystemError & error) {
-        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
-        if (status == GGML_STATUS_DEVICE_LOST) {
-            ctx->poisoned = true;
-            ctx->device->poisoned.store(true);
-        }
-        return status;
-    }
+    });
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -17156,12 +17528,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     ggml_backend_abort_context_mark_native(
         &ctx->abort, GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT);
-    if (ctx->poisoned || ctx->device->poisoned.load()) {
+    if (ctx->memory_quarantined || ctx->poisoned || ctx->device->poisoned.load()) {
         return GGML_STATUS_BACKEND_POISONED;
     }
     if (ggml_backend_abort_context_requested(&ctx->abort)) {
         return GGML_STATUS_ABORTED;
     }
+
+    const auto finish_failure = [&](enum ggml_status submitted, int64_t native_error) {
+        ggml_vk_record_context_status(ctx, submitted, native_error);
+        if (submitted == GGML_STATUS_DEVICE_LOST || submitted == GGML_STATUS_BACKEND_POISONED) {
+            return submitted;
+        }
+        const enum ggml_status completed = ggml_backend_vk_synchronize(backend);
+        return ggml_backend_status_merge(submitted, completed);
+    };
 
     try {
     if (vk_instance.debug_utils_support) {
@@ -17580,15 +17961,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     return aborted ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
+    } catch (const ggml_backend_exception & error) {
+        return finish_failure(error.status, error.native_error);
     } catch (const vk::SystemError & error) {
-        // vk::SystemError::code() is a std::error_code whose value is the VkResult.
-        const enum ggml_status submitted = ggml_vk_status(static_cast<vk::Result>(error.code().value()));
-        if (submitted == GGML_STATUS_DEVICE_LOST) {
-            ctx->poisoned = true;
-            return submitted;
-        }
-        const enum ggml_status completed = ggml_backend_vk_synchronize(backend);
-        return ggml_backend_status_merge(submitted, completed);
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        return finish_failure(ggml_vk_status(result), static_cast<int64_t>(result));
+    } catch (const std::bad_alloc &) {
+        return finish_failure(GGML_STATUS_ALLOC_FAILED, 0);
+    } catch (...) {
+        return finish_failure(GGML_STATUS_EXECUTION_FAILED, 0);
     }
 }
 
@@ -17908,58 +18289,52 @@ static void ggml_backend_vk_event_wait_impl(ggml_backend_t backend, ggml_backend
 
 static enum ggml_status ggml_backend_vk_event_record_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if (ctx->poisoned || ctx->device->poisoned.load()) {
-        return GGML_STATUS_BACKEND_POISONED;
-    }
-    try {
-        ggml_backend_vk_event_record_impl(backend, event);
-        return GGML_STATUS_SUCCESS;
-    } catch (const vk::SystemError & error) {
-        if (!ctx->compute_ctx.expired()) {
-            vk_context compute_ctx = ctx->compute_ctx.lock();
-            if (compute_ctx->s && compute_ctx->s->buffer) {
-                compute_ctx->s->buffer->in_use = false;
-                compute_ctx->s->buffer->buf.reset();
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
+        try {
+            ggml_backend_vk_event_record_impl(backend, event);
+            return GGML_STATUS_SUCCESS;
+        } catch (...) {
+            if (!ctx->compute_ctx.expired()) {
+                vk_context compute_ctx = ctx->compute_ctx.lock();
+                if (compute_ctx->s && compute_ctx->s->buffer) {
+                    compute_ctx->s->buffer->in_use = false;
+                    compute_ctx->s->buffer->buf.reset();
+                }
+                ctx->compute_ctx.reset();
             }
-            ctx->compute_ctx.reset();
+            ctx->submit_pending = false;
+            ctx->compute_submit_pending = false;
+            ctx->compute_pending_completion_value = 0;
+            throw;
         }
-        ctx->submit_pending = false;
-        ctx->compute_submit_pending = false;
-        ctx->compute_pending_completion_value = 0;
-        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
-        if (status == GGML_STATUS_DEVICE_LOST) {
-            ctx->poisoned = true;
-            ctx->device->poisoned.store(true);
-        }
-        return status;
-    }
+    });
 }
 
 static enum ggml_status ggml_backend_vk_event_wait_status(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if (ctx->poisoned || ctx->device->poisoned.load()) {
-        return GGML_STATUS_BACKEND_POISONED;
-    }
-    try {
+    return ggml_vk_status_boundary(ctx, [&]() -> enum ggml_status {
         ggml_backend_vk_event_wait_impl(backend, event);
         return GGML_STATUS_SUCCESS;
-    } catch (const vk::SystemError & error) {
-        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
-        if (status == GGML_STATUS_DEVICE_LOST) {
-            ctx->poisoned = true;
-            ctx->device->poisoned.store(true);
-        }
-        return status;
+    });
+}
+
+static enum ggml_status ggml_backend_vk_set_abort_callback_status(
+        ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
+        struct ggml_backend_graph_cancel_capability * cancel_capability) {
+    if (!ggml_backend_is_vk(backend)) {
+        return GGML_STATUS_FAILED;
     }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_backend_abort_context_set(
+        &ctx->abort, abort_callback, abort_callback_data, cancel_capability);
+    return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_vk_set_abort_callback(
         ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data,
         struct ggml_backend_graph_cancel_capability * cancel_capability) {
-    GGML_ASSERT(ggml_backend_is_vk(backend));
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
-    ggml_backend_abort_context_set(
-        &ctx->abort, abort_callback, abort_callback_data, cancel_capability);
+    (void) ggml_backend_vk_set_abort_callback_status(
+        backend, abort_callback, abort_callback_data, cancel_capability);
 }
 
 // TODO: enable async and synchronize
@@ -17988,23 +18363,85 @@ static ggml_guid_t ggml_backend_vk_guid() {
 }
 
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
-    VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
-
-    ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-    ggml_vk_init(ctx, dev_num);
-
-    ggml_backend_t vk_backend = new ggml_backend {
-        /* .guid    = */ ggml_backend_vk_guid(),
-        /* .iface   = */ ggml_backend_vk_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
-        /* .context = */ ctx,
+    std::unique_ptr<ggml_backend_vk_context> ctx;
+    const auto cleanup_failed_init = [](ggml_backend_vk_context * value) noexcept {
+        if (value == nullptr || !value->device) {
+            return;
+        }
+        const vk_device device = value->device;
+        if (value->transfer_cmd_pool.pool) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->transfer_cmd_pool.destroy(value->device->device);
+            });
+        }
+        if (value->transfer_semaphore.s) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->device->device.destroySemaphore(value->transfer_semaphore.s);
+            });
+        }
+        if (value->compute_cmd_pool.pool) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->compute_cmd_pool.destroy(value->device->device);
+            });
+        }
+        if (value->compute_completion.s) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->device->device.destroySemaphore(value->compute_completion.s);
+            });
+        }
+        if (value->almost_ready_fence) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->device->device.destroyFence(value->almost_ready_fence);
+            });
+        }
+        if (value->fence) {
+            ggml_vk_cleanup_step(device, [&]() {
+                value->device->device.destroyFence(value->fence);
+            });
+        }
     };
 
-    if (!ctx->device->support_async) {
-        vk_backend->iface.get_tensor_async = nullptr;
+    try {
+        // Keep even debug-stream formatting inside the C-ABI exception
+        // boundary. An iostream configured to throw must not escape this
+        // exported entry point before Vulkan initialization is attempted.
+        VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
+        ctx.reset(new ggml_backend_vk_context {});
+        ggml_vk_init(ctx.get(), dev_num);
+        std::unique_ptr<ggml_backend> vk_backend(new ggml_backend {
+            /* .guid    = */ ggml_backend_vk_guid(),
+            /* .iface   = */ ggml_backend_vk_interface,
+            /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+            /* .context = */ ctx.get(),
+        });
+        if (!ctx->device->support_async) {
+            vk_backend->iface.get_tensor_async = nullptr;
+        }
+        ctx.release();
+        return vk_backend.release();
+    } catch (const ggml_backend_exception & error) {
+        cleanup_failed_init(ctx.get());
+        if (ctx && ctx->device) {
+            ggml_vk_record_device_status(ctx->device, error.status, error.native_error);
+        }
+    } catch (const vk::SystemError & error) {
+        cleanup_failed_init(ctx.get());
+        if (ctx && ctx->device) {
+            const vk::Result result = static_cast<vk::Result>(error.code().value());
+            ggml_vk_record_device_status(ctx->device, ggml_vk_status(result), static_cast<int64_t>(result));
+        }
+    } catch (const std::bad_alloc &) {
+        cleanup_failed_init(ctx.get());
+        if (ctx && ctx->device) {
+            ggml_vk_record_device_status(ctx->device, GGML_STATUS_ALLOC_FAILED, 0);
+        }
+    } catch (...) {
+        cleanup_failed_init(ctx.get());
+        if (ctx && ctx->device) {
+            ggml_vk_record_device_status(ctx->device, GGML_STATUS_EXECUTION_FAILED, 0);
+        }
     }
-
-    return vk_backend;
+    return nullptr;
 }
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {
@@ -18012,17 +18449,26 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
 }
 
 int ggml_backend_vk_get_device_count() {
-    return ggml_vk_get_device_count();
+    return ggml_backend_noexcept_or<int>([]() { return ggml_vk_get_device_count(); }, 0);
 }
 
 void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size) {
-    GGML_ASSERT(device < (int) vk_instance.device_indices.size());
-    int dev_idx = vk_instance.device_indices[device];
-    ggml_vk_get_device_description(dev_idx, description, description_size);
+    if (description != nullptr && description_size > 0) {
+        description[0] = '\0';
+    }
+    ggml_backend_noexcept_void([&]() {
+        GGML_ASSERT(device >= 0 && device < (int) vk_instance.device_indices.size());
+        const int dev_idx = vk_instance.device_indices[device];
+        ggml_vk_get_device_description(dev_idx, description, description_size);
+    });
 }
 
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
-    GGML_ASSERT(device < (int) vk_instance.device_indices.size());
+    if (free != nullptr) *free = 0;
+    if (total != nullptr) *total = 0;
+    ggml_backend_noexcept_void([&]() {
+    GGML_ASSERT(free != nullptr && total != nullptr);
+    GGML_ASSERT(device >= 0 && device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
 
     vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
@@ -18035,9 +18481,6 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
         memprops.pNext = &budgetprops;
     }
     vkdev.getMemoryProperties2(&memprops);
-
-    *total = 0;
-    *free = 0;
 
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
@@ -18052,6 +18495,7 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             }
         }
     }
+    });
 }
 
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
@@ -18891,43 +19335,90 @@ static bool ggml_backend_vk_device_offload_op(ggml_backend_dev_t dev, const ggml
 static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t dev) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
+    std::unique_ptr<vk_event> vkev;
+    try {
+        vkev.reset(new vk_event);
+        // No events initially, they get created on demand.
+        vkev->has_event = false;
 
-    vk_event *vkev = new vk_event;
-    if (!vkev) {
-        return nullptr;
+        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+        vk::SemaphoreCreateInfo ci{};
+        ci.setPNext(&tci);
+        vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
+
+        std::unique_ptr<ggml_backend_event> event(new ggml_backend_event {
+            /* .device  = */ dev,
+            /* .context = */ vkev.get(),
+        });
+        vkev.release();
+        return event.release();
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(device, error.status, error.native_error);
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        ggml_vk_record_device_status(device, ggml_vk_status(result), static_cast<int64_t>(result));
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+    } catch (...) {
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
     }
-
-    // No events initially, they get created on demand
-    vkev->has_event = false;
-
-    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
-    vk::SemaphoreCreateInfo ci{};
-    ci.setPNext(&tci);
-    vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
-
-    return new ggml_backend_event {
-        /* .device  = */ dev,
-        /* .context = */ vkev,
-    };
+    if (vkev && vkev->tl_semaphore.s) {
+        ggml_vk_cleanup_step(
+            device, [&]() { device->device.destroySemaphore(vkev->tl_semaphore.s); });
+    }
+    return nullptr;
 }
 
 static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    if (dev == nullptr || event == nullptr || event->context == nullptr) {
+        throw ggml_backend_exception { GGML_STATUS_FAILED, 0 };
+    }
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-    auto device = ggml_vk_get_device(ctx->device);
+    // An event can only be created after this slot was initialized. Do not
+    // re-enter lazy device initialization while destroying it: that lookup may
+    // itself fail and must never prevent the C owner objects from being freed.
+    const vk_device device = ctx->device < GGML_VK_MAX_DEVICES
+        ? vk_instance.devices[ctx->device]
+        : vk_device {};
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroySemaphore(vkev->tl_semaphore.s);
-    for (auto& event : vkev->events_free) {
-        device->device.destroyEvent(event);
+    if (!device) {
+        throw ggml_backend_exception { GGML_STATUS_FAILED, 0 };
     }
-    for (auto& event : vkev->events_submitted) {
-        device->device.destroyEvent(event);
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    const auto release = [&](auto && callback) {
+        status = ggml_backend_status_merge(
+            status, ggml_vk_device_cleanup_step(device, callback));
+    };
+    release([&]() {
+        device->device.destroySemaphore(vkev->tl_semaphore.s);
+        vkev->tl_semaphore.s = VK_NULL_HANDLE;
+    });
+    for (auto& free_event : vkev->events_free) {
+        release([&]() {
+            device->device.destroyEvent(free_event);
+            free_event = VK_NULL_HANDLE;
+        });
+    }
+    for (auto& submitted_event : vkev->events_submitted) {
+        release([&]() {
+            device->device.destroyEvent(submitted_event);
+            submitted_event = VK_NULL_HANDLE;
+        });
     }
     if (vkev->has_event) {
-        device->device.destroyEvent(vkev->event);
+        release([&]() {
+            device->device.destroyEvent(vkev->event);
+            vkev->event = VK_NULL_HANDLE;
+            vkev->has_event = false;
+        });
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        throw ggml_backend_exception { status, 0 };
     }
     delete vkev;
+    event->context = nullptr;
     delete event;
 }
 
@@ -18937,7 +19428,7 @@ static enum ggml_status ggml_backend_vk_device_event_synchronize(ggml_backend_de
     auto device = ggml_vk_get_device(ctx->device);
     vk_event *vkev = (vk_event *)event->context;
 
-    try {
+    return ggml_vk_device_status_boundary(device, [&]() -> enum ggml_status {
         // Only do something if the event has actually been used
         if (vkev->has_event) {
             vk::Semaphore sem = vkev->tl_semaphore.s;
@@ -18951,7 +19442,8 @@ static enum ggml_status ggml_backend_vk_device_event_synchronize(ggml_backend_de
                 }
                 vkev->cmd_buffer = nullptr;
                 const enum ggml_status status = ggml_vk_status(wait_status);
-                if (status == GGML_STATUS_DEVICE_LOST) device->poisoned.store(true);
+                ggml_vk_record_device_status(
+                    device, status, static_cast<int64_t>(wait_status));
                 return status;
             }
 
@@ -18970,13 +19462,7 @@ static enum ggml_status ggml_backend_vk_device_event_synchronize(ggml_backend_de
             }
         }
         return GGML_STATUS_SUCCESS;
-    } catch (const vk::SystemError & error) {
-        const enum ggml_status status = ggml_vk_status((vk::Result) error.code().value());
-        if (status == GGML_STATUS_DEVICE_LOST) {
-            device->poisoned.store(true);
-        }
-        return status;
-    }
+    });
 }
 
 static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
@@ -18994,14 +19480,7 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
 
     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
 
-    vk_buffer buf {};
-    try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
-    } catch (vk::SystemError& e) {
-        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
-    }
-
-    return buf;
+    return ggml_vk_create_buffer(device, size, { property_flags }, ptr);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -19011,17 +19490,33 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
-    vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
-
-    if (!buf) {
-        return {};
+    try {
+        vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+        if (!buf) {
+            return nullptr;
+        }
+        std::unique_ptr<ggml_backend_vk_buffer_context> bufctx(
+            new ggml_backend_vk_buffer_context(device, std::move(buf), device->name));
+        ggml_backend_buffer_t result = ggml_backend_buffer_init(
+            ggml_backend_vk_device_get_buffer_type(dev),
+            ggml_backend_vk_buffer_interface, bufctx.get(), size);
+        if (result == nullptr) {
+            ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+            return nullptr;
+        }
+        bufctx.release();
+        return result;
+    } catch (const ggml_backend_exception & error) {
+        ggml_vk_record_device_status(device, error.status, error.native_error);
+    } catch (const vk::SystemError & error) {
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        ggml_vk_record_device_status(device, ggml_vk_status(result), static_cast<int64_t>(result));
+    } catch (const std::bad_alloc &) {
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+    } catch (...) {
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
     }
-
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
-
-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
-
-    return ret;
+    return nullptr;
 }
 
 static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
@@ -19086,12 +19581,52 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// Vulkan 1.1 deviceUUID is a stable per-physical-device token when PCI-BDF is
+// unavailable. It is only safe to emit when it is non-zero and unique among
+// the instance's physical devices. Duplicate UUIDs (MoltenVK multi-GPU, two
+// ICDs for one GPU already de-duplicated above, or a broken driver) must stay
+// all-zero so DEVICE_LOCAL admission fail-closes instead of colliding.
+static bool ggml_backend_vk_unique_nonzero_device_uuid(const uint8_t * uuid) {
+    bool nonzero = false;
+    for (uint32_t i = 0; i < VK_UUID_SIZE; ++i) {
+        if (uuid[i] != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    if (!nonzero) {
+        return false;
+    }
+    int matches = 0;
+    for (const auto & phys : vk_instance.instance.enumeratePhysicalDevices()) {
+        vk::PhysicalDeviceIDProperties id_props{};
+        vk::PhysicalDeviceProperties2 props{};
+        props.pNext = &id_props;
+        phys.getProperties2(&props);
+        if (std::equal(uuid, uuid + VK_UUID_SIZE, id_props.deviceUUID.data())) {
+            matches++;
+        }
+    }
+    return matches == 1;
+}
+
 static ggml_backend_memory_domain_id_v1 ggml_backend_vk_memory_domain(
         const vk_device & device, uint32_t heap_index, uint32_t kind) {
     ggml_backend_memory_domain_id_v1 id = {};
     const std::string pci_bus_id = ggml_backend_vk_get_device_pci_id((int) device->idx);
-    (void) ggml_backend_memory_encode_pci_bdf_v1(
-        pci_bus_id.empty() ? NULL : pci_bus_id.c_str(), id.physical_device_uuid);
+    // DEVICE_LOCAL admission fail-closes on an all-zero identity. Several
+    // Windows vendor ICDs (including AMD Adrenalin) omit VK_EXT_pci_bus_info,
+    // so PCI-BDF encoding is not always available; Vulkan 1.1 deviceUUID is.
+    if (!ggml_backend_memory_encode_pci_bdf_v1(
+            pci_bus_id.empty() ? nullptr : pci_bus_id.c_str(), id.physical_device_uuid)) {
+        vk::PhysicalDeviceIDProperties id_props{};
+        vk::PhysicalDeviceProperties2 props{};
+        props.pNext = &id_props;
+        device->physical_device.getProperties2(&props);
+        if (ggml_backend_vk_unique_nonzero_device_uuid(id_props.deviceUUID.data())) {
+            memcpy(id.physical_device_uuid, id_props.deviceUUID.data(), sizeof(id.physical_device_uuid));
+        }
+    }
     id.heap_index = heap_index;
     id.kind = kind;
     return id;
@@ -19166,7 +19701,18 @@ static enum ggml_status ggml_backend_vk_memory_buffer_commitment(
         return GGML_STATUS_SUCCESS;
     } catch (const vk::SystemError & error) {
         if (buffer) device->device.destroyBuffer(buffer);
-        return ggml_vk_status((vk::Result) error.code().value());
+        const vk::Result result = static_cast<vk::Result>(error.code().value());
+        const enum ggml_status status = ggml_vk_status(result);
+        ggml_vk_record_device_status(device, status, static_cast<int64_t>(result));
+        return status;
+    } catch (const std::bad_alloc &) {
+        if (buffer) device->device.destroyBuffer(buffer);
+        ggml_vk_record_device_status(device, GGML_STATUS_ALLOC_FAILED, 0);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        if (buffer) device->device.destroyBuffer(buffer);
+        ggml_vk_record_device_status(device, GGML_STATUS_EXECUTION_FAILED, 0);
+        return GGML_STATUS_EXECUTION_FAILED;
     }
 }
 
@@ -19320,7 +19866,9 @@ static enum ggml_status ggml_backend_vk_memory_reserve_private(
         if (requests[i].backend != NULL) {
             ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) requests[i].backend->context;
             reserve_device = reserve_device ? reserve_device : ctx->device;
-            if (ctx->poisoned || ctx->device->poisoned.load()) return GGML_STATUS_BACKEND_POISONED;
+            if (ctx->memory_quarantined || ctx->poisoned || ctx->device->poisoned.load()) {
+                return GGML_STATUS_BACKEND_POISONED;
+            }
         } else if (!reserve_device && requests[i].buft != NULL && requests[i].kind == GGML_BACKEND_MEMORY_REQUEST_BUFFER) {
             if (requests[i].buft->iface.get_name != ggml_backend_vk_buffer_type_name) return GGML_STATUS_FAILED;
             reserve_device = ((ggml_backend_vk_buffer_type_context *) requests[i].buft->context)->device;
@@ -19341,6 +19889,7 @@ static enum ggml_status ggml_backend_vk_memory_get_stats(
     if (dev == NULL || inout_count == NULL) return GGML_STATUS_FAILED;
     ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *) dev->context;
     vk_device device = ggml_vk_get_device(dev_ctx->device);
+    return ggml_vk_device_status_boundary(device, [&]() -> enum ggml_status {
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgets;
     vk::PhysicalDeviceMemoryProperties2 props;
     const bool has_budget = vk_instance.device_supports_membudget[dev_ctx->device];
@@ -19369,10 +19918,27 @@ static enum ggml_status ggml_backend_vk_memory_get_stats(
         if (!has_budget) value.flags |= GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE;
         value.timestamp_monotonic_ns = (uint64_t) ggml_time_us() * 1000;
         value.health = device->poisoned.load() ? GGML_BACKEND_MEMORY_DEVICE_LOST : GGML_BACKEND_MEMORY_HEALTHY;
-        if (backend != NULL && ((ggml_backend_vk_context *) backend->context)->poisoned) value.health = GGML_BACKEND_MEMORY_QUARANTINED;
+        value.last_ggml_status = device->last_ggml_status.load(std::memory_order_acquire);
+        value.last_native_error = device->last_native_error.load(std::memory_order_relaxed);
+        value.quarantine_generation = device->quarantine_generation.load(std::memory_order_relaxed);
+        if (backend != NULL) {
+            ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+            if (ctx->last_ggml_status != GGML_STATUS_SUCCESS) {
+                value.last_ggml_status = ctx->last_ggml_status;
+                value.last_native_error = ctx->last_native_error;
+            }
+            value.quarantine_generation = ctx->quarantine_generation;
+            if (ctx->memory_quarantined || ctx->poisoned) {
+                value.health = GGML_BACKEND_MEMORY_QUARANTINED;
+            }
+            if (ctx->device->poisoned.load()) {
+                value.health = GGML_BACKEND_MEMORY_DEVICE_LOST;
+            }
+        }
         stats[i] = value;
     }
-    return GGML_STATUS_SUCCESS;
+        return GGML_STATUS_SUCCESS;
+    });
 }
 
 static enum ggml_status ggml_backend_vk_memory_trim(ggml_backend_t backend, uint64_t flags) {
@@ -19381,20 +19947,32 @@ static enum ggml_status ggml_backend_vk_memory_trim(ggml_backend_t backend, uint
     const enum ggml_status status = ggml_backend_vk_synchronize(backend);
     if (status != GGML_STATUS_SUCCESS) return status;
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
-    ggml_vk_destroy_buffer(ctx->prealloc_x);
-    ggml_vk_destroy_buffer(ctx->prealloc_y);
-    ggml_vk_destroy_buffer(ctx->prealloc_split_k);
-    ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
-    ggml_vk_destroy_buffer(ctx->sync_staging);
-    return GGML_STATUS_SUCCESS;
+    enum ggml_status first_failure = GGML_STATUS_SUCCESS;
+    const auto release = [&](auto && callback) {
+        const enum ggml_status step = ggml_vk_context_cleanup_step(ctx, callback);
+        if (first_failure == GGML_STATUS_SUCCESS && step != GGML_STATUS_SUCCESS) {
+            first_failure = step;
+        }
+    };
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_x); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_y); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_split_k); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials); });
+    release([&]() { ggml_vk_destroy_buffer(ctx->sync_staging); });
+    return first_failure;
 }
 
 static enum ggml_status ggml_backend_vk_memory_quarantine(
         ggml_backend_t backend, const ggml_backend_memory_quarantine_v1 * request) {
     if (backend == NULL || request == NULL || request->struct_size < sizeof(*request)) return GGML_STATUS_FAILED;
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
-    ctx->poisoned = true;
-    ctx->device->poisoned.store(true);
+    ctx->memory_quarantined = true;
+    ctx->last_ggml_status = (enum ggml_status) request->ggml_status;
+    ctx->last_native_error = request->native_error;
+    ctx->quarantine_generation++;
+    ctx->device->quarantine_generation.fetch_add(1, std::memory_order_relaxed);
+    ggml_vk_record_device_status(
+        ctx->device, (enum ggml_status) request->ggml_status, request->native_error);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -19486,6 +20064,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_vk_set_abort_callback;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback_status") == 0) {
+        return (void *)ggml_backend_vk_set_abort_callback_status;
     }
 #ifdef GGML_VULKAN_TESTS
     if (strcmp(name, "ggml_backend_vk_test_gate_create") == 0) {
@@ -20420,6 +21001,82 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 
     VK_LOG_DEBUG("END ggml_vk_check_results_1(" << tensor->name << ")");
+}
+#endif
+
+#ifdef GGML_BACKEND_DL
+extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
+        const char * expected_target,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (driver_out == nullptr || driver_out_capacity == 0) {
+        return 0;
+    }
+    driver_out[0] = '\0';
+    try {
+        if (expected_target == nullptr || expected_target[0] == '\0') {
+            return 0;
+        }
+
+        ggml_vk_instance_init();
+        const std::vector<vk::PhysicalDevice> physical_devices =
+            vk_instance.instance.enumeratePhysicalDevices();
+        for (size_t physical_index : vk_instance.device_indices) {
+            if (physical_index >= physical_devices.size()) {
+                return 0;
+            }
+            const vk::PhysicalDevice physical_device = physical_devices[physical_index];
+            vk::PhysicalDeviceProperties2 properties{};
+            physical_device.getProperties2(&properties);
+            const auto & pipeline_uuid = properties.properties.pipelineCacheUUID;
+            if (std::all_of(pipeline_uuid.begin(), pipeline_uuid.end(), [](uint8_t byte) { return byte == 0; })) {
+                continue;
+            }
+
+            // `deviceUUID` is per physical card and would make a signed
+            // activation useless on another card of the same model. Vulkan's
+            // pipelineCacheUUID is explicitly an implementation compatibility
+            // token. Combined with vendor/device ids and the separately bound
+            // exact driver version, it defines the narrow reusable capability
+            // class used by release qualification. Physical UUID remains a
+            // memory-domain/isolation identity and is never broadened here.
+            char actual_target[8 + 8 + 1 + 8 + 1 + VK_UUID_SIZE * 2 + 1] = {};
+            const int target_prefix_length = std::snprintf(
+                actual_target,
+                sizeof(actual_target),
+                "vk_caps_%08x_%08x_",
+                properties.properties.vendorID,
+                properties.properties.deviceID);
+            if (target_prefix_length != 26) {
+                return 0;
+            }
+            for (uint32_t index = 0; index < VK_UUID_SIZE; ++index) {
+                std::snprintf(
+                    actual_target + 26 + index * 2,
+                    sizeof(actual_target) - 26 - index * 2,
+                    "%02x",
+                    static_cast<unsigned>(pipeline_uuid[index]));
+            }
+            if (std::strcmp(actual_target, expected_target) != 0) {
+                continue;
+            }
+
+            const uint32_t raw_driver = properties.properties.driverVersion;
+            if (raw_driver == 0) {
+                return 0;
+            }
+            const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%u", raw_driver);
+            if (driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
+                driver_out[0] = '\0';
+                return 0;
+            }
+            return 1;
+        }
+        return 0;
+    } catch (...) {
+        driver_out[0] = '\0';
+        return 0;
+    }
 }
 #endif
 
