@@ -2905,8 +2905,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static enum ggml_status ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static enum ggml_status ggml_cuda_graph_update_executable(
+        ggml_backend_cuda_context * cuda_ctx,
+        const void * graph_key,
+        uint32_t * executable_change) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    GGML_ASSERT(executable_change != nullptr);
+    *executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -2932,14 +2937,20 @@ static enum ggml_status ggml_cuda_graph_update_executable(ggml_backend_cuda_cont
             return ggml_cuda_is_device_lost(destroy_status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
         }
         cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
-        return instantiate_status == cudaSuccess
-            ? GGML_STATUS_SUCCESS
-            : (ggml_cuda_is_device_lost(instantiate_status) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+        if (instantiate_status == cudaSuccess) {
+            *executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_REPLACED_V1;
+            return GGML_STATUS_SUCCESS;
+        }
+        return ggml_cuda_is_device_lost(instantiate_status)
+            ? GGML_STATUS_DEVICE_LOST
+            : GGML_STATUS_EXECUTION_FAILED;
     }
 
-    return stat == cudaSuccess
-        ? GGML_STATUS_SUCCESS
-        : (ggml_cuda_is_device_lost(stat) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED);
+    if (stat == cudaSuccess) {
+        *executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_UPDATED_V1;
+        return GGML_STATUS_SUCCESS;
+    }
+    return ggml_cuda_is_device_lost(stat) ? GGML_STATUS_DEVICE_LOST : GGML_STATUS_EXECUTION_FAILED;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4452,18 +4463,34 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        uint32_t executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
             if (instantiate_status != cudaSuccess) {
                 graph->instance = nullptr;
                 return ggml_cuda_status(instantiate_status);
             }
+            executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_INSTANTIATED_V1;
         }
         if (cuda_graph_update_required) { // Update graph executable
-            enum ggml_status update_status = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            uint32_t update_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
+            enum ggml_status update_status = ggml_cuda_graph_update_executable(
+                cuda_ctx, graph_key, &update_change);
             if (update_status != GGML_STATUS_SUCCESS) {
                 return update_status;
             }
+            // One completed capture/update cycle is one observable generation,
+            // even when the provider redundantly updates a freshly instantiated
+            // executable. A replacement is still surfaced because its native
+            // handle changed during the cycle.
+            if (executable_change == GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1 ||
+                update_change == GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_REPLACED_V1) {
+                executable_change = update_change;
+            }
+        }
+        if (executable_change != GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1 &&
+            !cuda_ctx->record_cuda_graph_executable_change(graph, executable_change)) {
+            return GGML_STATUS_FAILED;
         }
         // Launch graph
         cudaError_t launch_status = cudaGraphLaunch(graph->instance, cuda_ctx->stream());
@@ -6060,6 +6087,52 @@ static const ggml_backend_memory_api_v1 * ggml_backend_cuda_memory_get_api_v1(vo
     return &api;
 }
 
+static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe(
+        ggml_backend_t backend,
+        const ggml_cgraph * cgraph,
+        ggml_backend_graph_lifecycle_observation_v1 * observation) {
+    if (backend == nullptr || cgraph == nullptr || observation == nullptr ||
+        observation->struct_size < sizeof(*observation) ||
+        cgraph->n_nodes <= 0 || cgraph->nodes == nullptr || cgraph->nodes[0] == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+
+    observation->abi_version = GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1;
+    observation->flags = 0;
+    observation->last_executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
+    observation->executable_generation = 0;
+
+#ifdef USE_CUDA_GRAPH
+    const ggml_backend_cuda_context * cuda_ctx =
+        static_cast<const ggml_backend_cuda_context *>(backend->context);
+    observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1;
+    const ggml_cuda_graph * graph = cuda_ctx->find_cuda_graph(cgraph->nodes[0]);
+    if (graph == nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (graph->is_enabled()) {
+        observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1;
+    }
+    if (graph->instance != nullptr) {
+        observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1;
+    }
+    observation->last_executable_change = graph->last_executable_change;
+    observation->executable_generation = graph->executable_generation;
+#endif
+    return GGML_STATUS_SUCCESS;
+}
+
+static const ggml_backend_graph_lifecycle_api_v1 *
+ggml_backend_cuda_graph_lifecycle_get_api_v1(void) {
+    static const ggml_backend_graph_lifecycle_api_v1 api = {
+        sizeof(ggml_backend_graph_lifecycle_api_v1),
+        GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1,
+        0,
+        ggml_backend_cuda_graph_lifecycle_observe,
+    };
+    return &api;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6082,6 +6155,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MEMORY_API_V1_PROC) == 0) {
         return (void *) ggml_backend_cuda_memory_get_api_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC) == 0) {
+        return (void *) ggml_backend_cuda_graph_lifecycle_get_api_v1;
     }
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_cuda_set_abort_callback;

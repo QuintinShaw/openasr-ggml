@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1275,6 +1276,8 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t executable_generation = 0;
+    uint32_t last_executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1500,6 +1503,7 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
+    uint64_t last_cuda_graph_executable_generation = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
@@ -1524,6 +1528,21 @@ struct ggml_backend_cuda_context {
         }
         it->second->last_used_time = time_now;
         return it->second.get();
+    }
+
+    const ggml_cuda_graph * find_cuda_graph(const void * first_node_ptr) const {
+        const auto it = cuda_graphs.find(first_node_ptr);
+        return it == cuda_graphs.end() ? nullptr : it->second.get();
+    }
+
+    bool record_cuda_graph_executable_change(ggml_cuda_graph * graph, uint32_t change) {
+        if (graph == nullptr ||
+            last_cuda_graph_executable_generation == std::numeric_limits<uint64_t>::max()) {
+            return false;
+        }
+        graph->executable_generation = ++last_cuda_graph_executable_generation;
+        graph->last_executable_change = change;
+        return true;
     }
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know

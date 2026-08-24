@@ -274,6 +274,52 @@ extern "C" {
         const struct ggml_backend_memory_api_v1 * api, ggml_backend_t backend,
         const struct ggml_backend_memory_quarantine_v1 * request);
 
+    // Optional, versioned observation of backend-native captured graph
+    // executables. This is diagnostic evidence only: it cannot enable graph
+    // capture or alter backend policy. A caller observes one concrete backend
+    // and cgraph after successful compute; providers must return the actual
+    // executable generation minted where instantiate/update succeeds rather
+    // than infer it from the requested planner mode.
+    #define GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC "ggml_backend_graph_lifecycle_get_api_v1"
+    #define GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1 1u
+
+    enum ggml_backend_graph_lifecycle_flags_v1 {
+        GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1  = 1u << 0,
+        GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1    = 1u << 1,
+        GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1 = 1u << 2,
+    };
+
+    enum ggml_backend_graph_executable_change_v1 {
+        GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1        = 0,
+        GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_INSTANTIATED_V1 = 1,
+        GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_UPDATED_V1      = 2,
+        GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_REPLACED_V1     = 3,
+    };
+
+    struct ggml_backend_graph_lifecycle_observation_v1 {
+        uint32_t struct_size;
+        uint32_t abi_version;
+        uint32_t flags;
+        uint32_t last_executable_change;
+        // Monotonic within one backend context, including cache eviction and
+        // recreation. Zero means no captured executable has been created for
+        // this graph in the current context.
+        uint64_t executable_generation;
+    };
+
+    struct ggml_backend_graph_lifecycle_api_v1 {
+        uint32_t struct_size;
+        uint32_t abi_version;
+        uint64_t capabilities;
+        enum ggml_status (*observe)(
+            ggml_backend_t backend,
+            const struct ggml_cgraph * graph,
+            struct ggml_backend_graph_lifecycle_observation_v1 * observation);
+    };
+
+    typedef const struct ggml_backend_graph_lifecycle_api_v1 *
+        (*ggml_backend_graph_lifecycle_get_api_v1_t)(void);
+
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
     GGML_API enum ggml_status               ggml_backend_buffer_free_status   (ggml_backend_buffer_t buffer);

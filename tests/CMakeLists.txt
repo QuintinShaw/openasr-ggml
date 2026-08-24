@@ -211,6 +211,12 @@ target_include_directories(${TEST_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+# versioned native captured-graph lifecycle observation ABI
+set(TEST_TARGET test-backend-graph-lifecycle)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 # versioned backend physical-memory ABI and frozen scheduler-plan contract
 set(TEST_TARGET test-backend-memory)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
@@ -221,6 +227,9 @@ if (Python3_Interpreter_FOUND)
     add_test(
         NAME test-backend-memory-static
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-memory-static.py)
+    add_test(
+        NAME test-backend-graph-lifecycle-static
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-graph-lifecycle-static.py)
 endif()
 
 # bounded GGUF parser C ABI and typed-limit smoke contract
