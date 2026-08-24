@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #ifdef GGML_USE_BLAS
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 struct fake_event_state {
@@ -43,6 +45,14 @@ struct fake_backend_state {
         GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
     int abort_set_calls = 0;
     int abort_clear_calls = 0;
+    bool throw_graph_optimize = false;
+    bool throw_init_tensor = false;
+    bool throw_buffer_free_before_release = false;
+    bool throw_buffer_free = false;
+    bool throw_buffer_reset = false;
+    bool fail_buffer_alloc = false;
+    int buffer_free_calls = 0;
+    int buffer_reset_calls = 0;
 };
 
 static const char * fake_buffer_name(ggml_backend_buffer_type_t buft) {
@@ -50,11 +60,28 @@ static const char * fake_buffer_name(ggml_backend_buffer_type_t buft) {
 }
 
 static void fake_buffer_free(ggml_backend_buffer_t buffer) {
+    auto * state = static_cast<fake_backend_state *>(buffer->buft->context);
+    if (state->throw_buffer_free_before_release) {
+        throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 109 };
+    }
     ggml_aligned_free(buffer->context, buffer->size);
+    state->buffer_free_calls++;
+    if (state->throw_buffer_free) {
+        throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 110 };
+    }
 }
 
 static void * fake_buffer_base(ggml_backend_buffer_t buffer) {
     return buffer->context;
+}
+
+static enum ggml_status fake_buffer_init_tensor(
+        ggml_backend_buffer_t buffer, ggml_tensor *) {
+    auto * state = static_cast<fake_backend_state *>(buffer->buft->context);
+    if (state->throw_init_tensor) {
+        throw ggml_backend_exception { GGML_STATUS_ALLOC_FAILED, 111 };
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 static void fake_buffer_memset(
@@ -76,13 +103,25 @@ static void fake_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     std::memset(buffer->context, value, buffer->size);
 }
 
+static void fake_buffer_reset(ggml_backend_buffer_t buffer) {
+    auto * state = static_cast<fake_backend_state *>(buffer->buft->context);
+    state->buffer_reset_calls++;
+    if (state->throw_buffer_reset) {
+        throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 113 };
+    }
+}
+
 static ggml_backend_buffer_t fake_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * state = static_cast<fake_backend_state *>(buft->context);
+    if (state->fail_buffer_alloc) {
+        return nullptr;
+    }
     void * data = ggml_aligned_malloc(size);
     assert(data != nullptr);
     const ggml_backend_buffer_i iface = {
         /* .free_buffer   = */ fake_buffer_free,
         /* .get_base      = */ fake_buffer_base,
-        /* .init_tensor   = */ nullptr,
+        /* .init_tensor   = */ fake_buffer_init_tensor,
         /* .memset_tensor = */ fake_buffer_memset,
         /* .set_tensor    = */ fake_buffer_set,
         /* .get_tensor    = */ fake_buffer_get,
@@ -90,13 +129,21 @@ static ggml_backend_buffer_t fake_buffer_alloc(ggml_backend_buffer_type_t buft, 
         /* .get_tensor_2d = */ nullptr,
         /* .cpy_tensor    = */ nullptr,
         /* .clear         = */ fake_buffer_clear,
-        /* .reset         = */ nullptr,
+        /* .reset         = */ fake_buffer_reset,
     };
     return ggml_backend_buffer_init(buft, iface, data, size);
 }
 
 static size_t fake_buffer_alignment(ggml_backend_buffer_type_t) {
     return GGML_MEM_ALIGN;
+}
+
+static size_t invalid_buffer_alignment(ggml_backend_buffer_type_t) {
+    return 3;
+}
+
+static void * null_buffer_base(ggml_backend_buffer_t) {
+    return nullptr;
 }
 
 static const char * fake_backend_name(ggml_backend_t backend) {
@@ -180,6 +227,13 @@ static enum ggml_status fake_graph_compute(ggml_backend_t backend, struct ggml_c
         return GGML_STATUS_ABORTED;
     }
     return GGML_STATUS_SUCCESS;
+}
+
+static void fake_graph_optimize(ggml_backend_t backend, ggml_cgraph *) {
+    auto * state = static_cast<fake_backend_state *>(backend->context);
+    if (state->throw_graph_optimize) {
+        throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 108 };
+    }
 }
 
 static void fake_set_abort_callback(
@@ -277,6 +331,14 @@ static void reset(fake_backend_state & state) {
     state.native_granularity = GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT;
     state.abort_set_calls = 0;
     state.abort_clear_calls = 0;
+    state.throw_graph_optimize = false;
+    state.throw_init_tensor = false;
+    state.throw_buffer_free_before_release = false;
+    state.throw_buffer_free = false;
+    state.throw_buffer_reset = false;
+    state.fail_buffer_alloc = false;
+    state.buffer_free_calls = 0;
+    state.buffer_reset_calls = 0;
 }
 
 struct scheduler_copy_abort_probe {
@@ -377,11 +439,357 @@ static ggml_backend make_fake_scheduler_backend(
             /* .graph_compute       = */ fake_graph_compute,
             /* .event_record_status = */ fake_event_record_status,
             /* .event_wait_status   = */ fake_event_wait_status,
-            /* .graph_optimize      = */ nullptr,
+            /* .graph_optimize      = */ fake_graph_optimize,
         },
         /* .device  = */ device,
         /* .context = */ state,
     };
+}
+
+static const char * throwing_buft_name(ggml_backend_buffer_type_t) {
+    throw std::runtime_error("injected buffer-name failure");
+}
+
+static ggml_backend_buffer_t throwing_buffer_alloc(ggml_backend_buffer_type_t, size_t) {
+    throw std::bad_alloc();
+}
+
+static void * throwing_buffer_base(ggml_backend_buffer_t) {
+    throw std::runtime_error("injected buffer-base failure");
+}
+
+static void throwing_buffer_set(
+        ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t) {
+    throw ggml_backend_exception { GGML_STATUS_ALLOC_FAILED, 101 };
+}
+
+static void throwing_buffer_get(
+        ggml_backend_buffer_t, const ggml_tensor *, void *, size_t, size_t) {
+    throw std::runtime_error("injected buffer-read failure");
+}
+
+static void throwing_buffer_memset(
+        ggml_backend_buffer_t, ggml_tensor *, uint8_t, size_t, size_t) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 102 };
+}
+
+static void throwing_buffer_clear(ggml_backend_buffer_t, uint8_t) {
+    throw ggml_backend_exception { GGML_STATUS_BACKEND_POISONED, 103 };
+}
+
+static void throwing_buffer_reset(ggml_backend_buffer_t) {
+    throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 114 };
+}
+
+static bool throwing_buffer_copy(
+        ggml_backend_buffer_t, const ggml_tensor *, ggml_tensor *) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 109 };
+}
+
+static enum ggml_status throwing_backend_synchronize(ggml_backend_t) {
+    throw std::runtime_error("injected synchronize failure");
+}
+
+static const char * throwing_backend_name(ggml_backend_t) {
+    throw std::runtime_error("injected backend-name failure");
+}
+
+static void throwing_backend_free(ggml_backend_t) {
+    throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 115 };
+}
+
+static enum ggml_status throwing_backend_compute(ggml_backend_t, ggml_cgraph *) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 104 };
+}
+
+static const char * throwing_device_name(ggml_backend_dev_t) {
+    throw std::runtime_error("injected device-name failure");
+}
+
+static void throwing_device_memory(ggml_backend_dev_t, size_t *, size_t *) {
+    throw std::runtime_error("injected device-memory failure");
+}
+
+static enum ggml_backend_dev_type throwing_device_type(ggml_backend_dev_t) {
+    throw std::runtime_error("injected device-type failure");
+}
+
+static void throwing_device_props(ggml_backend_dev_t, ggml_backend_dev_props *) {
+    throw std::runtime_error("injected device-props failure");
+}
+
+static ggml_backend_t throwing_device_init(ggml_backend_dev_t, const char *) {
+    throw std::bad_alloc();
+}
+
+static ggml_backend_buffer_type_t throwing_device_buft(ggml_backend_dev_t) {
+    throw std::runtime_error("injected device-buft failure");
+}
+
+static bool throwing_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
+    throw std::runtime_error("injected supports-op failure");
+}
+
+static bool throwing_device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t) {
+    throw std::runtime_error("injected supports-buft failure");
+}
+
+static ggml_backend_event_t throwing_event_new(ggml_backend_dev_t) {
+    throw std::bad_alloc();
+}
+
+static void throwing_event_free(ggml_backend_dev_t, ggml_backend_event_t) {
+    throw ggml_backend_exception { GGML_STATUS_EXECUTION_FAILED, 116 };
+}
+
+static enum ggml_status throwing_event_synchronize(ggml_backend_dev_t, ggml_backend_event_t) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 105 };
+}
+
+static const char * throwing_reg_name(ggml_backend_reg_t) {
+    throw std::runtime_error("injected registry-name failure");
+}
+
+static size_t throwing_reg_count(ggml_backend_reg_t) {
+    throw std::bad_alloc();
+}
+
+static ggml_backend_dev_t throwing_reg_get(ggml_backend_reg_t, size_t) {
+    throw std::runtime_error("injected registry-device failure");
+}
+
+static void * throwing_reg_proc(ggml_backend_reg_t, const char *) {
+    throw std::runtime_error("injected registry-proc failure");
+}
+
+static void throwing_set_n_threads(ggml_backend_t, int) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 112 };
+}
+
+static uint32_t throwing_pci_vendor_id(ggml_backend_dev_t) {
+    throw std::runtime_error("injected PCI vendor query failure");
+}
+
+static void * callback_throwing_reg_proc(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        return reinterpret_cast<void *>(throwing_set_n_threads);
+    }
+    if (std::strcmp(name, GGML_BACKEND_DEVICE_PCI_VENDOR_ID_PROC) == 0) {
+        return reinterpret_cast<void *>(throwing_pci_vendor_id);
+    }
+    return nullptr;
+}
+
+static enum ggml_status throwing_memory_domains(
+        ggml_backend_dev_t, ggml_backend_memory_domain_v1 *, uint32_t *) {
+    throw ggml_backend_exception { GGML_STATUS_DEVICE_LOST, 106 };
+}
+
+static enum ggml_status throwing_memory_quote(
+        const ggml_backend_memory_request_v1 *, uint32_t, ggml_backend_memory_quote_v1 *,
+        ggml_backend_memory_claim_v1 *, uint32_t *) {
+    throw std::bad_alloc();
+}
+
+static enum ggml_status throwing_memory_reserve(
+        const ggml_backend_memory_request_v1 *, uint32_t,
+        const ggml_backend_memory_quote_v1 *, ggml_backend_memory_claim_v1 *, uint32_t *) {
+    throw std::runtime_error("injected reserve failure");
+}
+
+static enum ggml_status throwing_memory_stats(
+        ggml_backend_dev_t, ggml_backend_t, ggml_backend_memory_stats_v1 *, uint32_t *) {
+    throw ggml_backend_exception { GGML_STATUS_BACKEND_POISONED, 107 };
+}
+
+static void verify_common_noexcept_adapter(ggml_tensor * tensor) {
+    assert(std::strcmp(ggml_backend_buft_name(nullptr), "unknown") == 0);
+    assert(ggml_backend_buft_alloc_buffer(nullptr, 16) == nullptr);
+    assert(ggml_backend_buft_get_alignment(nullptr) == 0);
+    assert(ggml_backend_buffer_init_tensor(nullptr, tensor) == GGML_STATUS_FAILED);
+    assert(ggml_backend_buffer_clear(nullptr, 0) == GGML_STATUS_FAILED);
+    assert(ggml_backend_graph_compute_async(nullptr, nullptr) == GGML_STATUS_FAILED);
+    assert(ggml_backend_event_synchronize(nullptr) == GGML_STATUS_FAILED);
+    assert(std::strcmp(ggml_backend_dev_name(nullptr), "unknown") == 0);
+    assert(std::strcmp(ggml_backend_reg_name(nullptr), "unknown") == 0);
+    assert(ggml_backend_tensor_alloc(nullptr, tensor, nullptr) == GGML_STATUS_FAILED);
+
+    ggml_backend_buffer_type buft = {
+        {
+            throwing_buft_name,
+            throwing_buffer_alloc,
+            fake_buffer_alignment,
+            nullptr,
+            nullptr,
+            nullptr,
+        },
+        nullptr,
+        nullptr,
+    };
+    assert(std::strcmp(ggml_backend_buft_name(&buft), "unknown") == 0);
+    assert(ggml_backend_buft_alloc_buffer(&buft, 16) == nullptr);
+
+    char storage[sizeof(float)] = {};
+    ggml_backend_buffer buffer = {
+        {
+            nullptr,
+            throwing_buffer_base,
+            nullptr,
+            throwing_buffer_memset,
+            throwing_buffer_set,
+            throwing_buffer_get,
+            nullptr,
+            nullptr,
+            throwing_buffer_copy,
+            throwing_buffer_clear,
+            throwing_buffer_reset,
+        },
+        &buft,
+        storage,
+        sizeof(storage),
+        GGML_BACKEND_BUFFER_USAGE_ANY,
+    };
+    tensor->buffer = &buffer;
+    tensor->data = storage;
+    float value = 1.0f;
+    assert(ggml_backend_buffer_get_base(&buffer) == nullptr);
+    assert(ggml_backend_tensor_set(tensor, &value, 0, sizeof(value)) == GGML_STATUS_ALLOC_FAILED);
+    assert(ggml_backend_tensor_get(tensor, &value, 0, sizeof(value)) == GGML_STATUS_EXECUTION_FAILED);
+    assert(ggml_backend_tensor_memset(tensor, 0, 0, sizeof(value)) == GGML_STATUS_DEVICE_LOST);
+    assert(ggml_backend_buffer_clear(&buffer, 0) == GGML_STATUS_BACKEND_POISONED);
+    assert(ggml_backend_buffer_reset_status(&buffer) == GGML_STATUS_EXECUTION_FAILED);
+    ggml_backend_buffer_reset(&buffer);
+    assert(ggml_backend_tensor_set(tensor, &value, SIZE_MAX, sizeof(value)) ==
+           GGML_STATUS_FAILED);
+    assert(ggml_backend_tensor_get(tensor, &value, SIZE_MAX, sizeof(value)) ==
+           GGML_STATUS_FAILED);
+    assert(ggml_backend_tensor_set_async(
+               nullptr, tensor, &value, 0, sizeof(value)) ==
+           GGML_STATUS_FAILED);
+    ggml_tensor copy_src = *tensor;
+    ggml_tensor copy_dst = *tensor;
+    assert(ggml_backend_tensor_copy(&copy_src, &copy_dst) == GGML_STATUS_DEVICE_LOST);
+    ggml_tensor invalid_view = *tensor;
+    invalid_view.buffer = nullptr;
+    invalid_view.data = nullptr;
+    invalid_view.view_src = nullptr;
+    assert(ggml_backend_view_init(&invalid_view) == GGML_STATUS_FAILED);
+
+    ggml_backend_device device = {
+        {
+            throwing_device_name,
+            throwing_device_name,
+            throwing_device_memory,
+            throwing_device_type,
+            throwing_device_props,
+            throwing_device_init,
+            throwing_device_buft,
+            throwing_device_buft,
+            nullptr,
+            throwing_device_supports_op,
+            throwing_device_supports_buft,
+            nullptr,
+            throwing_event_new,
+            throwing_event_free,
+            throwing_event_synchronize,
+        },
+        nullptr,
+        nullptr,
+    };
+    size_t free = 1;
+    size_t total = 1;
+    ggml_backend_dev_props props = {};
+    assert(std::strcmp(ggml_backend_dev_name(&device), "unknown") == 0);
+    ggml_backend_dev_memory(&device, &free, &total);
+    assert(free == 0 && total == 0);
+    assert(ggml_backend_dev_type(&device) == GGML_BACKEND_DEVICE_TYPE_UNKNOWN);
+    ggml_backend_dev_get_props(&device, &props);
+    assert(props.name == nullptr && props.memory_total == 0);
+    assert(ggml_backend_dev_init(&device, nullptr) == nullptr);
+    assert(ggml_backend_dev_buffer_type(&device) == nullptr);
+    assert(!ggml_backend_dev_supports_op(&device, tensor));
+    assert(!ggml_backend_dev_supports_buft(&device, &buft));
+    assert(ggml_backend_event_new(&device) == nullptr);
+
+    fake_event_state event_state;
+    ggml_backend_event event = {&device, &event_state};
+    assert(ggml_backend_event_synchronize(&event) == GGML_STATUS_DEVICE_LOST);
+    assert(ggml_backend_event_free_status(&event) == GGML_STATUS_EXECUTION_FAILED);
+
+    ggml_backend backend = {
+        {},
+        {
+            throwing_backend_name,
+            throwing_backend_free,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            throwing_backend_synchronize,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            throwing_backend_compute,
+            nullptr,
+            nullptr,
+            nullptr,
+        },
+        &device,
+        nullptr,
+    };
+    assert(std::strcmp(ggml_backend_name(&backend), "unknown") == 0);
+    assert(ggml_backend_synchronize(&backend) == GGML_STATUS_EXECUTION_FAILED);
+    ggml_cgraph graph = {};
+    assert(ggml_backend_graph_compute_async(&backend, &graph) == GGML_STATUS_DEVICE_LOST);
+
+    ggml_backend_reg callback_reg = {
+        GGML_BACKEND_API_VERSION,
+        {nullptr, nullptr, nullptr, callback_throwing_reg_proc},
+        nullptr,
+    };
+    device.reg = &callback_reg;
+    assert(ggml_backend_set_n_threads_if_supported(&backend, 4) == GGML_STATUS_DEVICE_LOST);
+    assert(ggml_backend_dev_pci_vendor_id(&device) == 0);
+    device.reg = nullptr;
+
+    ggml_backend_reg reg = {
+        GGML_BACKEND_API_VERSION,
+        {throwing_reg_name, throwing_reg_count, throwing_reg_get, throwing_reg_proc},
+        nullptr,
+    };
+    assert(std::strcmp(ggml_backend_reg_name(&reg), "unknown") == 0);
+    assert(ggml_backend_reg_dev_count(&reg) == 0);
+    assert(ggml_backend_reg_dev_get(&reg, 0) == nullptr);
+    assert(ggml_backend_reg_get_proc_address(&reg, "injected") == nullptr);
+
+    ggml_backend_memory_api_v1 memory_api = {
+        sizeof(ggml_backend_memory_api_v1),
+        GGML_BACKEND_MEMORY_ABI_V1,
+        0,
+        throwing_memory_domains,
+        throwing_memory_quote,
+        throwing_memory_reserve,
+        throwing_memory_stats,
+        nullptr,
+        nullptr,
+    };
+    uint32_t count = 0;
+    ggml_backend_memory_quote_v1 quote = {};
+    quote.struct_size = sizeof(quote);
+    assert(ggml_backend_memory_api_get_domains_v1(
+               &memory_api, &device, nullptr, &count) == GGML_STATUS_DEVICE_LOST);
+    assert(ggml_backend_memory_api_quote_v1(
+               &memory_api, nullptr, 0, &quote, nullptr, &count) == GGML_STATUS_ALLOC_FAILED);
+    assert(ggml_backend_memory_api_reserve_private_v1(
+               &memory_api, nullptr, 0, &quote, nullptr, &count) == GGML_STATUS_EXECUTION_FAILED);
+    assert(ggml_backend_memory_api_get_stats_v1(
+               &memory_api, &device, &backend, nullptr, &count) == GGML_STATUS_BACKEND_POISONED);
+    assert(ggml_backend_free_status(&backend) == GGML_STATUS_EXECUTION_FAILED);
+
+    tensor->buffer = nullptr;
+    tensor->data = nullptr;
 }
 
 int main() {
@@ -392,6 +800,20 @@ int main() {
     };
     ggml_context * ctx = ggml_init(params);
     assert(ctx != nullptr);
+    ggml_init_params overflowing_params = {
+        /* .mem_size   = */ SIZE_MAX,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    assert(ggml_try_init(overflowing_params) == nullptr);
+    ggml_hash_set impossible_hash = {};
+    assert(!ggml_hash_set_try_new(SIZE_MAX, &impossible_hash));
+    assert(impossible_hash.keys == nullptr && impossible_hash.used == nullptr);
+    ggml_tensor * boundary_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    // This executable proves the shared adapter, not any native provider SDK.
+    // CUDA/HIP/Vulkan compilation and real fault injection remain separate
+    // target-qualified gates.
+    verify_common_noexcept_adapter(boundary_tensor);
     ggml_tensor * value = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_tensor * increment = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     for (int i = 0; i < 65; ++i) {
@@ -768,6 +1190,144 @@ int main() {
     ggml_backend gpu_backend = make_fake_scheduler_backend(&gpu_state, &gpu_device);
     ggml_backend cpu_backend = make_fake_scheduler_backend(&cpu_state, &cpu_device);
 
+    // Host-capacity and malformed-provider metadata are ordinary typed
+    // failures at the common allocator seam; none may terminate the process.
+    ggml_tensor * oversized_tensor =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+    ggml_backend_buffer_t tiny_buffer = fake_buffer_alloc(&cpu_buft, 16);
+    ggml_tallocr tiny_allocator = ggml_tallocr_new(tiny_buffer);
+    assert(ggml_tallocr_alloc(&tiny_allocator, oversized_tensor) ==
+           GGML_STATUS_ALLOC_FAILED);
+    assert(oversized_tensor->buffer == nullptr &&
+           oversized_tensor->data == nullptr);
+
+    ggml_backend_buffer null_base_buffer = *tiny_buffer;
+    null_base_buffer.iface.get_base = null_buffer_base;
+    ggml_tallocr null_base_allocator = ggml_tallocr_new(&null_base_buffer);
+    assert(ggml_tallocr_alloc(&null_base_allocator, oversized_tensor) ==
+           GGML_STATUS_FAILED);
+    assert(ggml_backend_buffer_free_status(tiny_buffer) ==
+           GGML_STATUS_SUCCESS);
+
+    // A provider failure before physical release is observable even though the
+    // opaque outer handle is consumed.  The caller must keep its physical
+    // accounting quarantined; the test retains the allocation only to clean up
+    // the injected failure without leaking the test process.
+    ggml_backend_buffer_t pre_release_failure_buffer =
+        fake_buffer_alloc(&cpu_buft, 16);
+    void * pre_release_failure_data = pre_release_failure_buffer->context;
+    cpu_state.throw_buffer_free_before_release = true;
+    assert(ggml_backend_buffer_free_status(pre_release_failure_buffer) ==
+           GGML_STATUS_EXECUTION_FAILED);
+    cpu_state.throw_buffer_free_before_release = false;
+    ggml_aligned_free(pre_release_failure_data, 16);
+
+    ggml_backend_buffer_type invalid_alignment_buft = cpu_buft;
+    invalid_alignment_buft.iface.get_alignment = invalid_buffer_alignment;
+    assert(ggml_gallocr_new(&invalid_alignment_buft) == nullptr);
+    assert(ggml_gallocr_new_n(nullptr, 0) == nullptr);
+
+    ggml_backend_t only_cpu_backend[] = {&cpu_backend};
+    ggml_backend_buffer_type_t only_cpu_buft[] = {&cpu_buft};
+    assert(ggml_backend_sched_new(
+               only_cpu_backend, only_cpu_buft, 1, SIZE_MAX, false,
+               false) == nullptr);
+
+    ggml_context * init_failure_ctx = ggml_init(params);
+    ggml_tensor * init_failure_tensor =
+        ggml_new_tensor_1d(init_failure_ctx, GGML_TYPE_F32, 8);
+    const int frees_before_init_failure = cpu_state.buffer_free_calls;
+    cpu_state.throw_init_tensor = true;
+    assert(ggml_backend_alloc_ctx_tensors(
+               init_failure_ctx, &cpu_backend) == nullptr);
+    assert(init_failure_tensor->buffer == nullptr &&
+           init_failure_tensor->data == nullptr);
+    assert(cpu_state.buffer_free_calls > frees_before_init_failure);
+    cpu_state.throw_init_tensor = false;
+    ggml_backend_buffer_t init_retry_buffer =
+        ggml_backend_alloc_ctx_tensors(init_failure_ctx, &cpu_backend);
+    assert(init_retry_buffer != nullptr);
+    assert(ggml_backend_buffer_free_status(init_retry_buffer) ==
+           GGML_STATUS_SUCCESS);
+    ggml_free(init_failure_ctx);
+
+    // Direct reserve is replacement-first: a failed larger allocation leaves
+    // the previous graph binding alive. The typed measure commit separately
+    // exposes a retired-buffer release failure instead of reporting success.
+    ggml_context * reserve_ctx = ggml_init(params);
+    ggml_tensor * reserve_small_input =
+        ggml_new_tensor_1d(reserve_ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * reserve_small_node =
+        ggml_sqr(reserve_ctx, reserve_small_input);
+    ggml_cgraph * reserve_small_graph =
+        ggml_new_graph_custom(reserve_ctx, 16, false);
+    ggml_build_forward_expand(reserve_small_graph, reserve_small_node);
+    ggml_tensor * reserve_large_input =
+        ggml_new_tensor_1d(reserve_ctx, GGML_TYPE_F32, 1024);
+    ggml_tensor * reserve_large_node =
+        ggml_sqr(reserve_ctx, reserve_large_input);
+    ggml_cgraph * reserve_large_graph =
+        ggml_new_graph_custom(reserve_ctx, 16, false);
+    ggml_build_forward_expand(reserve_large_graph, reserve_large_node);
+
+    ggml_gallocr_t reserve_allocator = ggml_gallocr_new(&cpu_buft);
+    assert(reserve_allocator != nullptr);
+    assert(ggml_gallocr_measure_n_v1(
+        reserve_allocator, reserve_small_graph, nullptr, nullptr));
+    uint32_t allocator_commit_flags = 0;
+    assert(ggml_gallocr_measure_commit_v2(
+               reserve_allocator, &allocator_commit_flags) ==
+           GGML_STATUS_SUCCESS);
+    assert((allocator_commit_flags &
+            GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED) != 0);
+    assert((allocator_commit_flags &
+            GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN) == 0);
+    assert(ggml_gallocr_alloc_graph_v2(
+               reserve_allocator, reserve_small_graph) ==
+           GGML_STATUS_SUCCESS);
+    cpu_state.throw_buffer_reset = true;
+    ggml_backend_buffer_t reset_failure_buffer = reserve_small_node->buffer;
+    assert(ggml_backend_buffer_reset_status(reset_failure_buffer) ==
+           GGML_STATUS_EXECUTION_FAILED);
+    // The legacy void wrapper remains source-compatible but cannot leak the
+    // provider exception across the public C boundary.
+    ggml_backend_buffer_reset(reset_failure_buffer);
+    assert(ggml_gallocr_alloc_graph_v2(
+               reserve_allocator, reserve_small_graph) ==
+           GGML_STATUS_EXECUTION_FAILED);
+    assert(reserve_small_node->buffer == nullptr &&
+           reserve_small_node->data == nullptr);
+    cpu_state.throw_buffer_reset = false;
+    assert(ggml_gallocr_alloc_graph_v2(
+               reserve_allocator, reserve_small_graph) ==
+           GGML_STATUS_SUCCESS);
+    ggml_backend_buffer_t prior_small_binding = reserve_small_node->buffer;
+    void * prior_small_data = reserve_small_node->data;
+    cpu_state.fail_buffer_alloc = true;
+    assert(!ggml_gallocr_reserve(
+        reserve_allocator, reserve_large_graph));
+    assert(reserve_small_node->buffer == prior_small_binding &&
+           reserve_small_node->data == prior_small_data);
+    cpu_state.fail_buffer_alloc = false;
+
+    ggml_gallocr_detach_graph_tensors_v1(
+        reserve_allocator, reserve_small_graph);
+    assert(ggml_gallocr_measure_n_v1(
+        reserve_allocator, reserve_large_graph, nullptr, nullptr));
+    cpu_state.throw_buffer_free = true;
+    allocator_commit_flags = 0;
+    assert(ggml_gallocr_measure_commit_v2(
+               reserve_allocator, &allocator_commit_flags) ==
+           GGML_STATUS_EXECUTION_FAILED);
+    assert((allocator_commit_flags &
+            GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED) != 0);
+    assert((allocator_commit_flags &
+            GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN) != 0);
+    cpu_state.throw_buffer_free = false;
+    assert(ggml_gallocr_free_status(reserve_allocator) ==
+           GGML_STATUS_SUCCESS);
+    ggml_free(reserve_ctx);
+
     uint8_t src_bytes[4] = {1, 2, 3, 4};
     uint8_t dst_bytes[4] = {0xa5, 0xa5, 0xa5, 0xa5};
     ggml_tensor * src_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 4);
@@ -909,16 +1469,86 @@ int main() {
     ggml_cgraph * memory_plan_graph = ggml_new_graph_custom(memory_plan_gpu_ctx, 16, false);
     ggml_build_forward_expand(memory_plan_graph, memory_plan_gpu_node);
     ggml_backend_sched_memory_plan_t memory_plan = nullptr;
+
+    // A provider failure during graph optimization may occur after the split
+    // has rewritten cross-backend sources. Creation must roll back those
+    // rewrites and leave the scheduler reusable instead of publishing a
+    // half-created plan.
+    gpu_state.throw_graph_optimize = true;
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               memory_plan_scheduler, memory_plan_graph, &memory_plan) == GGML_STATUS_DEVICE_LOST);
+    assert(memory_plan == nullptr);
+    assert(memory_plan_gpu_node->src[0] == memory_plan_cpu_node);
+    gpu_state.throw_graph_optimize = false;
+
+    const int gpu_frees_before_recovery = gpu_state.buffer_free_calls;
+    const int cpu_frees_before_recovery = cpu_state.buffer_free_calls;
     assert(ggml_backend_sched_memory_plan_create_v1(
                memory_plan_scheduler, memory_plan_graph, &memory_plan) == GGML_STATUS_SUCCESS);
     assert(memory_plan != nullptr);
     assert(memory_plan_gpu_node->src[0] != memory_plan_cpu_node);
+    gpu_state.throw_init_tensor = true;
+    cpu_state.throw_init_tensor = true;
+    uint32_t failed_commit_flags = 0;
+    assert(ggml_backend_sched_memory_plan_commit_v2(
+               memory_plan, &failed_commit_flags) == GGML_STATUS_ALLOC_FAILED);
+    assert((failed_commit_flags & GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED) != 0);
+    assert((failed_commit_flags & GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN) != 0);
+    assert(gpu_state.buffer_free_calls > gpu_frees_before_recovery ||
+           cpu_state.buffer_free_calls > cpu_frees_before_recovery);
+    assert(memory_plan_gpu_node->src[0] == memory_plan_cpu_node);
+    ggml_backend_sched_memory_plan_free_v1(memory_plan);
+    memory_plan = nullptr;
+    gpu_state.throw_init_tensor = false;
+    cpu_state.throw_init_tensor = false;
+
+    // The proven recovery installs a fresh empty allocator, so the same
+    // scheduler can commit a later plan without rebuilding the backend.
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               memory_plan_scheduler, memory_plan_graph, &memory_plan) == GGML_STATUS_SUCCESS);
+    assert(memory_plan != nullptr);
     // The v1 entrypoint remains ABI-compatible and delegates to the v2 commit
     // contract used by OpenASR's typed admission layer.
     assert(ggml_backend_sched_memory_plan_commit_v1(memory_plan) == GGML_STATUS_SUCCESS);
     ggml_backend_sched_memory_plan_free_v1(memory_plan);
+    memory_plan = nullptr;
+
+    // A release callback exception is contained but cannot be treated as proof.
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               memory_plan_scheduler, memory_plan_graph, &memory_plan) == GGML_STATUS_SUCCESS);
+    gpu_state.throw_init_tensor = true;
+    cpu_state.throw_init_tensor = true;
+    gpu_state.throw_buffer_free = true;
+    cpu_state.throw_buffer_free = true;
+    uint32_t unproven_commit_flags = 0;
+    assert(ggml_backend_sched_memory_plan_commit_v2(
+               memory_plan, &unproven_commit_flags) == GGML_STATUS_ALLOC_FAILED);
+    assert((unproven_commit_flags & GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED) != 0);
+    assert((unproven_commit_flags & GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN) == 0);
+    ggml_backend_sched_memory_plan_free_v1(memory_plan);
+    gpu_state.throw_init_tensor = false;
+    cpu_state.throw_init_tensor = false;
+    gpu_state.throw_buffer_free = false;
+    cpu_state.throw_buffer_free = false;
     memory_plan_gpu_node->src[0] = memory_plan_cpu_node;
     ggml_backend_sched_free(memory_plan_scheduler);
+
+    ggml_backend_sched_t release_status_scheduler = ggml_backend_sched_new(
+        scheduler_backends, scheduler_bufts, 2, 16, false, false);
+    assert(release_status_scheduler != nullptr);
+    assert(ggml_backend_sched_memory_plan_create_v1(
+               release_status_scheduler, memory_plan_graph, &memory_plan) ==
+           GGML_STATUS_SUCCESS);
+    assert(ggml_backend_sched_memory_plan_commit_v1(memory_plan) ==
+           GGML_STATUS_SUCCESS);
+    ggml_backend_sched_memory_plan_free_v1(memory_plan);
+    memory_plan = nullptr;
+    gpu_state.throw_buffer_free = true;
+    cpu_state.throw_buffer_free = true;
+    assert(ggml_backend_sched_free_status(release_status_scheduler) ==
+           GGML_STATUS_EXECUTION_FAILED);
+    gpu_state.throw_buffer_free = false;
+    cpu_state.throw_buffer_free = false;
     ggml_backend_buffer_free(memory_plan_gpu_buffer);
     ggml_backend_buffer_free(memory_plan_cpu_buffer);
     ggml_free(memory_plan_gpu_ctx);
@@ -991,6 +1621,19 @@ int main() {
     assert(gpu_state.copy_calls == 1);
     assert(gpu_state.graph_sizes.empty());
     assert(scheduler_probe.polls > 0);
+    assert(!cpu_state.pending);
+    assert(!gpu_state.pending);
+
+    // A provider-terminal async copy is not an "unsupported" result. It must
+    // fail the exact scheduler lane instead of silently retrying through the
+    // synchronous host fallback.
+    reset(cpu_state);
+    reset(gpu_state);
+    gpu_state.transfer_submit_status = GGML_STATUS_DEVICE_LOST;
+    assert(ggml_backend_sched_graph_compute(
+               scheduler, scheduler_graph) == GGML_STATUS_DEVICE_LOST);
+    assert(gpu_state.copy_calls == 1);
+    assert(gpu_state.graph_sizes.empty());
     assert(!cpu_state.pending);
     assert(!gpu_state.pending);
 

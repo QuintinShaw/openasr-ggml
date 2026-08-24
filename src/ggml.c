@@ -1624,7 +1624,7 @@ static inline bool ggml_can_repeat_rows(const struct ggml_tensor * t0, const str
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct ggml_context * ggml_init(struct ggml_init_params params) {
+static void ggml_init_once(void) {
     static bool is_first_call = true;
 
     ggml_critical_section_start();
@@ -1637,19 +1637,42 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     }
 
     ggml_critical_section_end();
+}
 
-    struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+struct ggml_context * ggml_try_init(struct ggml_init_params params) {
+    ggml_init_once();
+
+    struct ggml_context * ctx = malloc(sizeof(struct ggml_context));
+    if (ctx == NULL) {
+        return NULL;
+    }
 
     // allow to call ggml_init with 0 size
     if (params.mem_size == 0) {
         params.mem_size = GGML_MEM_ALIGN;
     }
 
-    const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+    if (!params.mem_buffer && params.mem_size > SIZE_MAX - (GGML_MEM_ALIGN - 1)) {
+        free(ctx);
+        return NULL;
+    }
+    const size_t mem_size = params.mem_buffer
+        ? params.mem_size
+        : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+    void * mem_buffer = params.mem_buffer
+        ? params.mem_buffer
+        : ggml_aligned_malloc(mem_size);
+    if (mem_buffer == NULL || ((uintptr_t) mem_buffer) % GGML_MEM_ALIGN != 0) {
+        if (!params.mem_buffer) {
+            ggml_aligned_free(mem_buffer, mem_size);
+        }
+        free(ctx);
+        return NULL;
+    }
 
     *ctx = (struct ggml_context) {
         /*.mem_size           =*/ mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+        /*.mem_buffer         =*/ mem_buffer,
         /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
         /*.no_alloc           =*/ params.no_alloc,
         /*.n_objects          =*/ 0,
@@ -1657,12 +1680,16 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         /*.objects_end        =*/ NULL,
     };
 
-    GGML_ASSERT(ctx->mem_buffer != NULL);
-
-    GGML_ASSERT_ALIGNED(ctx->mem_buffer);
-
     GGML_PRINT_DEBUG("%s: context initialized\n", __func__);
 
+    return ctx;
+}
+
+struct ggml_context * ggml_init(struct ggml_init_params params) {
+    struct ggml_context * ctx = ggml_try_init(params);
+    if (ctx == NULL) {
+        GGML_ABORT("%s: failed to initialize context", __func__);
+    }
     return ctx;
 }
 
@@ -6665,16 +6692,41 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct ggml_hash_set ggml_hash_set_new(size_t size) {
+bool ggml_hash_set_try_new(size_t size, struct ggml_hash_set * out_hash_set) {
+    if (out_hash_set == NULL) {
+        return false;
+    }
+    *out_hash_set = (struct ggml_hash_set) { 0, NULL, NULL };
+
     size = ggml_hash_size(size);
+    const size_t bitset_count = ggml_bitset_size(size);
+    if (size == 0 || size > SIZE_MAX / sizeof(struct ggml_tensor *) ||
+            bitset_count > SIZE_MAX / sizeof(ggml_bitset_t)) {
+        return false;
+    }
+
+    struct ggml_tensor ** keys = malloc(sizeof(struct ggml_tensor *) * size);
+    ggml_bitset_t * used = calloc(bitset_count, sizeof(ggml_bitset_t));
+    if (keys == NULL || used == NULL) {
+        free(keys);
+        free(used);
+        return false;
+    }
+
+    *out_hash_set = (struct ggml_hash_set) { size, used, keys };
+    return true;
+}
+
+struct ggml_hash_set ggml_hash_set_new(size_t size) {
     struct ggml_hash_set result;
-    result.size = size;
-    result.keys = GGML_MALLOC(sizeof(struct ggml_tensor *) * size);
-    result.used = GGML_CALLOC(ggml_bitset_size(size), sizeof(ggml_bitset_t));
+    if (!ggml_hash_set_try_new(size, &result)) {
+        GGML_ABORT("%s: failed to allocate hash set", __func__);
+    }
     return result;
 }
 
 void ggml_hash_set_reset(struct ggml_hash_set * hash_set) {
+    GGML_ASSERT(hash_set != NULL && hash_set->used != NULL);
     memset(hash_set->used, 0, sizeof(ggml_bitset_t) * ggml_bitset_size(hash_set->size));
 }
 
@@ -7517,8 +7569,80 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     return nbytes;
 }
 
+static bool ggml_size_add_aligned(
+        size_t * total, size_t amount, size_t alignment) {
+    if (total == NULL || alignment == 0 ||
+            (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    const size_t padding =
+        (alignment - (*total % alignment)) % alignment;
+    if (*total > SIZE_MAX - padding) {
+        return false;
+    }
+    *total += padding;
+    if (*total > SIZE_MAX - amount) {
+        return false;
+    }
+    *total += amount;
+    return true;
+}
+
+bool ggml_graph_overhead_custom_try(
+        size_t size, bool grads, size_t * out_size) {
+    if (out_size == NULL || size > SIZE_MAX / 2) {
+        return false;
+    }
+    const size_t hash_size = ggml_hash_size(size * 2);
+    const size_t bitset_count = ggml_bitset_size(hash_size);
+    if (size > SIZE_MAX / sizeof(struct ggml_tensor *) ||
+            hash_size > SIZE_MAX / sizeof(struct ggml_tensor *) ||
+            hash_size > SIZE_MAX / sizeof(int32_t) ||
+            bitset_count > SIZE_MAX / sizeof(ggml_bitset_t)) {
+        return false;
+    }
+
+    size_t total = 0;
+    if (!ggml_size_add_aligned(&total, sizeof(struct ggml_cgraph), 1) ||
+            !ggml_size_add_aligned(
+                &total, size * sizeof(struct ggml_tensor *),
+                sizeof(struct ggml_tensor *)) ||
+            !ggml_size_add_aligned(
+                &total, size * sizeof(struct ggml_tensor *),
+                sizeof(struct ggml_tensor *)) ||
+            !ggml_size_add_aligned(
+                &total, hash_size * sizeof(int32_t), sizeof(int32_t)) ||
+            !ggml_size_add_aligned(
+                &total, hash_size * sizeof(struct ggml_tensor *),
+                sizeof(struct ggml_tensor *))) {
+        return false;
+    }
+    if (grads &&
+            (!ggml_size_add_aligned(
+                &total, hash_size * sizeof(struct ggml_tensor *),
+                sizeof(struct ggml_tensor *)) ||
+             !ggml_size_add_aligned(
+                &total, hash_size * sizeof(struct ggml_tensor *),
+                sizeof(struct ggml_tensor *)))) {
+        return false;
+    }
+    if (!ggml_size_add_aligned(
+            &total, bitset_count * sizeof(ggml_bitset_t),
+            sizeof(ggml_bitset_t)) ||
+            !ggml_size_add_aligned(&total, 0, GGML_MEM_ALIGN) ||
+            total > SIZE_MAX - GGML_OBJECT_SIZE) {
+        return false;
+    }
+    *out_size = GGML_OBJECT_SIZE + total;
+    return true;
+}
+
 size_t ggml_graph_overhead_custom(size_t size, bool grads) {
-    return GGML_OBJECT_SIZE + GGML_PAD(ggml_graph_nbytes(size, grads), GGML_MEM_ALIGN);
+    size_t result = 0;
+    if (!ggml_graph_overhead_custom_try(size, grads, &result)) {
+        GGML_ABORT("%s: graph size overflow", __func__);
+    }
+    return result;
 }
 
 size_t ggml_graph_overhead(void) {
@@ -7650,7 +7774,9 @@ struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
         return tensor;
     }
     if (tensor->buffer) {
-        ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
+        if (ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor)) != GGML_STATUS_SUCCESS) {
+            return NULL;
+        }
     } else {
         GGML_ASSERT(tensor->data);
         memset(tensor->data, 0, ggml_nbytes(tensor));
@@ -7682,7 +7808,9 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
 
                 const float onef = 1.0f;
                 if (grad_acc->buffer) {
-                    ggml_backend_tensor_set(grad_acc, &onef, 0, sizeof(float));
+                    if (ggml_backend_tensor_set(grad_acc, &onef, 0, sizeof(float)) != GGML_STATUS_SUCCESS) {
+                        return;
+                    }
                 } else {
                     GGML_ASSERT(grad_acc->data);
                     *((float *) grad_acc->data) = onef;

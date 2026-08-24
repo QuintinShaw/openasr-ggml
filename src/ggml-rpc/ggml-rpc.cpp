@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -97,9 +98,9 @@ static constexpr bool rpc_protocol_version_compatible(uint8_t major, uint8_t min
            patch == RPC_PROTO_PATCH_VERSION;
 }
 
-static_assert(rpc_protocol_version_compatible(4, 0, 5));
-static_assert(!rpc_protocol_version_compatible(4, 0, 4));
-static_assert(!rpc_protocol_version_compatible(4, 1, 5));
+static_assert(rpc_protocol_version_compatible(4, 0, 7));
+static_assert(!rpc_protocol_version_compatible(4, 0, 6));
+static_assert(!rpc_protocol_version_compatible(4, 1, 7));
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
@@ -892,8 +893,11 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
         /*.no_alloc   =*/ true,
     };
 
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
-    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context_ptr ctx_ptr { ggml_try_init(params) };
+    if (ctx_ptr == nullptr) {
+        GGML_LOG_ERROR("Failed to allocate tensor initialization context.\n");
+        return false;
+    }
     ggml_context * ctx = ctx_ptr.get();
 
     ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
@@ -1000,8 +1004,7 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
-    ggml_backend_buffer_clear(buffer, request.value);
-    return true;
+    return ggml_backend_buffer_clear(buffer, request.value) == GGML_STATUS_SUCCESS;
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
@@ -1109,8 +1112,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
-    return true;
+    return ggml_backend_tensor_set(tensor, data, offset, size) == GGML_STATUS_SUCCESS;
 }
 
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
@@ -1170,7 +1172,10 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    if (ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size) !=
+            GGML_STATUS_SUCCESS) {
+        return false;
+    }
     response.result = 1;
     return true;
 }
@@ -1192,12 +1197,16 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     LOG_DBG("[%s] buffer: %p, data: %p\n", __func__, (void*)tensor->buffer, tensor->data);
     // Call the backend's buffer_init_tensor function
     ggml_backend_buffer_t buffer = tensor->buffer;
-    if (buffer && buffer->iface.init_tensor) {
-        buffer->iface.init_tensor(buffer, tensor);
-    } else {
-        if (!buffer) {
-            GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
-        }
+    if (buffer == nullptr) {
+        GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
+        return false;
+    }
+    const enum ggml_status init_status =
+        ggml_backend_buffer_init_tensor(buffer, tensor);
+    if (init_status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("Backend tensor initialization failed with status %d\n",
+            init_status);
+        return false;
     }
 
     if (tensor->extra != nullptr) {
@@ -1241,8 +1250,8 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
-    ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
-    return true;
+    return ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size) ==
+        GGML_STATUS_SUCCESS;
 }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
@@ -1716,8 +1725,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
-    if (n_devices == 0 || devices == nullptr) {
+    if (endpoint == nullptr || n_devices == 0 || devices == nullptr ||
+            n_threads == 0 ||
+            n_threads > static_cast<size_t>(std::numeric_limits<int>::max())) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
+        return;
+    }
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
         return;
     }
     std::vector<ggml_backend_t> backends;
@@ -1736,23 +1752,23 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
                total / 1024 / 1024, free / 1024 / 1024);
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
-            fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+            fprintf(stderr, "Failed to create backend for device %s\n", ggml_backend_dev_name(dev));
+            for (ggml_backend_t initialized : backends) {
+                ggml_backend_free(initialized);
+            }
             return;
         }
         backends.push_back(backend);
-        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg) {
-            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-            if (ggml_backend_set_n_threads_fn) {
-                ggml_backend_set_n_threads_fn(backend, n_threads);
+        const enum ggml_status thread_status = ggml_backend_set_n_threads_if_supported(
+            backend, static_cast<int>(n_threads));
+        if (thread_status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to configure backend threads for device %s (status %d)\n",
+                    ggml_backend_dev_name(dev), thread_status);
+            for (ggml_backend_t initialized : backends) {
+                ggml_backend_free(initialized);
             }
+            return;
         }
-    }
-
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        return;
     }
 
 #ifdef GGML_RPC_RDMA

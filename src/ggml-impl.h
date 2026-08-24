@@ -203,7 +203,7 @@ static_assert(sizeof(ggml_bitset_t) == 4, "bitset_t constants must be updated");
 #define BITSET_MASK (sizeof(ggml_bitset_t)*8 - 1)
 
 static size_t ggml_bitset_size(size_t n) {
-    return (n + BITSET_MASK) >> BITSET_SHR;
+    return (n >> BITSET_SHR) + ((n & BITSET_MASK) != 0);
 }
 
 static inline bool ggml_bitset_get(const ggml_bitset_t * bitset, size_t i) {
@@ -230,7 +230,14 @@ struct ggml_hash_set {
 };
 
 struct ggml_hash_set ggml_hash_set_new(size_t size);
+bool                 ggml_hash_set_try_new(size_t size, struct ggml_hash_set * out_hash_set);
 void                 ggml_hash_set_free(struct ggml_hash_set * hash_set);
+
+// Fallible context construction for status-returning C seams. The legacy
+// ggml_init API retains its historical fatal-on-host-OOM contract; new runtime
+// paths must use this helper and propagate allocation failure instead.
+struct ggml_context * ggml_try_init(struct ggml_init_params params);
+bool ggml_graph_overhead_custom_try(size_t size, bool grads, size_t * out_size);
 
 // returns the minimum size for a hash set that can hold min_sz elements
 size_t ggml_hash_size(size_t min_sz);
@@ -247,7 +254,7 @@ static size_t ggml_hash_find(const struct ggml_hash_set * hash_set, const struct
 // returns GGML_HASHSET_ALREADY_EXISTS if key already exists, index otherwise, asserts if table is full
 static size_t ggml_hash_insert(struct ggml_hash_set * hash_set, struct ggml_tensor * key);
 
-// return index, asserts if table is full
+// return index, or GGML_HASHSET_FULL if table is full
 static size_t ggml_hash_find_or_insert(struct ggml_hash_set * hash_set, struct ggml_tensor * key);
 
 // hash function for ggml_tensor
@@ -315,7 +322,7 @@ static size_t ggml_hash_find_or_insert(struct ggml_hash_set * hash_set, struct g
     } while (i != h);
 
     // visited all hash table entries -> not found
-    GGML_ABORT("fatal error");
+    return GGML_HASHSET_FULL;
 }
 
 // computation graph

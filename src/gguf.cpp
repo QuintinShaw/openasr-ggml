@@ -1760,7 +1760,12 @@ struct gguf_writer_buf final : public gguf_writer_base {
 
         buf.resize(offset + nbytes);
         if (info.t.buffer) {
-            ggml_backend_tensor_get(&info.t, buf.data() + offset, 0, nbytes);
+            const enum ggml_status status =
+                ggml_backend_tensor_get(&info.t, buf.data() + offset, 0, nbytes);
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error(
+                    "backend tensor read failed with status " + std::to_string(status));
+            }
         } else {
             GGML_ASSERT(info.t.data);
             memcpy(buf.data() + offset, info.t.data, nbytes);
@@ -1804,7 +1809,12 @@ struct gguf_writer_file final : public gguf_writer_base {
 
         std::vector<int8_t> buf(nbytes);
         if (info.t.buffer) {
-            ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
+            const enum ggml_status status =
+                ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error(
+                    "backend tensor read failed with status " + std::to_string(status));
+            }
         } else {
             GGML_ASSERT(info.t.data);
             memcpy(buf.data(), info.t.data, nbytes);

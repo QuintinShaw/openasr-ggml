@@ -4,6 +4,53 @@
 
 #include "ggml-backend.h"
 
+#ifdef __cplusplus
+#include <new>
+
+// Typed native failure used only inside C++ backend implementations. Every
+// public C entry point invokes provider callbacks through the helpers below,
+// so this exception is translated back to ggml_status before it can cross the
+// C ABI. native_error remains provider-defined diagnostic data; policy uses
+// status and the existing memory-health contract.
+struct ggml_backend_exception {
+    enum ggml_status status;
+    int64_t native_error;
+};
+
+template <typename Callback>
+static inline enum ggml_status ggml_backend_noexcept_status(Callback && callback) noexcept {
+    try {
+        return callback();
+    } catch (const ggml_backend_exception & error) {
+        return error.status;
+    } catch (const std::bad_alloc &) {
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (...) {
+        return GGML_STATUS_EXECUTION_FAILED;
+    }
+}
+
+template <typename Result, typename Callback>
+static inline Result ggml_backend_noexcept_or(Callback && callback, Result fallback) noexcept {
+    try {
+        return callback();
+    } catch (...) {
+        return fallback;
+    }
+}
+
+template <typename Callback>
+static inline void ggml_backend_noexcept_void(Callback && callback) noexcept {
+    try {
+        callback();
+    } catch (...) {
+        // Destruction and legacy void callbacks have no result channel. Their
+        // public wrappers are process-safe; status-returning operations use
+        // ggml_backend_noexcept_status instead and never silently succeed.
+    }
+}
+#endif
+
 #ifndef OPENASR_BACKEND_ABI_V1
 #define OPENASR_BACKEND_ABI_V1 ""
 #endif
@@ -109,20 +156,19 @@ extern "C" {
     // Backend (stream)
     //
 
-    // Merge queue submission with the terminal completion/drain result.
-    // Completion normally wins because it describes work that reached a
-    // terminal device state. Cancellation is the exception: a later cancel
-    // observation must never hide a concrete submit or device failure.
+    // Merge queue submission with the terminal completion/drain result. Keep
+    // the strongest concrete failure: a poison repeat after device loss must
+    // not erase the causal DEVICE_LOST, and cancellation must never hide a
+    // capacity/validation/provider failure observed at the same boundary.
     static inline enum ggml_status ggml_backend_status_merge(
             enum ggml_status submitted, enum ggml_status completed) {
-        if (completed == GGML_STATUS_SUCCESS) {
-            return submitted;
-        }
-        if (completed == GGML_STATUS_ABORTED &&
-            submitted != GGML_STATUS_SUCCESS && submitted != GGML_STATUS_ABORTED) {
-            return submitted;
-        }
-        return completed;
+        if (submitted == GGML_STATUS_DEVICE_LOST || completed == GGML_STATUS_DEVICE_LOST) return GGML_STATUS_DEVICE_LOST;
+        if (submitted == GGML_STATUS_BACKEND_POISONED || completed == GGML_STATUS_BACKEND_POISONED) return GGML_STATUS_BACKEND_POISONED;
+        if (submitted == GGML_STATUS_EXECUTION_FAILED || completed == GGML_STATUS_EXECUTION_FAILED) return GGML_STATUS_EXECUTION_FAILED;
+        if (submitted == GGML_STATUS_ALLOC_FAILED || completed == GGML_STATUS_ALLOC_FAILED) return GGML_STATUS_ALLOC_FAILED;
+        if (submitted == GGML_STATUS_FAILED || completed == GGML_STATUS_FAILED) return GGML_STATUS_FAILED;
+        if (submitted == GGML_STATUS_ABORTED || completed == GGML_STATUS_ABORTED) return GGML_STATUS_ABORTED;
+        return GGML_STATUS_SUCCESS;
     }
 
     // Compute-scoped cancellation state shared by native backend adapters.

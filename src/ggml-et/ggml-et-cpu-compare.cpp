@@ -81,22 +81,30 @@ bool ggml_et_cpu_compare_init_pre(ggml_et_cpu_compare_ctx * ctx, const ggml_tens
     if (ctx->src0_size > 0) {
         // Copy logical tensor size - ggml_backend_tensor_get handles stride layout internally
         size_t logical_size = ggml_nbytes(node->src[0]);
-        ggml_backend_tensor_get(node->src[0], ctx->cpu_src0_data, 0, logical_size);
+        if (ggml_backend_tensor_get(node->src[0], ctx->cpu_src0_data, 0, logical_size) != GGML_STATUS_SUCCESS) {
+            goto cleanup;
+        }
     }
     if (ctx->src1_size > 0) {
         size_t logical_size = ggml_nbytes(node->src[1]);
-        ggml_backend_tensor_get(node->src[1], ctx->cpu_src1_data, 0, logical_size);
+        if (ggml_backend_tensor_get(node->src[1], ctx->cpu_src1_data, 0, logical_size) != GGML_STATUS_SUCCESS) {
+            goto cleanup;
+        }
     }
     if (ctx->src2_size > 0) {
         size_t logical_size = ggml_nbytes(node->src[2]);
-        ggml_backend_tensor_get(node->src[2], ctx->cpu_src2_data, 0, logical_size);
+        if (ggml_backend_tensor_get(node->src[2], ctx->cpu_src2_data, 0, logical_size) != GGML_STATUS_SUCCESS) {
+            goto cleanup;
+        }
     }
 
     // Copy destination data from device (for operations like SET_ROWS that modify existing data)
     // Most ops create new tensors so this is unused, but SET_ROWS requires existing dst data
     {
         size_t logical_size = ggml_nbytes(node);
-        ggml_backend_tensor_get(node, ctx->cpu_dst_data, 0, logical_size);
+        if (ggml_backend_tensor_get(node, ctx->cpu_dst_data, 0, logical_size) != GGML_STATUS_SUCCESS) {
+            goto cleanup;
+        }
     }
 
     // Create CPU backend for reference computation
@@ -368,7 +376,9 @@ bool ggml_et_cpu_compare_compute_and_check(ggml_et_cpu_compare_ctx *          ct
 
     // Now copy ET device destination to host for comparison
     size_t dst_logical_size = ggml_nbytes(node);
-    ggml_backend_tensor_get(node, ctx->et_dst_data, 0, dst_logical_size);
+    if (ggml_backend_tensor_get(node, ctx->et_dst_data, 0, dst_logical_size) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
 
     if (config->log_differences) {
         size_t num_elements = ggml_nelements(node);
@@ -445,7 +455,11 @@ bool ggml_et_cpu_compare_compute_and_check(ggml_et_cpu_compare_ctx *          ct
     if (config->use_cpu_result) {
         GGML_LOG_DEBUG("ET: Overwriting ET device result with CPU result for correct inference\n");
         size_t dst_logical_size = ggml_nbytes(node);
-        ggml_backend_tensor_set(const_cast<ggml_tensor *>(node), ctx->cpu_dst_data, 0, dst_logical_size);
+        if (ggml_backend_tensor_set(
+                const_cast<ggml_tensor *>(node), ctx->cpu_dst_data, 0,
+                dst_logical_size) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
         GGML_LOG_DEBUG("ET: CPU result copied to ET device buffer\n");
     }
 
