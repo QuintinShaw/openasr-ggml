@@ -15,6 +15,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def read_source(relative_path: str) -> str:
+    """Read repository sources using their declared, platform-independent encoding."""
+    return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
 def function_body(source: str, name: str, next_name: str) -> str:
     pattern = rf"static enum ggml_status {re.escape(name)}\(.*?(?=static enum ggml_status {re.escape(next_name)}\()"
     match = re.search(pattern, source, flags=re.DOTALL)
@@ -26,17 +31,17 @@ def function_body(source: str, name: str, next_name: str) -> str:
 class BackendMemoryStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header = (ROOT / "include/ggml-backend.h").read_text()
-        cls.alloc_header = (ROOT / "include/ggml-alloc.h").read_text()
-        cls.core = (ROOT / "src/ggml-backend.cpp").read_text()
-        cls.meta = (ROOT / "src/ggml-backend-meta.cpp").read_text()
-        cls.allocator = (ROOT / "src/ggml-alloc.c").read_text()
-        cls.impl = (ROOT / "src/ggml-impl.h").read_text()
-        cls.cpu = (ROOT / "src/ggml-cpu/ggml-cpu.cpp").read_text()
-        cls.blas = (ROOT / "src/ggml-blas/ggml-blas.cpp").read_text()
-        cls.metal = (ROOT / "src/ggml-metal/ggml-metal.cpp").read_text()
-        cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text()
-        cls.vulkan = (ROOT / "src/ggml-vulkan/ggml-vulkan.cpp").read_text()
+        cls.header = read_source("include/ggml-backend.h")
+        cls.alloc_header = read_source("include/ggml-alloc.h")
+        cls.core = read_source("src/ggml-backend.cpp")
+        cls.meta = read_source("src/ggml-backend-meta.cpp")
+        cls.allocator = read_source("src/ggml-alloc.c")
+        cls.impl = read_source("src/ggml-impl.h")
+        cls.cpu = read_source("src/ggml-cpu/ggml-cpu.cpp")
+        cls.blas = read_source("src/ggml-blas/ggml-blas.cpp")
+        cls.metal = read_source("src/ggml-metal/ggml-metal.cpp")
+        cls.cuda = read_source("src/ggml-cuda/ggml-cuda.cu")
+        cls.vulkan = read_source("src/ggml-vulkan/ggml-vulkan.cpp")
 
     def test_all_provider_tokens_use_complete_shared_fingerprint(self) -> None:
         helper = self.core[
@@ -168,9 +173,9 @@ class BackendMemoryStaticContract(unittest.TestCase):
         self.assertIn("catch (...) {", self.cuda)
         self.assertNotIn('GGML_ABORT(GGML_CUDA_NAME " error")', self.cuda)
 
-        common = (ROOT / "src/ggml-cuda/common.cuh").read_text()
-        hip = (ROOT / "src/ggml-cuda/vendors/hip.h").read_text()
-        musa = (ROOT / "src/ggml-cuda/vendors/musa.h").read_text()
+        common = read_source("src/ggml-cuda/common.cuh")
+        hip = read_source("src/ggml-cuda/vendors/hip.h")
+        musa = read_source("src/ggml-cuda/vendors/musa.h")
         self.assertIn("#define GGML_ABORT(...) ggml_cuda_abort", common)
         self.assertIn("#define cudaErrorMemoryAllocation hipErrorOutOfMemory", hip)
         self.assertIn("#define cudaErrorNoDevice hipErrorNoDevice", hip)
