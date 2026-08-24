@@ -1637,7 +1637,15 @@ void ggml_compute_forward_argmax_first(
     for (int64_t row = row_begin; row < row_end; ++row) {
         const float * values = (const float *) ((const char *) src0->data + row * src0->nb[1]);
         int32_t best = 0;
+        if (!std::isfinite(values[0])) {
+            ((int32_t *) dst->data)[row] = -1;
+            continue;
+        }
         for (int32_t col = 1; col < ncols; ++col) {
+            if (!std::isfinite(values[col])) {
+                best = -1;
+                break;
+            }
             if (values[col] > values[best]) {
                 best = col;
             }

@@ -1086,7 +1086,8 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
-    // argmax along rows, resolving exact ties to the lowest column index
+    // argmax along rows, resolving exact ties to the lowest column index;
+    // returns -1 for a row containing any NaN or infinity
     GGML_API struct ggml_tensor * ggml_argmax_first(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);

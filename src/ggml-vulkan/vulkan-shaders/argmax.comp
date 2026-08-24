@@ -16,6 +16,9 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 
 shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
 shared uint tmp[BLOCK_SIZE];
+#ifdef FIRST_MAX
+shared uint tmpinvalid[BLOCK_SIZE];
+#endif
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -27,13 +30,22 @@ void main() {
 
     A_TYPE amax = -FLT_MAX;
     uint acol = col;
+#ifdef FIRST_MAX
+    bool invalid = false;
+#endif
 
     if (col < p.KX) {
         amax = data_a[row*p.KX + col];
+#ifdef FIRST_MAX
+        invalid = isnan(amax) || isinf(amax);
+#endif
     }
 
     for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
         A_TYPE val = data_a[row*p.KX + i];
+#ifdef FIRST_MAX
+        invalid = invalid || isnan(val) || isinf(val);
+#endif
         if (val > amax) {
             amax = val;
             acol = i;
@@ -42,10 +54,16 @@ void main() {
 
     tmp[col] = acol;
     tmpmax[col] = amax;
+#ifdef FIRST_MAX
+    tmpinvalid[col] = invalid ? 1 : 0;
+#endif
 
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (col < s && col + s < p.KX) {
+#ifdef FIRST_MAX
+            tmpinvalid[col] |= tmpinvalid[col + s];
+#endif
             if (tmpmax[col] < tmpmax[col + s]
 #ifdef FIRST_MAX
                 || (tmpmax[col] == tmpmax[col + s] && tmp[col + s] < tmp[col])
@@ -59,6 +77,10 @@ void main() {
     }
 
     if (col == 0) {
+#ifdef FIRST_MAX
+        data_d[row] = tmpinvalid[0] != 0 ? D_TYPE(-1) : D_TYPE(tmp[0]);
+#else
         data_d[row] = D_TYPE(tmp[0]);
+#endif
     }
 }

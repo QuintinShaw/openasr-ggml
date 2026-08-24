@@ -2720,11 +2720,11 @@ struct test_argmax : public test_case {
 // GGML_OP_ARGMAX_FIRST
 struct test_argmax_first : public test_case {
     std::string vars() override {
-        return "ne=[8,4,1,1],ties=first";
+        return "ne=[8,6,1,1],ties=first,nonfinite=reject";
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 6);
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_argmax_first(ctx, a);
@@ -2747,11 +2747,13 @@ struct test_argmax_first : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        static const std::array<float, 32> input = {
+        static const std::array<float, 48> input = {
              1.0f,  5.0f,  5.0f,  2.0f,  0.0f,  5.0f, -1.0f,  4.0f,
              7.0f,  7.0f,  7.0f,  7.0f,  7.0f,  7.0f,  7.0f,  7.0f,
             -1.0f, -2.0f, -1.0f, -3.0f, -1.0f, -4.0f, -1.0f, -5.0f,
              0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f,
+             NAN,   1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f,
+             0.0f,  1.0f,  2.0f, INFINITY, 4.0f, 5.0f,  6.0f,  7.0f,
         };
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "a") == 0) {
@@ -2764,7 +2766,7 @@ struct test_argmax_first : public test_case {
         if (t->op != GGML_OP_ARGMAX_FIRST) {
             return true;
         }
-        static const std::array<float, 4> expected = {1.0f, 0.0f, 0.0f, 7.0f};
+        static const std::array<float, 6> expected = {1.0f, 0.0f, 0.0f, 7.0f, -1.0f, -1.0f};
         if (values.size() != expected.size() || !std::equal(values.begin(), values.end(), expected.begin())) {
             printf("ARGMAX_FIRST oracle mismatch [%s] ", backend_name);
             return false;
