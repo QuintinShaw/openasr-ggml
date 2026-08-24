@@ -27,6 +27,7 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
         self.assertIn("executable generation minted", self.header)
         self.assertIn("uint64_t executable_generation", self.header)
         self.assertIn("uint32_t last_executable_change", self.header)
+        self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1", self.header)
 
     def test_generation_is_context_monotonic_across_graph_eviction(self) -> None:
         self.assertIn("uint64_t last_cuda_graph_executable_generation = 0", self.common)
@@ -64,6 +65,7 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
         ]
         self.assertIn("find_cuda_graph", observer)
         self.assertNotIn("->cuda_graph(", observer)
+        self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1", observer)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1", observer)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC", self.cuda)
         # HIP compiles this same source through vendors/hip.h, so there must be

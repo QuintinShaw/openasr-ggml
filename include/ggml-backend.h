@@ -277,9 +277,11 @@ extern "C" {
     // Optional, versioned observation of backend-native captured graph
     // executables. This is diagnostic evidence only: it cannot enable graph
     // capture or alter backend policy. A caller observes one concrete backend
-    // and cgraph after successful compute; providers must return the actual
-    // executable generation minted where instantiate/update succeeds rather
-    // than infer it from the requested planner mode.
+    // and cgraph before and after compute; providers must return whether that
+    // exact graph key is already tracked, plus the actual executable generation minted
+    // where instantiate/update succeeds. Callers can therefore
+    // distinguish a pre-existing executable from a change caused by the
+    // measured compute instead of inferring either fact from planner policy.
     #define GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC "ggml_backend_graph_lifecycle_get_api_v1"
     #define GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1 1u
 
@@ -287,6 +289,7 @@ extern "C" {
         GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1  = 1u << 0,
         GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1    = 1u << 1,
         GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1 = 1u << 2,
+        GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1      = 1u << 3,
     };
 
     enum ggml_backend_graph_executable_change_v1 {

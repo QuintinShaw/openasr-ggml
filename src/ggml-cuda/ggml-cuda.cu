@@ -6110,6 +6110,7 @@ static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe(
     if (graph == nullptr) {
         return GGML_STATUS_SUCCESS;
     }
+    observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1;
     if (graph->is_enabled()) {
         observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1;
     }
