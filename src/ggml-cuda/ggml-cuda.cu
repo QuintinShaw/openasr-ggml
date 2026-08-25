@@ -2823,6 +2823,71 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+// hipBLASLt (via rocBLAS on ROCm 7) uses a legacy/blocking stream that cannot
+// join a capturing stream (HIP error 906). Quantized/vector ggml GEMM kernels
+// stay capturable; only graphs that would actually call hipBLAS must run
+// uncaptured. Blanket-skipping every MUL_MAT would also drop decoder mmq graphs.
+static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0 == nullptr || src1 == nullptr) {
+        return true;
+    }
+
+    const int device    = ggml_cuda_get_device();
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    if (dst->op == GGML_OP_MUL_MAT_ID) {
+        if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+            return true;
+        }
+        const int64_t ne2  = dst->ne[2];
+        const int64_t ne12 = src1->ne[2];
+        const int64_t ne02 = src0->ne[2];
+        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+            if (ggml_is_quantized(src0->type)) {
+                if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+                    return false;
+                }
+            } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                return false;
+            }
+        }
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            return false;
+        }
+        if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, (int) src1->ne[2], /*mul_mat_id=*/true)) {
+            return false;
+        }
+        return true;
+    }
+
+    const bool bad_padding_clear = src0->buffer != nullptr
+        && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0)
+        && src0->view_src != nullptr;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return true;
+    }
+    const int64_t ne11 = src1->ne[1];
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, (int) ne11, /*mul_mat_id=*/false)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts=*/0)) {
+        return false;
+    }
+    return true;
+}
+#endif
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -2836,6 +2901,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+#ifdef GGML_USE_HIP
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            ggml_cuda_mul_mat_uses_cublas(node)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling HIP graphs due to hipBLASLt-incompatible GEMM\n", __func__);
+#endif
+            break;
+        }
+#endif
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
