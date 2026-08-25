@@ -117,6 +117,12 @@ struct ggml_backend_reg_entry {
 
 typedef const char * (*openasr_ggml_backend_abi_v1_t)(void);
 typedef int (*openasr_ggml_backend_probe_v1_t)(const char * expected_target, char * driver_out, size_t driver_out_capacity);
+typedef int (*openasr_ggml_backend_target_identity_v1_t)(
+    size_t device_index,
+    char * target_out,
+    size_t target_out_capacity,
+    char * driver_out,
+    size_t driver_out_capacity);
 
 static bool openasr_backend_abi_matches(dl_handle * handle, const char * expected_abi, const fs::path & path, bool silent) {
     if (expected_abi == nullptr || expected_abi[0] == '\0') {
@@ -714,6 +720,73 @@ bool ggml_backend_probe_verified_v3_utf8(
     }
     if (driver_out != nullptr && driver_out_capacity > 0) {
         std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver.c_str());
+    }
+    return true;
+}
+
+bool ggml_backend_probe_identity_verified_v1_utf8(
+        const char * path_utf8,
+        const char * const * dependency_dirs_utf8,
+        size_t dependency_dir_count,
+        const char * expected_openasr_abi_v1,
+        const char * expected_provider_v1,
+        size_t device_index,
+        char * target_out,
+        size_t target_out_capacity,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (target_out != nullptr && target_out_capacity > 0) {
+        target_out[0] = '\0';
+    }
+    if (driver_out != nullptr && driver_out_capacity > 0) {
+        driver_out[0] = '\0';
+    }
+    if (path_utf8 == nullptr || expected_openasr_abi_v1 == nullptr || expected_openasr_abi_v1[0] == '\0' ||
+        expected_provider_v1 == nullptr || expected_provider_v1[0] == '\0' ||
+        target_out == nullptr || target_out_capacity == 0 ||
+        driver_out == nullptr || driver_out_capacity == 0) {
+        return false;
+    }
+    std::vector<fs::path> dependency_dirs;
+    if (!openasr_parse_dependency_dirs(dependency_dirs_utf8, dependency_dir_count, dependency_dirs)) {
+        return false;
+    }
+    const fs::path path = fs::u8path(path_utf8);
+    dl_handle_ptr handle { dl_load_library(path, dependency_dirs) };
+    if (!handle ||
+        !openasr_backend_abi_matches(handle.get(), expected_openasr_abi_v1, path, false) ||
+        !openasr_backend_provider_matches(handle.get(), expected_provider_v1, path, false)) {
+        return false;
+    }
+    auto identity_fn = (openasr_ggml_backend_target_identity_v1_t)
+        dl_get_sym(handle.get(), "openasr_ggml_backend_target_identity_v1");
+    char actual_target[128] = {};
+    char actual_driver[64] = {};
+    const bool discovered = identity_fn != nullptr &&
+        ggml_backend_noexcept_or<int>(
+            [&]() {
+                return identity_fn(
+                    device_index,
+                    actual_target,
+                    sizeof(actual_target),
+                    actual_driver,
+                    sizeof(actual_driver));
+            },
+            0) == 1 &&
+        actual_target[0] != '\0' &&
+        std::memchr(actual_target, '\0', sizeof(actual_target)) != nullptr &&
+        actual_driver[0] != '\0' &&
+        std::memchr(actual_driver, '\0', sizeof(actual_driver)) != nullptr;
+    if (!discovered) {
+        return false;
+    }
+    const int target_length = std::snprintf(target_out, target_out_capacity, "%s", actual_target);
+    const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver);
+    if (target_length <= 0 || static_cast<size_t>(target_length) >= target_out_capacity ||
+        driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
+        target_out[0] = '\0';
+        driver_out[0] = '\0';
+        return false;
     }
     return true;
 }

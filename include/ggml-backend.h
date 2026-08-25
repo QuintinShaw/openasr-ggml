@@ -662,6 +662,23 @@ extern "C" {
             const char * minimum_driver_version,
             char * driver_out,
             size_t driver_out_capacity);
+    // Discover one provider-defined live device target without registering the
+    // backend. The module is first restricted by the same exact path,
+    // dependency-directory, OpenASR ABI, and provider checks as verified-v3.
+    // `device_index` is the provider registry ordinal, so a later load can bind
+    // execution to the same device. This deliberately does not accept a caller-
+    // supplied target; the target and driver are observations from the module.
+    GGML_API bool ggml_backend_probe_identity_verified_v1_utf8(
+            const char * path_utf8,
+            const char * const * dependency_dirs_utf8,
+            size_t dependency_dir_count,
+            const char * expected_openasr_abi_v1,
+            const char * expected_provider_v1,
+            size_t device_index,
+            char * target_out,
+            size_t target_out_capacity,
+            char * driver_out,
+            size_t driver_out_capacity);
     // Load only the CPU and Vulkan modules from one host-owned absolute
     // directory. Unlike load_all, this never consults the executable's current
     // directory, GGML_BACKEND_PATH, or any downloaded plugin store.

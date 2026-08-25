@@ -21005,6 +21005,107 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
 #endif
 
 #ifdef GGML_BACKEND_DL
+static int openasr_ggml_backend_vulkan_target_identity(
+        size_t device_index,
+        char * target_out,
+        size_t target_out_capacity,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    if (target_out == nullptr || target_out_capacity == 0 ||
+        driver_out == nullptr || driver_out_capacity == 0) {
+        return 0;
+    }
+    target_out[0] = '\0';
+    driver_out[0] = '\0';
+
+    ggml_vk_instance_init();
+    const std::vector<vk::PhysicalDevice> physical_devices =
+        vk_instance.instance.enumeratePhysicalDevices();
+    if (device_index >= vk_instance.device_indices.size()) {
+        return 0;
+    }
+    const size_t physical_index = vk_instance.device_indices[device_index];
+    if (physical_index >= physical_devices.size()) {
+        return 0;
+    }
+    const vk::PhysicalDevice physical_device = physical_devices[physical_index];
+    vk::PhysicalDeviceProperties2 properties{};
+    physical_device.getProperties2(&properties);
+    const auto & pipeline_uuid = properties.properties.pipelineCacheUUID;
+    if (std::all_of(pipeline_uuid.begin(), pipeline_uuid.end(), [](uint8_t byte) { return byte == 0; })) {
+        return 0;
+    }
+
+    // `deviceUUID` is per physical card and would make a signed activation
+    // useless on another card of the same model. Vulkan's pipelineCacheUUID is
+    // an implementation compatibility token. Combined with vendor/device ids
+    // and the separately bound exact driver version, it defines the narrow
+    // reusable capability class used by release qualification.
+    const int target_prefix_length = std::snprintf(
+        target_out,
+        target_out_capacity,
+        "vk_caps_%08x_%08x_",
+        properties.properties.vendorID,
+        properties.properties.deviceID);
+    if (target_prefix_length != 26 || static_cast<size_t>(target_prefix_length) >= target_out_capacity) {
+        target_out[0] = '\0';
+        return 0;
+    }
+    for (uint32_t index = 0; index < VK_UUID_SIZE; ++index) {
+        const size_t offset = 26 + index * 2;
+        if (offset >= target_out_capacity) {
+            target_out[0] = '\0';
+            return 0;
+        }
+        const int written = std::snprintf(
+            target_out + offset,
+            target_out_capacity - offset,
+            "%02x",
+            static_cast<unsigned>(pipeline_uuid[index]));
+        if (written != 2) {
+            target_out[0] = '\0';
+            return 0;
+        }
+    }
+
+    const uint32_t raw_driver = properties.properties.driverVersion;
+    if (raw_driver == 0) {
+        target_out[0] = '\0';
+        return 0;
+    }
+    const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%u", raw_driver);
+    if (driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
+        target_out[0] = '\0';
+        driver_out[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" GGML_BACKEND_API int openasr_ggml_backend_target_identity_v1(
+        size_t device_index,
+        char * target_out,
+        size_t target_out_capacity,
+        char * driver_out,
+        size_t driver_out_capacity) {
+    try {
+        return openasr_ggml_backend_vulkan_target_identity(
+            device_index,
+            target_out,
+            target_out_capacity,
+            driver_out,
+            driver_out_capacity);
+    } catch (...) {
+        if (target_out != nullptr && target_out_capacity > 0) {
+            target_out[0] = '\0';
+        }
+        if (driver_out != nullptr && driver_out_capacity > 0) {
+            driver_out[0] = '\0';
+        }
+        return 0;
+    }
+}
+
 extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
         const char * expected_target,
         char * driver_out,
@@ -21019,53 +21120,21 @@ extern "C" GGML_BACKEND_API int openasr_ggml_backend_probe_v1(
         }
 
         ggml_vk_instance_init();
-        const std::vector<vk::PhysicalDevice> physical_devices =
-            vk_instance.instance.enumeratePhysicalDevices();
-        for (size_t physical_index : vk_instance.device_indices) {
-            if (physical_index >= physical_devices.size()) {
-                return 0;
-            }
-            const vk::PhysicalDevice physical_device = physical_devices[physical_index];
-            vk::PhysicalDeviceProperties2 properties{};
-            physical_device.getProperties2(&properties);
-            const auto & pipeline_uuid = properties.properties.pipelineCacheUUID;
-            if (std::all_of(pipeline_uuid.begin(), pipeline_uuid.end(), [](uint8_t byte) { return byte == 0; })) {
+        for (size_t device_index = 0; device_index < vk_instance.device_indices.size(); ++device_index) {
+            char actual_target[128] = {};
+            char actual_driver[64] = {};
+            if (openasr_ggml_backend_vulkan_target_identity(
+                    device_index,
+                    actual_target,
+                    sizeof(actual_target),
+                    actual_driver,
+                    sizeof(actual_driver)) != 1) {
                 continue;
-            }
-
-            // `deviceUUID` is per physical card and would make a signed
-            // activation useless on another card of the same model. Vulkan's
-            // pipelineCacheUUID is explicitly an implementation compatibility
-            // token. Combined with vendor/device ids and the separately bound
-            // exact driver version, it defines the narrow reusable capability
-            // class used by release qualification. Physical UUID remains a
-            // memory-domain/isolation identity and is never broadened here.
-            char actual_target[8 + 8 + 1 + 8 + 1 + VK_UUID_SIZE * 2 + 1] = {};
-            const int target_prefix_length = std::snprintf(
-                actual_target,
-                sizeof(actual_target),
-                "vk_caps_%08x_%08x_",
-                properties.properties.vendorID,
-                properties.properties.deviceID);
-            if (target_prefix_length != 26) {
-                return 0;
-            }
-            for (uint32_t index = 0; index < VK_UUID_SIZE; ++index) {
-                std::snprintf(
-                    actual_target + 26 + index * 2,
-                    sizeof(actual_target) - 26 - index * 2,
-                    "%02x",
-                    static_cast<unsigned>(pipeline_uuid[index]));
             }
             if (std::strcmp(actual_target, expected_target) != 0) {
                 continue;
             }
-
-            const uint32_t raw_driver = properties.properties.driverVersion;
-            if (raw_driver == 0) {
-                return 0;
-            }
-            const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%u", raw_driver);
+            const int driver_length = std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver);
             if (driver_length <= 0 || static_cast<size_t>(driver_length) >= driver_out_capacity) {
                 driver_out[0] = '\0';
                 return 0;

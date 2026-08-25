@@ -230,6 +230,9 @@ if (Python3_Interpreter_FOUND)
     add_test(
         NAME test-backend-graph-lifecycle-static
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-graph-lifecycle-static.py)
+    add_test(
+        NAME test-backend-plugin-identity-static
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-plugin-identity-static.py)
 endif()
 
 # bounded GGUF parser C ABI and typed-limit smoke contract
