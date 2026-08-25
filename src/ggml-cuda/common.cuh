@@ -1275,6 +1275,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool property_baseline = false;
     uint64_t uid = 0;
     uint64_t executable_generation = 0;
     uint32_t last_executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
@@ -1498,14 +1499,15 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from ggml_graph_capture_uid to the native captured graph. Views share
+    // the owner's uid; scheduler splits mint a new uid after detaching view_src.
+    // Keying by uid keeps identity across ggml arena reuse of the cgraph object.
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
     uint64_t last_cuda_graph_executable_generation = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(uint64_t capture_uid) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1522,16 +1524,16 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(capture_uid);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(capture_uid, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
     }
 
-    const ggml_cuda_graph * find_cuda_graph(const void * first_node_ptr) const {
-        const auto it = cuda_graphs.find(first_node_ptr);
+    const ggml_cuda_graph * find_cuda_graph(uint64_t capture_uid) const {
+        const auto it = cuda_graphs.find(capture_uid);
         return it == cuda_graphs.end() ? nullptr : it->second.get();
     }
 

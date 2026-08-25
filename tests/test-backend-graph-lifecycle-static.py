@@ -18,6 +18,8 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.header = (ROOT / "include/ggml-backend.h").read_text()
+        cls.ggml_h = (ROOT / "include/ggml.h").read_text()
+        cls.ggml_c = (ROOT / "src/ggml.c").read_text()
         cls.backend = (ROOT / "src/ggml-backend.cpp").read_text()
         cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text()
         cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text()
@@ -74,13 +76,56 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
         self.assertIn("instantiate_status == cudaSuccess", updater)
         self.assertIn("stat == cudaSuccess", updater)
 
+    def test_capture_identity_is_the_owned_cgraph(self) -> None:
+        self.assertIn("ggml_graph_capture_source", self.ggml_h)
+        self.assertIn("ggml_graph_capture_uid", self.ggml_h)
+        view = self.ggml_c[
+            self.ggml_c.index("struct ggml_cgraph ggml_graph_view") :
+            self.ggml_c.index("void ggml_graph_cpy")
+        ]
+        self.assertIn("ggml_graph_capture_source", view)
+        self.assertIn("view_src", view)
+        copy = self.ggml_c[
+            self.ggml_c.index("void ggml_graph_cpy") :
+            self.ggml_c.index("struct ggml_cgraph * ggml_graph_dup")
+        ]
+        self.assertIn("Capture identity (uid, view_src) stays with dst", copy)
+        splits = self.backend[
+            self.backend.index("// set ids for all splits") :
+            self.backend.index("enum ggml_status ggml_backend_sched_split_graph_v2")
+        ]
+        self.assertIn("view_src = NULL", splits)
+        self.assertIn("ggml_graph_next_uid", splits)
+        getter = self.cuda[
+            self.cuda.index("static uint64_t ggml_cuda_graph_get_key") :
+            self.cuda.index("static bool ggml_cuda_graph_update_required")
+        ]
+        self.assertIn("ggml_graph_capture_uid", getter)
+        self.assertNotIn("return cgraph->nodes[0];", getter)
+        self.assertNotIn("ggml_graph_capture_source(cgraph)", getter)
+        props = self.cuda[
+            self.cuda.index("static bool ggml_cuda_graph_update_required") :
+            self.cuda.index("static enum ggml_status ggml_cuda_graph_update_executable")
+        ]
+        self.assertIn("property_baseline", props)
+        self.assertNotIn("CUDA Graph id", props)
+        self.assertIn("bool property_baseline = false", self.common)
+        self.assertIn(
+            "std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>>",
+            self.common,
+        )
+        self.assertNotIn("first_node_ptr", self.common)
+
     def test_observation_is_side_effect_free_and_exported_by_cuda_and_hip(self) -> None:
         observer = self.cuda[
             self.cuda.index("static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe") :
             self.cuda.index("static const ggml_backend_graph_lifecycle_api_v1", self.cuda.index("static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe"))
         ]
         self.assertIn("find_cuda_graph", observer)
+        self.assertIn("ggml_cuda_graph_get_key", observer)
         self.assertNotIn("->cuda_graph(", observer)
+        self.assertNotIn("n_nodes", observer)
+        self.assertNotIn("nodes[0]", observer)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1", observer)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1", observer)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC", self.cuda)

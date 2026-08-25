@@ -214,6 +214,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 # versioned native captured-graph lifecycle observation ABI
 set(TEST_TARGET test-backend-graph-lifecycle)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 

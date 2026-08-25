@@ -348,9 +348,15 @@ struct ggml_cgraph {
 
     enum ggml_cgraph_eval_order order;
 
-    // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
-    // a value of 0 means it is not set and should be ignored
+    // Capture identity. Zero means unset. Owned graphs mint a non-zero uid at
+    // allocation. Views copy the owner's uid. Scheduler splits that detach
+    // view_src mint a new uid and become independent capture keys.
     uint64_t uid;
+
+    // Owned graphs are NULL. `ggml_graph_view` writes the root owner so capture
+    // and lifecycle observation share one identity. Scheduler splits that mint a
+    // new uid must clear this and become independent compute identities.
+    struct ggml_cgraph * view_src;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

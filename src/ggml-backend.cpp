@@ -2275,6 +2275,10 @@ static void ggml_backend_sched_split_graph_impl(
 
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
+        // A split is an independent compute identity that aliases node storage.
+        // Detach the parent view so CUDA/HIP capture does not share executables
+        // across different node ranges.
+        sched->splits[i].graph.view_src = NULL;
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
 }

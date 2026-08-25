@@ -7682,7 +7682,8 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
-        /*.uid          =*/ 0,
+        /*.uid          =*/ ggml_graph_next_uid(),
+        /*.view_src     =*/ NULL,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7698,7 +7699,23 @@ struct ggml_cgraph * ggml_new_graph(struct ggml_context * ctx) {
     return ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, false);
 }
 
+const struct ggml_cgraph * ggml_graph_capture_source(const struct ggml_cgraph * cgraph) {
+    if (cgraph == NULL) {
+        return NULL;
+    }
+    while (cgraph->view_src != NULL) {
+        cgraph = cgraph->view_src;
+    }
+    return cgraph;
+}
+
+uint64_t ggml_graph_capture_uid(const struct ggml_cgraph * cgraph) {
+    const struct ggml_cgraph * source = ggml_graph_capture_source(cgraph);
+    return source != NULL ? source->uid : 0;
+}
+
 struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1) {
+    struct ggml_cgraph * source = (struct ggml_cgraph *) ggml_graph_capture_source(cgraph0);
     struct ggml_cgraph cgraph = {
         /*.size             =*/ 0,
         /*.n_nodes          =*/ i1 - i0,
@@ -7710,7 +7727,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ source != NULL ? source->uid : 0,
+        /*.view_src         =*/ source,
     };
 
     return cgraph;
@@ -7720,6 +7738,9 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     GGML_ASSERT(dst->size >= src->n_leafs);
     GGML_ASSERT(dst->size >= src->n_nodes);
     GGML_ASSERT(dst->visited_hash_set.size >= src->visited_hash_set.size);
+
+    // Copy node contents only. Capture identity (uid, view_src) stays with dst
+    // so a duplicate is a new owned graph, not an alias of src.
 
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;

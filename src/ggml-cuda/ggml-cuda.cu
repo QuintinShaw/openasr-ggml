@@ -2859,28 +2859,23 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+static uint64_t ggml_cuda_graph_get_key(const ggml_cgraph * cgraph) {
+    // Capture identity lives in ggml core. Views resolve to the owner uid;
+    // scheduler splits detach view_src and mint their own uid.
+    return ggml_graph_capture_uid(cgraph);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    bool res = false;
-
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    graph->uid = graph_key;
 
-    if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
-        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
-        GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        return false;
-    }
-
-    graph->uid = cgraph->uid;
-
-    // Check if the graph size has changed
-    if ((int)graph->node_props.size() != cgraph->n_nodes) {
-        res = true;
+    // The map is keyed by capture uid, so uid equality is not a property
+    // match. The first fill is the baseline for this identity, not a change.
+    // Later topology/data-pointer drift is a real change and resets capture.
+    bool changed = false;
+    if ((int) graph->node_props.size() != cgraph->n_nodes) {
+        changed = graph->property_baseline;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
@@ -2896,18 +2891,23 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        if (!graph->property_baseline) {
             graph->node_props[i] = prop;
-            res = true;
+            continue;
+        }
+        if (changed || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            graph->node_props[i] = prop;
+            changed = true;
         }
     }
 
-    return res;
+    graph->property_baseline = true;
+    return changed;
 }
 
 static enum ggml_status ggml_cuda_graph_update_executable(
         ggml_backend_cuda_context * cuda_ctx,
-        const void * graph_key,
+        uint64_t graph_key,
         uint32_t * executable_change) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     GGML_ASSERT(executable_change != nullptr);
@@ -4221,7 +4221,7 @@ static enum ggml_status ggml_cuda_abort_graph_capture(ggml_backend_cuda_context 
 }
 #endif
 
-static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4507,7 +4507,7 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -4542,7 +4542,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4556,14 +4556,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
+                // Capture on the first stable property snapshot. The initial
+                // baseline fill is not a change, so a new capture identity
+                // instantiates on its first compute and replays on the next.
                 if (!properties_changed) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
@@ -4641,7 +4642,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -6091,9 +6092,8 @@ static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe(
         ggml_backend_t backend,
         const ggml_cgraph * cgraph,
         ggml_backend_graph_lifecycle_observation_v1 * observation) {
-    if (backend == nullptr || cgraph == nullptr || observation == nullptr ||
-        observation->struct_size < sizeof(*observation) ||
-        cgraph->n_nodes <= 0 || cgraph->nodes == nullptr || cgraph->nodes[0] == nullptr) {
+    if (backend == nullptr || backend->context == nullptr || cgraph == nullptr ||
+        observation == nullptr || observation->struct_size < sizeof(*observation)) {
         return GGML_STATUS_FAILED;
     }
 
@@ -6103,10 +6103,13 @@ static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe(
     observation->executable_generation = 0;
 
 #ifdef USE_CUDA_GRAPH
+    // Identity is ggml_graph_capture_uid. Empty/unbuilt graphs are still
+    // observable: missing from the map means not tracked yet, not a failure.
     const ggml_backend_cuda_context * cuda_ctx =
         static_cast<const ggml_backend_cuda_context *>(backend->context);
     observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1;
-    const ggml_cuda_graph * graph = cuda_ctx->find_cuda_graph(cgraph->nodes[0]);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
+    const ggml_cuda_graph * graph = cuda_ctx->find_cuda_graph(graph_key);
     if (graph == nullptr) {
         return GGML_STATUS_SUCCESS;
     }
