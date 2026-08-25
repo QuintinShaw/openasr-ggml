@@ -18,6 +18,7 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.header = (ROOT / "include/ggml-backend.h").read_text()
+        cls.backend = (ROOT / "src/ggml-backend.cpp").read_text()
         cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text()
         cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text()
 
@@ -28,6 +29,21 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
         self.assertIn("uint64_t executable_generation", self.header)
         self.assertIn("uint32_t last_executable_change", self.header)
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1", self.header)
+
+    def test_foreign_callers_use_shared_no_throw_trampolines(self) -> None:
+        self.assertIn("ggml_backend_graph_lifecycle_api_for_backend_v1", self.header)
+        self.assertIn("ggml_backend_graph_lifecycle_api_observe_v1", self.header)
+        resolver = self.backend[
+            self.backend.index("ggml_backend_graph_lifecycle_api_for_backend_v1") :
+            self.backend.index("ggml_backend_graph_lifecycle_api_observe_v1")
+        ]
+        self.assertIn("ggml_backend_noexcept_or", resolver)
+        self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC", resolver)
+        observer = self.backend[
+            self.backend.index("ggml_backend_graph_lifecycle_api_observe_v1") :
+            self.backend.index("ggml_backend_memory_api_get_domains_v1")
+        ]
+        self.assertIn("ggml_backend_noexcept_status", observer)
 
     def test_generation_is_context_monotonic_across_graph_eviction(self) -> None:
         self.assertIn("uint64_t last_cuda_graph_executable_generation = 0", self.common)

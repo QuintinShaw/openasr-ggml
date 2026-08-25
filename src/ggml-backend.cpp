@@ -176,6 +176,42 @@ const struct ggml_backend_memory_api_v1 * ggml_backend_memory_api_for_backend_v1
     }, NULL);
 }
 
+const struct ggml_backend_graph_lifecycle_api_v1 *
+ggml_backend_graph_lifecycle_api_for_backend_v1(ggml_backend_t backend) {
+    if (backend == NULL) {
+        return NULL;
+    }
+    return ggml_backend_noexcept_or<const struct ggml_backend_graph_lifecycle_api_v1 *>([&]() {
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        if (device == NULL) {
+            return (const struct ggml_backend_graph_lifecycle_api_v1 *) NULL;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg == NULL) {
+            return (const struct ggml_backend_graph_lifecycle_api_v1 *) NULL;
+        }
+        void * proc = ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC);
+        if (proc == NULL) {
+            return (const struct ggml_backend_graph_lifecycle_api_v1 *) NULL;
+        }
+        auto get_api = reinterpret_cast<ggml_backend_graph_lifecycle_get_api_v1_t>(proc);
+        return get_api();
+    }, NULL);
+}
+
+enum ggml_status ggml_backend_graph_lifecycle_api_observe_v1(
+        const struct ggml_backend_graph_lifecycle_api_v1 * api,
+        ggml_backend_t backend,
+        const struct ggml_cgraph * graph,
+        struct ggml_backend_graph_lifecycle_observation_v1 * observation) {
+    if (api == NULL || api->observe == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_backend_noexcept_status(
+        [&]() { return api->observe(backend, graph, observation); });
+}
+
 enum ggml_status ggml_backend_memory_api_get_domains_v1(
         const struct ggml_backend_memory_api_v1 * api, ggml_backend_dev_t dev,
         struct ggml_backend_memory_domain_v1 * domains, uint32_t * inout_count) {

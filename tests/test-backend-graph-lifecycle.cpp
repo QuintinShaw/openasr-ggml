@@ -17,5 +17,12 @@ static_assert(sizeof(ggml_backend_graph_lifecycle_observation_v1) == 24);
 int main() {
     ggml_backend_graph_lifecycle_observation_v1 observation = {};
     observation.struct_size = sizeof(observation);
-    return observation.executable_generation == 0 ? 0 : 1;
+    if (ggml_backend_graph_lifecycle_api_for_backend_v1(nullptr) != nullptr) {
+        return 1;
+    }
+    if (ggml_backend_graph_lifecycle_api_observe_v1(
+            nullptr, nullptr, nullptr, &observation) != GGML_STATUS_FAILED) {
+        return 2;
+    }
+    return observation.executable_generation == 0 ? 0 : 3;
 }

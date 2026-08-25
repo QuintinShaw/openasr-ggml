@@ -323,6 +323,16 @@ extern "C" {
     typedef const struct ggml_backend_graph_lifecycle_api_v1 *
         (*ggml_backend_graph_lifecycle_get_api_v1_t)(void);
 
+    // Shared no-throw trampolines for lifecycle evidence. Foreign-language
+    // callers must not resolve or invoke provider registry procedures directly.
+    GGML_API const struct ggml_backend_graph_lifecycle_api_v1 *
+        ggml_backend_graph_lifecycle_api_for_backend_v1(ggml_backend_t backend);
+    GGML_API enum ggml_status ggml_backend_graph_lifecycle_api_observe_v1(
+        const struct ggml_backend_graph_lifecycle_api_v1 * api,
+        ggml_backend_t backend,
+        const struct ggml_cgraph * graph,
+        struct ggml_backend_graph_lifecycle_observation_v1 * observation);
+
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
     GGML_API enum ggml_status               ggml_backend_buffer_free_status   (ggml_backend_buffer_t buffer);
