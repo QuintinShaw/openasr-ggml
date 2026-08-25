@@ -325,6 +325,9 @@ extern "C" {
 
     // Shared no-throw trampolines for lifecycle evidence. Foreign-language
     // callers must not resolve or invoke provider registry procedures directly.
+    // The returned table and its callbacks are registry-owned and remain stable
+    // while the backend is live; callers must not retain them past backend free
+    // or registry unload.
     GGML_API const struct ggml_backend_graph_lifecycle_api_v1 *
         ggml_backend_graph_lifecycle_api_for_backend_v1(ggml_backend_t backend);
     GGML_API enum ggml_status ggml_backend_graph_lifecycle_api_observe_v1(
