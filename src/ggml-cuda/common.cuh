@@ -1240,6 +1240,42 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    void release_hip_mixed() {
+#if defined(GGML_USE_HIP)
+        if (!hip_fragments.empty()) {
+            if (graph == hip_fragments[0].graph) {
+                graph = nullptr;
+            }
+            if (instance == hip_fragments[0].instance) {
+                instance = nullptr;
+            }
+        }
+        cudaError_t first_error = cudaSuccess;
+        for (hip_fragment & fragment : hip_fragments) {
+            if (fragment.instance != nullptr) {
+                const cudaError_t status = cudaGraphExecDestroy(fragment.instance);
+                fragment.instance = nullptr;
+                if (status != cudaSuccess && first_error == cudaSuccess) {
+                    first_error = status;
+                }
+            }
+            if (fragment.graph != nullptr) {
+                const cudaError_t status = cudaGraphDestroy(fragment.graph);
+                fragment.graph = nullptr;
+                if (status != cudaSuccess && first_error == cudaSuccess) {
+                    first_error = status;
+                }
+            }
+        }
+        hip_fragments.clear();
+        hip_replay_plan.clear();
+        hip_eager_gemm_nodes = false;
+        if (first_error != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+#endif
+    }
+
     void release() {
         enum ggml_status status = GGML_STATUS_SUCCESS;
         const auto cleanup = [&](auto && callback) {
@@ -1249,6 +1285,7 @@ struct ggml_cuda_graph {
             });
             status = ggml_backend_status_merge(status, current);
         };
+        cleanup([&]() { release_hip_mixed(); });
         if (instance != nullptr) {
             cleanup([&]() {
                 CUDA_CHECK(cudaGraphExecDestroy(instance));
@@ -1276,6 +1313,23 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     bool property_baseline = false;
+    // HIP hipBLASLt GEMMs cannot join a capturing stream. Those nodes run
+    // eagerly between capture fragments. Reuse launches the kept fragment
+    // executables in order, interleaved with the same GEMMs; graph/instance
+    // alias the first fragment so observation still sees one executable.
+    bool hip_eager_gemm_nodes = false;
+#if defined(GGML_USE_HIP)
+    struct hip_fragment {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t instance = nullptr;
+    };
+    struct hip_replay_step {
+        bool is_fragment = false;
+        int index = -1;
+    };
+    std::vector<hip_fragment> hip_fragments;
+    std::vector<hip_replay_step> hip_replay_plan;
+#endif
     uint64_t uid = 0;
     uint64_t executable_generation = 0;
     uint32_t last_executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
@@ -1510,11 +1564,16 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(uint64_t capture_uid) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // sweep every 5s, evicting cuda graphs unused for >=10s.
+        // Graphs that still have an instantiated executable are a live
+        // observation generation: dropping them makes host lifecycle evidence
+        // fail-closed with GraphTrackingDisappeared / CaptureExecutableDisappeared
+        // (resident encoder graphs go idle while a decoder runs).
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (it->second->instance == nullptr &&
+                    time_now - it->second->last_used_time >= 10'000'000) {
                     ggml_cuda_set_device(device);
                     it->second->release();
                     it = cuda_graphs.erase(it);

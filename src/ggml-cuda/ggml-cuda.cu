@@ -1048,7 +1048,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            // Blocking legacy-stream memset is illegal while another stream is
+            // capturing a HIP/CUDA graph ("legacy stream depend on a capturing
+            // blocking stream"). Keep this padding fill on the per-thread
+            // stream, matching ggml_backend_cuda_buffer_memset_tensor.
+            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -2826,8 +2831,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 #if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
 // hipBLASLt (via rocBLAS on ROCm 7) uses a legacy/blocking stream that cannot
 // join a capturing stream (HIP error 906). Quantized/vector ggml GEMM kernels
-// stay capturable; only graphs that would actually call hipBLAS must run
-// uncaptured. Blanket-skipping every MUL_MAT would also drop decoder mmq graphs.
+// stay capturable. Graphs that also contain hipBLAS GEMMs still capture the
+// rest: those GEMMs run eagerly between capture fragments instead of disabling
+// the whole graph. Blanket-skipping every MUL_MAT would also drop decoder mmq
+// graphs.
 static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2886,6 +2893,148 @@ static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * dst) {
     }
     return true;
 }
+
+// CUDA/HIP stream capture records kernels; it does not execute them. Mixed HIP
+// graphs therefore have to launch each captured fragment on the same stream
+// before the next eager hipBLASLt GEMM, otherwise only the GEMMs run and the
+// rest of the ggml graph is silently dropped. Fragments stay instantiated so
+// reuse can GraphLaunch them in order instead of eager-walking capturable
+// kernels (FunASR q4_k was a 3x reuse regression from that walk).
+static enum ggml_status ggml_cuda_hip_commit_fragment(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cuda_graph * graph,
+        cudaGraph_t fragment) {
+    if (fragment == nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+    size_t n_nodes = 0;
+    (void) cudaGraphGetNodes(fragment, nullptr, &n_nodes);
+    if (n_nodes == 0) {
+        (void) cudaGraphDestroy(fragment);
+        return GGML_STATUS_SUCCESS;
+    }
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t instantiate_status = cudaGraphInstantiate(&exec, fragment, nullptr, nullptr, 0);
+    if (instantiate_status != cudaSuccess) {
+        (void) cudaGraphDestroy(fragment);
+        return ggml_cuda_status(instantiate_status);
+    }
+    const cudaError_t launch_status = cudaGraphLaunch(exec, cuda_ctx->stream());
+    if (launch_status != cudaSuccess) {
+        (void) cudaGraphExecDestroy(exec);
+        (void) cudaGraphDestroy(fragment);
+        return ggml_cuda_status(launch_status);
+    }
+    ggml_cuda_graph::hip_replay_step step;
+    step.is_fragment = true;
+    step.index = (int) graph->hip_fragments.size();
+    graph->hip_replay_plan.push_back(step);
+    ggml_cuda_graph::hip_fragment kept;
+    kept.graph = fragment;
+    kept.instance = exec;
+    graph->hip_fragments.push_back(kept);
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_cuda_hip_pause_capture(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cuda_graph * graph,
+        int gemm_node_index) {
+    cudaGraph_t fragment = nullptr;
+    const cudaError_t end_status = cudaStreamEndCapture(cuda_ctx->stream(), &fragment);
+    ggml_cuda_graph_capture_finished();
+    graph->hip_eager_gemm_nodes = true;
+    if (end_status != cudaSuccess) {
+        if (fragment != nullptr) {
+            (void) cudaGraphDestroy(fragment);
+        }
+        (void) cudaGetLastError();
+        return GGML_STATUS_SUCCESS;
+    }
+    const enum ggml_status commit_status = ggml_cuda_hip_commit_fragment(cuda_ctx, graph, fragment);
+    if (commit_status != GGML_STATUS_SUCCESS) {
+        return commit_status;
+    }
+    ggml_cuda_graph::hip_replay_step step;
+    step.is_fragment = false;
+    step.index = gemm_node_index;
+    graph->hip_replay_plan.push_back(step);
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_cuda_hip_adopt_observable(ggml_cuda_graph * graph, uint32_t * executable_change) {
+    if (graph->hip_fragments.empty()) {
+        return GGML_STATUS_SUCCESS;
+    }
+    const ggml_cuda_graph::hip_fragment & first = graph->hip_fragments[0];
+    if (graph->graph != nullptr && graph->graph != first.graph) {
+        const cudaError_t destroy_status = cudaGraphDestroy(graph->graph);
+        graph->graph = nullptr;
+        if (destroy_status != cudaSuccess) {
+            return ggml_cuda_status(destroy_status);
+        }
+    }
+    if (graph->instance != nullptr && graph->instance != first.instance) {
+        const cudaError_t destroy_status = cudaGraphExecDestroy(graph->instance);
+        graph->instance = nullptr;
+        if (destroy_status != cudaSuccess) {
+            return ggml_cuda_status(destroy_status);
+        }
+    }
+    const bool created = graph->instance == nullptr;
+    graph->graph = first.graph;
+    graph->instance = first.instance;
+    if (created && executable_change != nullptr &&
+        *executable_change == GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1) {
+        *executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_INSTANTIATED_V1;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_cuda_hip_replay_mixed(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph,
+        ggml_cuda_graph * graph) {
+    for (const ggml_cuda_graph::hip_replay_step & step : graph->hip_replay_plan) {
+        if (step.is_fragment) {
+            if (step.index < 0 || (size_t) step.index >= graph->hip_fragments.size()) {
+                return GGML_STATUS_FAILED;
+            }
+            cudaGraphExec_t exec = graph->hip_fragments[step.index].instance;
+            if (exec == nullptr) {
+                return GGML_STATUS_FAILED;
+            }
+            const cudaError_t launch_status = cudaGraphLaunch(exec, cuda_ctx->stream());
+            if (launch_status != cudaSuccess) {
+                return ggml_cuda_status(launch_status);
+            }
+            continue;
+        }
+        if (step.index < 0 || step.index >= cgraph->n_nodes) {
+            return GGML_STATUS_FAILED;
+        }
+        ggml_tensor * node = cgraph->nodes[step.index];
+        if (!ggml_cuda_compute_forward(*cuda_ctx, node)) {
+            GGML_LOG_ERROR("%s: op not supported or dispatch failed %s (%s)\n",
+                    __func__, node->name, ggml_op_name(node->op));
+            return cuda_ctx->terminal_status;
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_cuda_hip_resume_capture(ggml_backend_cuda_context * cuda_ctx) {
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    const cudaError_t begin_status = cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed);
+    if (begin_status != cudaSuccess) {
+        ggml_cuda_graph_capture_finished();
+        return ggml_cuda_status(begin_status);
+    }
+    return GGML_STATUS_SUCCESS;
+}
 #endif
 
 #ifdef USE_CUDA_GRAPH
@@ -2901,16 +3050,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-#ifdef GGML_USE_HIP
-        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
-            ggml_cuda_mul_mat_uses_cublas(node)) {
-            use_cuda_graph = false;
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling HIP graphs due to hipBLASLt-incompatible GEMM\n", __func__);
-#endif
-            break;
-        }
-#endif
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -4339,6 +4478,8 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+        // Mixed HIP reuse is also a graph launch: captured fragments plus the
+        // eager hipBLASLt GEMMs recorded between them, not a full ggml walk.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
@@ -4489,7 +4630,37 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+                bool paused_hip_capture = false;
+                if (use_cuda_graph && cuda_graph_update_required &&
+                    (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+                    ggml_cuda_mul_mat_uses_cublas(node)) {
+                    ggml_cuda_graph * hip_graph = cuda_ctx->cuda_graph(graph_key);
+                    const enum ggml_status pause_status = ggml_cuda_hip_pause_capture(cuda_ctx, hip_graph, i);
+                    if (pause_status != GGML_STATUS_SUCCESS) {
+                        return pause_status;
+                    }
+                    paused_hip_capture = true;
+                }
+#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+                if (paused_hip_capture) {
+                    const enum ggml_status resume_status = ggml_cuda_hip_resume_capture(cuda_ctx);
+                    if (!ok) {
+                        if (resume_status == GGML_STATUS_SUCCESS) {
+                            cudaGraph_t abandoned = nullptr;
+                            (void) cudaStreamEndCapture(cuda_ctx->stream(), &abandoned);
+                            if (abandoned != nullptr) {
+                                (void) cudaGraphDestroy(abandoned);
+                            }
+                            ggml_cuda_graph_capture_finished();
+                        }
+                    } else if (resume_status != GGML_STATUS_SUCCESS) {
+                        return resume_status;
+                    }
+                }
+#endif
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported or dispatch failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
 #ifdef USE_CUDA_GRAPH
@@ -4515,22 +4686,49 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                cudaError_t destroy_status = cudaGraphDestroy(graph->graph);
-                graph->graph = nullptr;
-                if (destroy_status != cudaSuccess) {
-                    ggml_cuda_graph_capture_finished();
-                    return ggml_cuda_status(destroy_status);
-                }
-            }
-
-            cudaError_t capture_status = cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph);
+            cudaGraph_t captured = nullptr;
+            cudaError_t capture_status = cudaStreamEndCapture(cuda_ctx->stream(), &captured);
             ggml_cuda_graph_capture_finished();
             if (capture_status != cudaSuccess) {
-                graph->graph = nullptr;
-                return ggml_cuda_status(capture_status);
+                if (captured != nullptr) {
+                    (void) cudaGraphDestroy(captured);
+                }
+#if defined(GGML_USE_HIP)
+                if (graph->hip_eager_gemm_nodes && !graph->hip_replay_plan.empty()) {
+                    (void) cudaGetLastError();
+                    graph_evaluated_or_captured = true;
+                } else
+#endif
+                if (graph->hip_eager_gemm_nodes && graph->graph != nullptr) {
+                    (void) cudaGetLastError();
+                    graph_evaluated_or_captured = true;
+                } else {
+                    graph->graph = nullptr;
+                    return ggml_cuda_status(capture_status);
+                }
+#if defined(GGML_USE_HIP)
+            } else if (graph->hip_eager_gemm_nodes) {
+                const enum ggml_status commit_status =
+                    ggml_cuda_hip_commit_fragment(cuda_ctx, graph, captured);
+                if (commit_status != GGML_STATUS_SUCCESS) {
+                    return commit_status;
+                }
+                graph_evaluated_or_captured = true;
+#endif
+            } else {
+                if (graph->graph != nullptr) {
+                    cudaError_t destroy_status = cudaGraphDestroy(graph->graph);
+                    graph->graph = nullptr;
+                    if (destroy_status != cudaSuccess) {
+                        if (captured != nullptr) {
+                            (void) cudaGraphDestroy(captured);
+                        }
+                        return ggml_cuda_status(destroy_status);
+                    }
+                }
+                graph->graph = captured;
+                graph_evaluated_or_captured = true;
             }
-            graph_evaluated_or_captured = true; // CUDA graph has been captured
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -4539,6 +4737,24 @@ static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_c
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         uint32_t executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
+#if defined(GGML_USE_HIP)
+        if (graph->hip_eager_gemm_nodes) {
+            const enum ggml_status adopt_status =
+                ggml_cuda_hip_adopt_observable(graph, &executable_change);
+            if (adopt_status != GGML_STATUS_SUCCESS) {
+                return adopt_status;
+            }
+            if (executable_change != GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1 &&
+                !cuda_ctx->record_cuda_graph_executable_change(graph, executable_change)) {
+                return GGML_STATUS_FAILED;
+            }
+            if (!cuda_graph_update_required) {
+                return ggml_cuda_hip_replay_mixed(cuda_ctx, cgraph, graph);
+            }
+            // Capture already launched each fragment before the next GEMM.
+            return GGML_STATUS_SUCCESS;
+        }
+#endif
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             cudaError_t instantiate_status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
             if (instantiate_status != cudaSuccess) {
@@ -4630,6 +4846,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
+#if defined(GGML_USE_HIP)
+            if (graph->hip_eager_gemm_nodes && !properties_changed &&
+                !graph->hip_replay_plan.empty()) {
+                // Mixed HIP reuse launches kept fragments interleaved with
+                // eager hipBLASLt GEMMs. The first fragment stays observable.
+                use_cuda_graph = true;
+                cuda_graph_update_required = false;
+            } else
+#endif
             if (!graph->warmup_complete) {
                 // Capture on the first stable property snapshot. The initial
                 // baseline fill is not a change, so a new capture identity
@@ -4645,6 +4870,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->hip_eager_gemm_nodes = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -4661,6 +4887,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     if (use_cuda_graph && cuda_graph_update_required) {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+        cuda_ctx->cuda_graph(graph_key)->release_hip_mixed();
+#endif
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6189,7 +6418,7 @@ static enum ggml_status ggml_backend_cuda_graph_lifecycle_observe(
         return GGML_STATUS_SUCCESS;
     }
     observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1;
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && graph->instance != nullptr) {
         observation->flags |= GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1;
     }
     if (graph->instance != nullptr) {
