@@ -7684,6 +7684,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ ggml_graph_next_uid(),
         /*.view_src     =*/ NULL,
+        /*.capture_allowed =*/ false,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7714,6 +7715,18 @@ uint64_t ggml_graph_capture_uid(const struct ggml_cgraph * cgraph) {
     return source != NULL ? source->uid : 0;
 }
 
+void ggml_graph_set_capture_allowed(struct ggml_cgraph * cgraph, bool allowed) {
+    struct ggml_cgraph * source = (struct ggml_cgraph *) ggml_graph_capture_source(cgraph);
+    if (source != NULL) {
+        source->capture_allowed = allowed;
+    }
+}
+
+bool ggml_graph_capture_allowed(const struct ggml_cgraph * cgraph) {
+    const struct ggml_cgraph * source = ggml_graph_capture_source(cgraph);
+    return source != NULL && source->capture_allowed;
+}
+
 struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1) {
     struct ggml_cgraph * source = (struct ggml_cgraph *) ggml_graph_capture_source(cgraph0);
     struct ggml_cgraph cgraph = {
@@ -7729,6 +7742,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.order            =*/ cgraph0->order,
         /*.uid              =*/ source != NULL ? source->uid : 0,
         /*.view_src         =*/ source,
+        /*.capture_allowed  =*/ source != NULL && source->capture_allowed,
     };
 
     return cgraph;

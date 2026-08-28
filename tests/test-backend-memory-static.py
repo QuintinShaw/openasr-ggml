@@ -201,6 +201,16 @@ class BackendMemoryStaticContract(unittest.TestCase):
         self.assertIn("ggml_vk_status_boundary", self.vulkan)
         self.assertIn("ggml_vk_buffer_boundary", self.vulkan)
         self.assertNotIn("vk_pipeline_stats_filter.clear();\n    throw;", self.vulkan)
+        self.assertIn(
+            'strcmp("VK_KHR_pipeline_executable_properties", properties.extensionName) == 0 &&\n'
+            '                       getenv("GGML_VK_PIPELINE_STATS") != nullptr',
+            self.vulkan,
+        )
+        self.assertIn("#define VK_LOG_DEBUG_CONT(msg) ((void) 0)", self.vulkan)
+        self.assertIn(
+            'VK_LOG_DEBUG("ggml_vk_dispatch_pipeline(" << pipeline->name << " wg="',
+            self.vulkan,
+        )
         self.assertIn("static std::mutex vk_instance_init_mutex", self.vulkan)
         self.assertIn("static bool vk_instance_initialized = false", self.vulkan)
         self.assertIn("ggml_vk_reset_failed_instance", self.vulkan)
@@ -227,6 +237,19 @@ class BackendMemoryStaticContract(unittest.TestCase):
         ]
         self.assertIn("ctx->memory_quarantined = true", quarantine)
         self.assertNotIn("ctx->device->poisoned.store(true)", quarantine)
+
+    def test_device_memory_api_keeps_c_linkage_without_nested_extern(self) -> None:
+        self.assertNotIn("ggml_backend_memory_api_for_device_v1", self.header)
+        decl = self.core[
+            self.core.index("Device-only lookup for admission quotes") :
+            self.core.index("ggml_backend_memory_api_for_backend_v1")
+        ]
+        self.assertIn("ggml_backend_memory_api_for_device_v1", decl)
+        self.assertIn('extern "C" {', decl)
+        self.assertNotIn(
+            'extern "C" GGML_API const struct ggml_backend_memory_api_v1',
+            decl,
+        )
 
     def test_optional_plugin_callbacks_use_common_noexcept_trampolines(self) -> None:
         self.assertIn("ggml_backend_set_n_threads_if_supported", self.header)
@@ -365,7 +388,7 @@ class BackendMemoryStaticContract(unittest.TestCase):
             "ggml_backend_vk_memory_quarantine",
         )
         self.assertIn("first_failure", trim)
-        self.assertEqual(trim.count("release([&]()"), 5)
+        self.assertEqual(trim.count("release([&]()"), 6)
         self.assertIn("return first_failure", trim)
 
         queue_selector = self.vulkan[
@@ -479,6 +502,8 @@ class BackendMemoryStaticContract(unittest.TestCase):
         ]
         self.assertIn("largest_heap_with", selector)
         self.assertIn("device->uma", selector)
+        self.assertIn("device->disable_host_visible_vidmem", selector)
+        self.assertIn("eHostVisible", selector)
         self.assertIn("getBufferMemoryRequirements(probe)", selector)
         self.assertIn("requirements.memoryTypeBits", selector)
 
@@ -489,7 +514,7 @@ class BackendMemoryStaticContract(unittest.TestCase):
         ]
         self.assertIn("memory_type.heapIndex == allocation_heap_index", self.vulkan)
         self.assertIn(
-            "ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, allocation_heap_index)",
+            "ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, allocation_heap_index, exclude_flags)",
             allocator,
         )
         self.assertIn(
@@ -503,6 +528,8 @@ class BackendMemoryStaticContract(unittest.TestCase):
         ]
         self.assertIn("allocation_heap_index", resolver)
         self.assertIn("ggml_vk_find_memory_properties", resolver)
+        self.assertIn("disable_host_visible_vidmem", resolver)
+        self.assertIn("eHostVisible", resolver)
 
         quote = function_body(
             self.vulkan,
@@ -513,6 +540,15 @@ class BackendMemoryStaticContract(unittest.TestCase):
             "buft_ctx, requests[i].requested_bytes",
             quote,
         )
+
+    def test_vulkan_float_controls_patch_is_opt_in(self) -> None:
+        self.assertIn("GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH", self.vulkan)
+        self.assertIn("GGML_VK_DISABLE_FLOAT_CONTROLS_PATCH", self.vulkan)
+        self.assertGreater(
+            self.vulkan.find("GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH"),
+            0,
+        )
+        self.assertIn("destroyShaderModule(pipeline->shader_module)", self.vulkan)
 
     def test_vulkan_quote_generation_excludes_live_heap_usage(self) -> None:
         generation = self.vulkan[

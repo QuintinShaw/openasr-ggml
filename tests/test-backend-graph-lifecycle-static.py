@@ -17,12 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class BackendGraphLifecycleStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header = (ROOT / "include/ggml-backend.h").read_text()
-        cls.ggml_h = (ROOT / "include/ggml.h").read_text()
-        cls.ggml_c = (ROOT / "src/ggml.c").read_text()
-        cls.backend = (ROOT / "src/ggml-backend.cpp").read_text()
-        cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text()
-        cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text()
+        cls.header = (ROOT / "include/ggml-backend.h").read_text(encoding="utf-8")
+        cls.ggml_h = (ROOT / "include/ggml.h").read_text(encoding="utf-8")
+        cls.ggml_c = (ROOT / "src/ggml.c").read_text(encoding="utf-8")
+        cls.backend = (ROOT / "src/ggml-backend.cpp").read_text(encoding="utf-8")
+        cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text(encoding="utf-8")
+        cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
 
     def test_versioned_observation_is_diagnostic_only(self) -> None:
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC", self.header)
@@ -115,6 +115,46 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
             self.common,
         )
         self.assertNotIn("first_node_ptr", self.common)
+
+    def test_capture_is_opt_in_on_owned_cgraph(self) -> None:
+        impl = (ROOT / "src/ggml-impl.h").read_text(encoding="utf-8")
+        self.assertIn("ggml_graph_set_capture_allowed", impl)
+        self.assertIn("ggml_graph_capture_allowed", impl)
+        self.assertNotIn("ggml_graph_set_capture_allowed", self.ggml_h)
+        self.assertNotIn("ggml_graph_capture_allowed", self.ggml_h)
+        impl = self.ggml_c[
+            self.ggml_c.index("void ggml_graph_set_capture_allowed") :
+            self.ggml_c.index("struct ggml_cgraph ggml_graph_view")
+        ]
+        self.assertIn("source->capture_allowed = allowed", impl)
+        self.assertIn("source != NULL && source->capture_allowed", impl)
+        new_graph = self.ggml_c[
+            self.ggml_c.index("struct ggml_cgraph * ggml_new_graph_custom") :
+            self.ggml_c.index("struct ggml_cgraph * ggml_new_graph(")
+        ]
+        self.assertIn("capture_allowed =*/ false", new_graph)
+        dispatcher = self.cuda[
+            self.cuda.index("bool use_cuda_graph             = false;") :
+            self.cuda.index("return ggml_cuda_graph_evaluate_and_capture")
+        ]
+        self.assertIn("ggml_graph_capture_allowed(cgraph)", dispatcher)
+        self.assertIn("never enter the uid cache", dispatcher)
+
+    def test_uid_reuse_ignores_input_pointer_churn(self) -> None:
+        props = self.cuda[
+            self.cuda.index("static bool ggml_cuda_graph_update_required") :
+            self.cuda.index("static enum ggml_status ggml_cuda_graph_update_executable")
+        ]
+        self.assertIn("treating data-pointer churn as a capture miss recaptures", props)
+        self.assertIn("Cheap-path: n_nodes + op/type", props)
+        cheap = props[
+            props.index("if (graph->property_baseline && graph->warmup_complete &&") :
+            props.index("The map is keyed by capture uid")
+        ]
+        self.assertIn("topology_changed", cheap)
+        self.assertIn("memcmp(prev.ne, node->ne, sizeof(prev.ne))", cheap)
+        self.assertNotIn("prev.data != node->data", cheap)
+        self.assertNotIn("node_src_data_ptrs", cheap)
 
     def test_observation_is_side_effect_free_and_exported_by_cuda_and_hip(self) -> None:
         observer = self.cuda[

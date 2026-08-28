@@ -67,6 +67,8 @@ void main() {
             if (tmpmax[col] < tmpmax[col + s]
 #ifdef FIRST_MAX
                 || (tmpmax[col] == tmpmax[col + s] && tmp[col + s] < tmp[col])
+#else
+                || (tmpmax[col] == tmpmax[col + s] && tmp[col + s] > tmp[col])
 #endif
             ) {
                 tmpmax[col] = tmpmax[col + s];

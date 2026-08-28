@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class BackendPluginIdentityStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header = (ROOT / "include/ggml-backend.h").read_text()
-        cls.registry = (ROOT / "src/ggml-backend-reg.cpp").read_text()
-        cls.vulkan = (ROOT / "src/ggml-vulkan/ggml-vulkan.cpp").read_text()
+        cls.header = (ROOT / "include/ggml-backend.h").read_text(encoding="utf-8")
+        cls.registry = (ROOT / "src/ggml-backend-reg.cpp").read_text(encoding="utf-8")
+        cls.vulkan = (ROOT / "src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
 
     def test_host_discovery_is_abi_and_provider_verified(self) -> None:
         self.assertIn("ggml_backend_probe_identity_verified_v1_utf8", self.header)
@@ -53,6 +53,27 @@ class BackendPluginIdentityStaticContract(unittest.TestCase):
         ]
         self.assertIn("openasr_ggml_backend_vulkan_target_identity", probe)
         self.assertIn("std::strcmp(actual_target, expected_target)", probe)
+        self.assertIn("ggml_vk_release_unused_instance", probe)
+        self.assertIn("openasr_ggml_backend_release_probe_v1", probe)
+        self.assertIn("Throwaway probe_verified_* callers must call release_probe_v1", probe)
+
+    def test_throwaway_verified_probe_releases_unused_instance(self) -> None:
+        v2 = self.registry[
+            self.registry.index("ggml_backend_probe_verified_v2_utf8") :
+            self.registry.index("ggml_backend_probe_verified_v3_utf8")
+        ]
+        v3 = self.registry[
+            self.registry.index("ggml_backend_probe_verified_v3_utf8") :
+            self.registry.index("ggml_backend_probe_identity_verified_v1_utf8")
+        ]
+        self.assertIn("openasr_backend_release_throwaway_probe", v2)
+        self.assertIn("openasr_backend_release_throwaway_probe", v3)
+        load = self.registry[
+            self.registry.index("ggml_backend_reg_t load_backend(") :
+            self.registry.index("void unload_backend(")
+        ]
+        self.assertIn("openasr_backend_release_throwaway_probe", load)
+        self.assertIn("register_backend(reg, std::move(handle))", load)
 
 
 if __name__ == "__main__":

@@ -153,6 +153,35 @@ bool ggml_backend_memory_encode_pci_bdf_v1(
     return true;
 }
 
+// Device-only lookup for admission quotes that must not construct a live
+// backend context. Intentionally omitted from ggml-backend.h / Rust ffi.rs so
+// the hashed host ABI fingerprint stays compatible with already-built plugins.
+// Do not write `extern "C" GGML_API` on one line: GGML_API already expands to
+// `extern`, and `extern "C" extern` is invalid C++.
+extern "C" {
+GGML_API const struct ggml_backend_memory_api_v1 *
+ggml_backend_memory_api_for_device_v1(ggml_backend_dev_t device);
+}
+
+const struct ggml_backend_memory_api_v1 *
+ggml_backend_memory_api_for_device_v1(ggml_backend_dev_t device) {
+    if (device == NULL) {
+        return NULL;
+    }
+    return ggml_backend_noexcept_or<const struct ggml_backend_memory_api_v1 *>([&]() {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg == NULL) {
+            return (const struct ggml_backend_memory_api_v1 *) NULL;
+        }
+        void * proc = ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MEMORY_API_V1_PROC);
+        if (proc == NULL) {
+            return (const struct ggml_backend_memory_api_v1 *) NULL;
+        }
+        auto get_api = reinterpret_cast<ggml_backend_memory_get_api_v1_t>(proc);
+        return get_api();
+    }, NULL);
+}
+
 const struct ggml_backend_memory_api_v1 * ggml_backend_memory_api_for_backend_v1(
         ggml_backend_t backend) {
     if (backend == NULL) {

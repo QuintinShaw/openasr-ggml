@@ -30,7 +30,7 @@ extern "C" {
 
 void ggml_print_backtrace(void);
 
-uint64_t ggml_graph_next_uid(void);
+GGML_API uint64_t ggml_graph_next_uid(void);
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -357,12 +357,21 @@ struct ggml_cgraph {
     // and lifecycle observation share one identity. Scheduler splits that mint a
     // new uid must clear this and become independent compute identities.
     struct ggml_cgraph * view_src;
+
+    // CUDA/HIP graph capture is amortization for a reused cgraph. Fresh
+    // `ggml_new_graph` identities stay false so one-shot encoder/prefill
+    // graphs do not instantiate mixed HIP fragments. Persistent sessions
+    // opt in through `ggml_graph_set_capture_allowed`.
+    bool capture_allowed;
 };
+
+GGML_API void ggml_graph_set_capture_allowed(struct ggml_cgraph * cgraph, bool allowed);
+GGML_API bool ggml_graph_capture_allowed    (const struct ggml_cgraph * cgraph);
 
 // returns a slice of cgraph with nodes [i0, i1)
 // the slice does not have leafs or gradients
 // if you need the gradients, get them from the original graph
-struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
+GGML_API struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
 
 // ggml-alloc.c: true if the operation can reuse memory from its sources
 GGML_API bool ggml_op_can_inplace(enum ggml_op op);

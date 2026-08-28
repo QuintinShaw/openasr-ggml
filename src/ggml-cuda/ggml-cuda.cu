@@ -3084,6 +3084,33 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     graph->uid = graph_key;
 
+    // After the first stable capture, v0.1.36 returned immediately on uid
+    // reuse. Decode reuse writes new input/KV contents into the same
+    // topology; treating data-pointer churn as a capture miss recaptures
+    // every token and inflates HIP RTF. Cheap-path: n_nodes + op/type.
+    // Shape/op_params changes still fall through to the full snapshot.
+    if (graph->property_baseline && graph->warmup_complete &&
+        (int) graph->node_props.size() == cgraph->n_nodes &&
+        (graph->instance != nullptr
+#if defined(GGML_USE_HIP)
+         || !graph->hip_replay_plan.empty()
+#endif
+        )) {
+        bool topology_changed = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            const auto & prev = graph->node_props[i];
+            if (prev.op != node->op || prev.type != node->type ||
+                memcmp(prev.ne, node->ne, sizeof(prev.ne)) != 0) {
+                topology_changed = true;
+                break;
+            }
+        }
+        if (!topology_changed) {
+            return false;
+        }
+    }
+
     // The map is keyed by capture uid, so uid equality is not a property
     // match. The first fill is the baseline for this identity, not a change.
     // Later topology/data-pointer drift is a real change and resets capture.
@@ -3094,14 +3121,24 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
         ggml_cuda_graph::node_properties prop = {};
-        memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        prop.type = node->type;
+        prop.op = node->op;
+        prop.flags = node->flags;
+        memcpy(prop.op_params, node->op_params, sizeof(prop.op_params));
+        memcpy(prop.ne, node->ne, sizeof(prop.ne));
+        memcpy(prop.nb, node->nb, sizeof(prop.nb));
+        prop.buffer = node->buffer;
+        prop.data = node->data;
+        prop.view_src = node->view_src;
+        prop.view_offs = node->view_offs;
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            if (node->src[j]) {
+                prop.node_src_data_ptrs[j] = node->src[j]->data;
+                memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
+                memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
         }
 
@@ -4836,6 +4873,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
+    // One-shot graphs (host `start_graph`) leave capture_allowed false so they
+    // never enter the uid cache or instantiate mixed HIP fragments. Persistent
+    // reuse sessions opt in before first compute.
+    if (ggml_graph_capture_allowed(cgraph)) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4878,6 +4919,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
     }
 #endif // USE_CUDA_GRAPH
 
@@ -4946,6 +4988,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
+    if (!ggml_graph_capture_allowed(cgraph)) {
+        return;
+    }
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
