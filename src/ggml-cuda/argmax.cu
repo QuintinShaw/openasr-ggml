@@ -7,8 +7,16 @@
 
 template <bool first_max>
 static __device__ __forceinline__ bool argmax_better(float value, int col, float best_value, int best_col) {
-    return value > best_value ||
-        (first_max && value == best_value && (best_col < 0 || col < best_col));
+    if (value > best_value) {
+        return true;
+    }
+    if (value != best_value) {
+        return false;
+    }
+    if (first_max) {
+        return best_col < 0 || col < best_col;
+    }
+    return col > best_col;
 }
 
 template <bool first_max>
