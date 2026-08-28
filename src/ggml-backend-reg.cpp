@@ -117,6 +117,7 @@ struct ggml_backend_reg_entry {
 
 typedef const char * (*openasr_ggml_backend_abi_v1_t)(void);
 typedef int (*openasr_ggml_backend_probe_v1_t)(const char * expected_target, char * driver_out, size_t driver_out_capacity);
+typedef void (*openasr_ggml_backend_release_probe_v1_t)(void);
 typedef int (*openasr_ggml_backend_target_identity_v1_t)(
     size_t device_index,
     char * target_out,
@@ -250,6 +251,18 @@ static bool openasr_verify_loaded_backend(
     return openasr_backend_abi_matches(handle, expected_abi, path, silent) &&
         openasr_backend_provider_matches(handle, expected_provider, path, silent) &&
         openasr_backend_runtime_matches(handle, expected_target, minimum_driver, path, silent, actual_driver_out);
+}
+
+static void openasr_backend_release_throwaway_probe(dl_handle * handle) {
+    if (handle == nullptr) {
+        return;
+    }
+    auto release_fn = (openasr_ggml_backend_release_probe_v1_t)
+        dl_get_sym(handle, "openasr_ggml_backend_release_probe_v1");
+    if (release_fn == nullptr) {
+        return;
+    }
+    ggml_backend_noexcept_or<int>([&]() { release_fn(); return 0; }, 0);
 }
 
 struct ggml_backend_registry {
@@ -391,6 +404,7 @@ struct ggml_backend_registry {
 
         if (!openasr_verify_loaded_backend(handle.get(), path, silent, expected_abi, expected_provider,
                                            expected_target, minimum_driver)) {
+            openasr_backend_release_throwaway_probe(handle.get());
             return nullptr;
         }
 
@@ -399,6 +413,7 @@ struct ggml_backend_registry {
             if (!silent) {
                 GGML_LOG_INFO("%s: backend %s is not supported on this system\n", __func__, path_str(path).c_str());
             }
+            openasr_backend_release_throwaway_probe(handle.get());
             return nullptr;
         }
 
@@ -407,6 +422,7 @@ struct ggml_backend_registry {
             if (!silent) {
                 GGML_LOG_ERROR("%s: failed to find ggml_backend_init in %s\n", __func__, path_str(path).c_str());
             }
+            openasr_backend_release_throwaway_probe(handle.get());
             return nullptr;
         }
 
@@ -422,6 +438,7 @@ struct ggml_backend_registry {
                         __func__, path_str(path).c_str(), reg->api_version, GGML_BACKEND_API_VERSION);
                 }
             }
+            openasr_backend_release_throwaway_probe(handle.get());
             return nullptr;
         }
 
@@ -677,8 +694,10 @@ bool ggml_backend_probe_verified_v2_utf8(
     if (!openasr_verify_loaded_backend(handle.get(), path, false, expected_openasr_abi_v1,
                                        expected_provider_v1, expected_device_target,
                                        minimum_driver_version, &actual_driver)) {
+        openasr_backend_release_throwaway_probe(handle.get());
         return false;
     }
+    openasr_backend_release_throwaway_probe(handle.get());
     if (driver_out != nullptr && driver_out_capacity > 0) {
         std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver.c_str());
     }
@@ -716,8 +735,10 @@ bool ggml_backend_probe_verified_v3_utf8(
     if (!openasr_verify_loaded_backend(handle.get(), path, false, expected_openasr_abi_v1,
                                        expected_provider_v1, expected_device_target,
                                        minimum_driver_version, &actual_driver)) {
+        openasr_backend_release_throwaway_probe(handle.get());
         return false;
     }
+    openasr_backend_release_throwaway_probe(handle.get());
     if (driver_out != nullptr && driver_out_capacity > 0) {
         std::snprintf(driver_out, driver_out_capacity, "%s", actual_driver.c_str());
     }
