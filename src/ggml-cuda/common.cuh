@@ -1334,8 +1334,22 @@ struct ggml_cuda_graph {
     uint64_t executable_generation = 0;
     uint32_t last_executable_change = GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1;
     int64_t last_used_time = 0;
+    // Capture identity only. Do not store a full ggml_tensor: HIP/CUDA write
+    // tensor->extra (and sometimes name) on every launch, which is not a
+    // topology change. v0.1.36 skipped this compare on uid reuse; keying by
+    // uid removed that short-circuit, so a full-tensor memcmp recaptured
+    // every decode step.
     struct node_properties {
-        ggml_tensor node;
+        ggml_type type;
+        ggml_op   op;
+        int32_t   flags;
+        int32_t   op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+        int64_t   ne[GGML_MAX_DIMS];
+        size_t    nb[GGML_MAX_DIMS];
+        const void * buffer;
+        const void * data;
+        const void * view_src;
+        size_t       view_offs;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
