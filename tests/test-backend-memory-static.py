@@ -238,6 +238,19 @@ class BackendMemoryStaticContract(unittest.TestCase):
         self.assertIn("ctx->memory_quarantined = true", quarantine)
         self.assertNotIn("ctx->device->poisoned.store(true)", quarantine)
 
+    def test_device_memory_api_keeps_c_linkage_without_nested_extern(self) -> None:
+        self.assertNotIn("ggml_backend_memory_api_for_device_v1", self.header)
+        decl = self.core[
+            self.core.index("Device-only lookup for admission quotes") :
+            self.core.index("ggml_backend_memory_api_for_backend_v1")
+        ]
+        self.assertIn("ggml_backend_memory_api_for_device_v1", decl)
+        self.assertIn('extern "C" {', decl)
+        self.assertNotIn(
+            'extern "C" GGML_API const struct ggml_backend_memory_api_v1',
+            decl,
+        )
+
     def test_optional_plugin_callbacks_use_common_noexcept_trampolines(self) -> None:
         self.assertIn("ggml_backend_set_n_threads_if_supported", self.header)
         self.assertIn("ggml_backend_dev_pci_vendor_id", self.header)

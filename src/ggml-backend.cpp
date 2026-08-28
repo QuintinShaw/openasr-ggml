@@ -156,7 +156,14 @@ bool ggml_backend_memory_encode_pci_bdf_v1(
 // Device-only lookup for admission quotes that must not construct a live
 // backend context. Intentionally omitted from ggml-backend.h / Rust ffi.rs so
 // the hashed host ABI fingerprint stays compatible with already-built plugins.
-extern "C" GGML_API const struct ggml_backend_memory_api_v1 *
+// Do not write `extern "C" GGML_API` on one line: GGML_API already expands to
+// `extern`, and `extern "C" extern` is invalid C++.
+extern "C" {
+GGML_API const struct ggml_backend_memory_api_v1 *
+ggml_backend_memory_api_for_device_v1(ggml_backend_dev_t device);
+}
+
+const struct ggml_backend_memory_api_v1 *
 ggml_backend_memory_api_for_device_v1(ggml_backend_dev_t device) {
     if (device == NULL) {
         return NULL;

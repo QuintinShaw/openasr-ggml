@@ -17,12 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class BackendGraphLifecycleStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header = (ROOT / "include/ggml-backend.h").read_text()
-        cls.ggml_h = (ROOT / "include/ggml.h").read_text()
-        cls.ggml_c = (ROOT / "src/ggml.c").read_text()
-        cls.backend = (ROOT / "src/ggml-backend.cpp").read_text()
-        cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text()
-        cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text()
+        cls.header = (ROOT / "include/ggml-backend.h").read_text(encoding="utf-8")
+        cls.ggml_h = (ROOT / "include/ggml.h").read_text(encoding="utf-8")
+        cls.ggml_c = (ROOT / "src/ggml.c").read_text(encoding="utf-8")
+        cls.backend = (ROOT / "src/ggml-backend.cpp").read_text(encoding="utf-8")
+        cls.common = (ROOT / "src/ggml-cuda/common.cuh").read_text(encoding="utf-8")
+        cls.cuda = (ROOT / "src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
 
     def test_versioned_observation_is_diagnostic_only(self) -> None:
         self.assertIn("GGML_BACKEND_GRAPH_LIFECYCLE_API_V1_PROC", self.header)
@@ -117,7 +117,7 @@ class BackendGraphLifecycleStaticContract(unittest.TestCase):
         self.assertNotIn("first_node_ptr", self.common)
 
     def test_capture_is_opt_in_on_owned_cgraph(self) -> None:
-        impl = (ROOT / "src/ggml-impl.h").read_text()
+        impl = (ROOT / "src/ggml-impl.h").read_text(encoding="utf-8")
         self.assertIn("ggml_graph_set_capture_allowed", impl)
         self.assertIn("ggml_graph_capture_allowed", impl)
         self.assertNotIn("ggml_graph_set_capture_allowed", self.ggml_h)

@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class BackendPluginIdentityStaticContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header = (ROOT / "include/ggml-backend.h").read_text()
-        cls.registry = (ROOT / "src/ggml-backend-reg.cpp").read_text()
-        cls.vulkan = (ROOT / "src/ggml-vulkan/ggml-vulkan.cpp").read_text()
+        cls.header = (ROOT / "include/ggml-backend.h").read_text(encoding="utf-8")
+        cls.registry = (ROOT / "src/ggml-backend-reg.cpp").read_text(encoding="utf-8")
+        cls.vulkan = (ROOT / "src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
 
     def test_host_discovery_is_abi_and_provider_verified(self) -> None:
         self.assertIn("ggml_backend_probe_identity_verified_v1_utf8", self.header)
