@@ -168,6 +168,40 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+if (WIN32)
+    # Put the plugin and its satellite DLL outside the test exe directory.
+    set(TEST_BACKEND_DL_PACK "${CMAKE_BINARY_DIR}/test-backend-dl-pack")
+
+    add_library(test-backend-dl-dep SHARED test-backend-dl.cpp)
+    target_compile_definitions(test-backend-dl-dep PRIVATE GGML_TEST_BACKEND_DL_DEP)
+
+    add_library(test-backend-dl-plugin MODULE test-backend-dl.cpp)
+    target_compile_definitions(test-backend-dl-plugin PRIVATE
+        GGML_TEST_BACKEND_DL_PLUGIN
+        GGML_BACKEND_DL
+        GGML_BACKEND_BUILD
+        GGML_BACKEND_SHARED)
+    target_include_directories(test-backend-dl-plugin PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test-backend-dl-plugin PRIVATE test-backend-dl-dep)
+
+    foreach (tgt test-backend-dl-dep test-backend-dl-plugin)
+        set_target_properties(${tgt} PROPERTIES PREFIX "")
+        foreach (prop RUNTIME_OUTPUT_DIRECTORY LIBRARY_OUTPUT_DIRECTORY ARCHIVE_OUTPUT_DIRECTORY)
+            set_target_properties(${tgt} PROPERTIES ${prop} "${TEST_BACKEND_DL_PACK}")
+            foreach (cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+                set_target_properties(${tgt} PROPERTIES ${prop}_${cfg} "${TEST_BACKEND_DL_PACK}")
+            endforeach()
+        endforeach()
+    endforeach()
+
+    set(TEST_TARGET test-backend-dl)
+    add_executable(${TEST_TARGET} test-backend-dl.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_dependencies(${TEST_TARGET} test-backend-dl-plugin)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> "$<TARGET_FILE:test-backend-dl-plugin>")
+endif()
 
 if (NOT GGML_BACKEND_DL)
     #
