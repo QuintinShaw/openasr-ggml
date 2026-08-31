@@ -2933,10 +2933,18 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_backend_sched_restore_src_rewrites(sched);
-        if (sched->allocated_graph != NULL) {
-            ggml_gallocr_detach_graph_tensors_v1(sched->galloc, sched->allocated_graph);
-            sched->allocated_graph = NULL;
+        // Detach the scheduler-owned split graph, not `allocated_graph`.
+        // `allocated_graph` is the caller's source cgraph and may already have
+        // been freed (a persistent session drops that context while this
+        // scheduler handle is still shared with the runner). The split graph's
+        // node/leaf arrays live on the scheduler until `ggml_backend_sched_free`.
+        if (sched->graph.nodes != NULL && sched->graph.leafs != NULL &&
+                sched->graph.size >= 0 &&
+                sched->graph.n_nodes >= 0 && sched->graph.n_nodes <= sched->graph.size &&
+                sched->graph.n_leafs >= 0 && sched->graph.n_leafs <= sched->graph.size) {
+            ggml_gallocr_detach_graph_tensors_v1(sched->galloc, &sched->graph);
         }
+        sched->allocated_graph = NULL;
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
