@@ -1476,7 +1476,11 @@ static void ggml_gallocr_detach_tensor(
 void ggml_gallocr_detach_graph_tensors_v1(
         ggml_gallocr_t galloc,
         struct ggml_cgraph * graph) {
-    if (galloc == NULL || graph == NULL) {
+    if (galloc == NULL || graph == NULL || graph->nodes == NULL || graph->leafs == NULL) {
+        return;
+    }
+    if (graph->size < 0 || graph->n_leafs < 0 || graph->n_nodes < 0 ||
+            graph->n_leafs > graph->size || graph->n_nodes > graph->size) {
         return;
     }
     for (int i = 0; i < graph->n_leafs; ++i) {
