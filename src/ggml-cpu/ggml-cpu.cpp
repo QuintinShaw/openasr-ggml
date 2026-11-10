@@ -1,3 +1,4 @@
+#include "../ggml-linux-meminfo.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -442,7 +443,9 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
         return;
     }
     *total = (size_t) status.totalram * status.mem_unit;
-    *free = (size_t) (status.freeram + status.bufferram) * status.mem_unit;
+    const auto available = ggml_linux_mem_available();
+    *free = available ? (size_t) std::min(*available, (uint64_t) SIZE_MAX)
+                      : (size_t) (status.freeram + status.bufferram) * status.mem_unit;
 #else
     long pages = sysconf(_SC_PHYS_PAGES);
     long available_pages = sysconf(_SC_AVPHYS_PAGES);
