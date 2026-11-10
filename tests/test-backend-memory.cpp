@@ -2,6 +2,11 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#if defined(__linux__)
+#include "../src/ggml-linux-meminfo.h"
+#include <sys/sysinfo.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -115,7 +120,23 @@ static const ggml_backend_memory_api_v1 * cpu_memory_api() {
     return api;
 }
 
+#if defined(__linux__)
+static void test_host_available_memory_is_plausible() {
+    const auto available = ggml_linux_mem_available();
+    assert(available.has_value());
+    assert(*available > 0);
+
+    struct sysinfo status = {};
+    if (sysinfo(&status) == 0) {
+        assert(*available <= (uint64_t) status.totalram * status.mem_unit);
+    }
+}
+#endif
+
 int main() {
+#if defined(__linux__)
+    test_host_available_memory_is_plausible();
+#endif
     test_canonical_pci_bdf_encoding();
     test_request_fingerprint_binds_all_semantics();
 
